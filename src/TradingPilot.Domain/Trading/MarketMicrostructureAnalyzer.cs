@@ -6,23 +6,33 @@ using TradingPilot.Symbols;
 namespace TradingPilot.Trading;
 
 /// <summary>
-/// Analyzes L2 order book data in real time to generate buy/sell trading signals.
-/// Combines multiple microstructure indicators: order book imbalance, weighted imbalance,
-/// pressure rate of change, spread analysis, and large order detection.
+/// Analyzes L2 order book data, tick data, and bar-based indicators in real time
+/// to generate buy/sell trading signals. Combines microstructure indicators
+/// (order book imbalance, weighted imbalance, pressure ROC, spread, large orders)
+/// with tick momentum, trend alignment, VWAP position, volume confirmation, and RSI filter.
 /// </summary>
 public class MarketMicrostructureAnalyzer
 {
     private readonly L2BookCache _l2Cache;
+    private readonly TickDataCache _tickCache;
+    private readonly BarIndicatorCache _barCache;
     private readonly ILogger<MarketMicrostructureAnalyzer> _logger;
 
     private readonly ConcurrentDictionary<long, TickerAnalysisState> _state = new();
 
-    // Indicator weights for composite score
-    private const decimal WeightObi = 0.30m;
-    private const decimal WeightWobi = 0.25m;
-    private const decimal WeightPressureRoc = 0.20m;
-    private const decimal WeightSpread = 0.15m;
-    private const decimal WeightLargeOrder = 0.10m;
+    // L2 indicator weights (total: 0.50)
+    private const decimal WeightObi = 0.15m;
+    private const decimal WeightWobi = 0.15m;
+    private const decimal WeightPressureRoc = 0.10m;
+    private const decimal WeightSpread = 0.05m;
+    private const decimal WeightLargeOrder = 0.05m;
+
+    // New indicator weights (total: 0.50)
+    private const decimal WeightTickMomentum = 0.10m;
+    private const decimal WeightTrendAlignment = 0.15m;
+    private const decimal WeightVwapPosition = 0.10m;
+    private const decimal WeightVolumeConfirmation = 0.10m;
+    private const decimal WeightRsiFilter = 0.05m;
 
     // Signal thresholds
     private const decimal StrongBuyThreshold = 0.40m;
@@ -44,9 +54,13 @@ public class MarketMicrostructureAnalyzer
 
     public MarketMicrostructureAnalyzer(
         L2BookCache l2Cache,
+        TickDataCache tickCache,
+        BarIndicatorCache barCache,
         ILogger<MarketMicrostructureAnalyzer> logger)
     {
         _l2Cache = l2Cache;
+        _tickCache = tickCache;
+        _barCache = barCache;
         _logger = logger;
     }
 
@@ -65,20 +79,61 @@ public class MarketMicrostructureAnalyzer
         if (state.RecentImbalances.Count < ShortWindow)
             return null;
 
-        // Compute individual indicators (all return values in [-1, +1])
+        // Compute L2 indicators (all return values in [-1, +1])
         decimal obiScore = ComputeSmoothedObi(state);
         decimal wobiScore = ComputeWeightedObi(snapshot);
         decimal pressureRocScore = ComputePressureRoc(state);
         decimal spreadScore = ComputeSpreadSignal(state, snapshot);
         decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
 
-        // Composite score
+        // Compute tick-based indicators
+        decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
+
+        // Compute bar-based indicators
+        var barIndicators = _barCache.GetIndicators(tickerId);
+        decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
+        decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
+        decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
+        decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
+
+        // Composite score: L2 indicators (0.50) + new indicators (0.50)
         decimal compositeScore =
             obiScore * WeightObi +
             wobiScore * WeightWobi +
             pressureRocScore * WeightPressureRoc +
             spreadScore * WeightSpread +
-            largeOrderScore * WeightLargeOrder;
+            largeOrderScore * WeightLargeOrder +
+            tickMomentumScore * WeightTickMomentum +
+            trendAlignmentScore * WeightTrendAlignment +
+            vwapPositionScore * WeightVwapPosition +
+            volumeConfirmationScore * WeightVolumeConfirmation +
+            rsiFilterScore * WeightRsiFilter;
+
+        // Apply contextual filters from bar indicators
+        if (barIndicators != null)
+        {
+            // Trend filter: if EMA trend is bearish but signal is BUY, reduce score
+            if (barIndicators.TrendDirection == -1 && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
+                compositeScore *= 0.5m; // halve sell signal in uptrend
+
+            // VWAP filter: buying below VWAP or selling above VWAP = lower confidence
+            if (!barIndicators.AboveVwap && compositeScore > 0)
+                compositeScore *= 0.7m;
+            else if (barIndicators.AboveVwap && compositeScore < 0)
+                compositeScore *= 0.7m;
+
+            // Volume confirmation: high volume = stronger signal
+            if (barIndicators.HighVolume)
+                compositeScore *= 1.3m;
+
+            // RSI filter: don't buy overbought, don't sell oversold
+            if (barIndicators.OverboughtRsi && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.OversoldRsi && compositeScore < 0)
+                compositeScore *= 0.5m;
+        }
 
         // Determine signal type and strength
         var (signalType, strength) = ClassifySignal(compositeScore);
@@ -99,8 +154,24 @@ public class MarketMicrostructureAnalyzer
             ["PressureROC"] = Math.Round(pressureRocScore, 4),
             ["SpreadSignal"] = Math.Round(spreadScore, 4),
             ["LargeOrderSignal"] = Math.Round(largeOrderScore, 4),
+            ["TickMomentum"] = Math.Round(tickMomentumScore, 4),
+            ["TrendAlignment"] = Math.Round(trendAlignmentScore, 4),
+            ["VwapPosition"] = Math.Round(vwapPositionScore, 4),
+            ["VolumeConfirmation"] = Math.Round(volumeConfirmationScore, 4),
+            ["RsiFilter"] = Math.Round(rsiFilterScore, 4),
             ["CompositeScore"] = Math.Round(compositeScore, 4),
         };
+
+        // Add bar indicator context if available
+        if (barIndicators != null)
+        {
+            indicators["EMA9"] = Math.Round(barIndicators.Ema9, 4);
+            indicators["EMA20"] = Math.Round(barIndicators.Ema20, 4);
+            indicators["VWAP"] = Math.Round(barIndicators.Vwap, 4);
+            indicators["RSI14"] = Math.Round(barIndicators.Rsi14, 2);
+            indicators["VolumeRatio"] = Math.Round(barIndicators.VolumeRatio, 2);
+            indicators["TrendDir"] = barIndicators.TrendDirection;
+        }
 
         string reason = BuildReason(signalType, strength, indicators);
 
@@ -125,16 +196,23 @@ public class MarketMicrostructureAnalyzer
             _logger.LogWarning(
                 "STRONG {SignalType} signal for {Ticker} (tickerId={TickerId}) at {Price:F4} | " +
                 "Score={Score:F4} OBI={OBI:F4} WOBI={WOBI:F4} PressureROC={PROCI:F4} " +
-                "Spread={Spread:F4} LargeOrder={LargeOrder:F4}",
+                "Spread={Spread:F4} LargeOrder={LargeOrder:F4} " +
+                "TickMom={TickMom:F4} Trend={Trend:F4} VWAP={VWAP:F4} Vol={Vol:F4} RSI={RSI:F4}",
                 signalType, ticker, tickerId, snapshot.MidPrice,
                 compositeScore, obiScore, wobiScore, pressureRocScore,
-                spreadScore, largeOrderScore);
+                spreadScore, largeOrderScore,
+                tickMomentumScore, trendAlignmentScore, vwapPositionScore,
+                volumeConfirmationScore, rsiFilterScore);
         }
         else
         {
             _logger.LogInformation(
-                "{Strength} {SignalType} signal for {Ticker} at {Price:F4} | Score={Score:F4}",
-                strength, signalType, ticker, snapshot.MidPrice, compositeScore);
+                "{Strength} {SignalType} signal for {Ticker} at {Price:F4} | Score={Score:F4} " +
+                "Trend={Trend} VWAP={VWAP} RSI={RSI:F1}",
+                strength, signalType, ticker, snapshot.MidPrice, compositeScore,
+                barIndicators?.TrendDirection ?? 0,
+                barIndicators?.AboveVwap == true ? "above" : "below",
+                barIndicators?.Rsi14 ?? 50);
         }
 
         return signal;
@@ -261,6 +339,73 @@ public class MarketMicrostructureAnalyzer
         // Normalize: all large bids = +1, all large asks = -1
         return (decimal)(largeBids - largeAsks) / total;
     }
+
+    #region New indicator computations
+
+    /// <summary>
+    /// Tick Momentum: uptick/downtick ratio from TickDataCache. Range [-1, +1].
+    /// </summary>
+    private decimal ComputeTickMomentumScore(long tickerId)
+    {
+        var tickData = _tickCache.GetData(tickerId);
+        if (tickData == null) return 0;
+
+        // TickMomentum is already in [-1, +1]
+        return tickData.TickMomentum;
+    }
+
+    /// <summary>
+    /// Trend Alignment: +1 if bullish EMA trend, -1 if bearish, 0 if neutral or no data.
+    /// </summary>
+    private static decimal ComputeTrendAlignmentScore(BarIndicators? barIndicators)
+    {
+        if (barIndicators == null) return 0;
+        return barIndicators.TrendDirection; // already +1, 0, or -1
+    }
+
+    /// <summary>
+    /// VWAP Position: positive if price is above VWAP (bullish), negative if below.
+    /// Magnitude based on distance from VWAP relative to price.
+    /// </summary>
+    private static decimal ComputeVwapPositionScore(BarIndicators? barIndicators, decimal currentPrice)
+    {
+        if (barIndicators == null || barIndicators.Vwap <= 0 || currentPrice <= 0)
+            return 0;
+
+        decimal deviation = (currentPrice - barIndicators.Vwap) / currentPrice;
+        // Clamp to [-1, +1], scale by 100 so a 1% deviation maps to ~1.0
+        return Math.Clamp(deviation * 100m, -1m, 1m);
+    }
+
+    /// <summary>
+    /// Volume Confirmation: high volume = stronger signal in the same direction.
+    /// Returns value in [0, +1] based on volume ratio.
+    /// </summary>
+    private static decimal ComputeVolumeConfirmationScore(BarIndicators? barIndicators)
+    {
+        if (barIndicators == null) return 0;
+
+        // VolumeRatio > 1.5 is significant. Map ratio to [0, 1].
+        // ratio=0.5 -> -0.5, ratio=1.0 -> 0, ratio=2.0 -> 1.0
+        decimal score = (barIndicators.VolumeRatio - 1.0m);
+        return Math.Clamp(score, -1m, 1m);
+    }
+
+    /// <summary>
+    /// RSI Filter: penalize overbought conditions for buys and oversold for sells.
+    /// Returns value in [-1, +1]. Neutral (RSI ~50) = 0.
+    /// </summary>
+    private static decimal ComputeRsiFilterScore(BarIndicators? barIndicators)
+    {
+        if (barIndicators == null) return 0;
+
+        // RSI 0-100 mapped to [-1, +1]: RSI=50 -> 0, RSI=30 -> -0.4, RSI=70 -> +0.4
+        // This gives a mild directional bias based on RSI
+        decimal normalized = (barIndicators.Rsi14 - 50m) / 50m;
+        return Math.Clamp(normalized, -1m, 1m);
+    }
+
+    #endregion
 
     private static (SignalType Type, SignalStrength Strength) ClassifySignal(decimal score)
     {

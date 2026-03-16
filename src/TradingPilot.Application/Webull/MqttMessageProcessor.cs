@@ -20,8 +20,11 @@ public class MqttMessageProcessor
 {
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly L2BookCache _l2Cache;
+    private readonly TickDataCache _tickCache;
+    private readonly BarIndicatorCache _barCache;
     private readonly MarketMicrostructureAnalyzer _analyzer;
     private readonly SignalStore _signalStore;
+    private readonly PaperTradingExecutor _paperTrader;
     private readonly ILogger<MqttMessageProcessor> _logger;
 
     // Track how many raw payloads we've logged per topic to avoid spam
@@ -34,6 +37,13 @@ public class MqttMessageProcessor
     // Track topic patterns we've seen
     private readonly ConcurrentDictionary<string, int> _topicCounts = new();
 
+    // Periodic bar indicator refresh (every 30s)
+    private readonly ConcurrentDictionary<long, DateTime> _lastBarRefresh = new();
+    private static readonly TimeSpan BarRefreshInterval = TimeSpan.FromSeconds(30);
+
+    // Periodic tick snapshot persistence (every 10s per ticker)
+    private readonly ConcurrentDictionary<long, DateTime> _lastTickSnapshotTime = new();
+
     // Binary capture: track saved samples per size bucket (max 20 unique)
     private readonly ConcurrentDictionary<string, int> _binaryCaptureCountPerBucket = new();
     private const int MaxCapturesPerBucket = 4; // 5 buckets × 4 = 20 total
@@ -44,14 +54,20 @@ public class MqttMessageProcessor
     public MqttMessageProcessor(
         IServiceScopeFactory scopeFactory,
         L2BookCache l2Cache,
+        TickDataCache tickCache,
+        BarIndicatorCache barCache,
         MarketMicrostructureAnalyzer analyzer,
         SignalStore signalStore,
+        PaperTradingExecutor paperTrader,
         ILogger<MqttMessageProcessor> logger)
     {
         _scopeFactory = scopeFactory;
         _l2Cache = l2Cache;
+        _tickCache = tickCache;
+        _barCache = barCache;
         _analyzer = analyzer;
         _signalStore = signalStore;
+        _paperTrader = paperTrader;
         _logger = logger;
     }
 
@@ -172,6 +188,13 @@ public class MqttMessageProcessor
         {
             _signalStore.AddSignal(signal);
             await PersistSignalAsync(signal, symbol.Id, snapshot);
+
+            // Send all signals to executor — it handles entry/exit logic internally
+            _ = Task.Run(async () =>
+            {
+                try { await _paperTrader.OnSignalAsync(signal); }
+                catch (Exception ex) { _logger.LogError(ex, "Paper trade execution failed for {Ticker}", signal.Ticker); }
+            });
         }
 
         // Store to DB
@@ -184,7 +207,7 @@ public class MqttMessageProcessor
         await uow.CompleteAsync();
     }
 
-    private void ProcessDecodedQuote(WebullMqttMessage decoded)
+    private async void ProcessDecodedQuote(WebullMqttMessage decoded)
     {
         int logCount = _decodedLogCounts.AddOrUpdate(WebullMqttMessageType.QuoteUpdate, 1, (_, c) => c + 1);
         if (logCount <= MaxDecodedLogsPerType)
@@ -194,6 +217,26 @@ public class MqttMessageProcessor
                 decoded.TickerId, decoded.Price, decoded.Open, decoded.High, decoded.Low,
                 decoded.Volume, decoded.ChangeAmount, decoded.ChangeRatio, decoded.TradeTime);
         }
+
+        // Feed quote data to TickDataCache
+        if (decoded.Price.HasValue)
+        {
+            _tickCache.AddQuote(
+                decoded.TickerId,
+                decoded.Price.Value,
+                decoded.Open ?? 0,
+                decoded.High ?? 0,
+                decoded.Low ?? 0,
+                decoded.Volume ?? 0,
+                decoded.ChangeRatio ?? 0,
+                decoded.TradeTime);
+        }
+
+        // Periodically refresh bar indicators (every 30s)
+        await TryRefreshBarIndicatorsAsync(decoded.TickerId);
+
+        // Periodically store tick snapshot (every 10s)
+        await TryStoreTickSnapshotAsync(decoded.TickerId);
     }
 
     private void ProcessDecodedTick(WebullMqttMessage decoded)
@@ -204,6 +247,93 @@ public class MqttMessageProcessor
             _logger.LogInformation(
                 "Decoded protobuf tick: tickerId={TickerId} price={Price} ts={Timestamp}",
                 decoded.TickerId, decoded.Price, decoded.Timestamp);
+        }
+
+        // Feed tick data to TickDataCache
+        if (decoded.Price.HasValue)
+        {
+            _tickCache.AddTick(
+                decoded.TickerId,
+                decoded.Price.Value,
+                decoded.Timestamp ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        }
+    }
+
+    #endregion
+
+    #region Periodic tasks (bar indicator refresh + tick snapshot persistence)
+
+    private async Task TryRefreshBarIndicatorsAsync(long tickerId)
+    {
+        var now = DateTime.UtcNow;
+        var lastRefresh = _lastBarRefresh.GetOrAdd(tickerId, DateTime.MinValue);
+        if ((now - lastRefresh) < BarRefreshInterval) return;
+
+        _lastBarRefresh[tickerId] = now;
+
+        var symbol = await GetSymbolByTickerIdAsync(tickerId);
+        if (symbol == null) return;
+
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var barService = scope.ServiceProvider.GetRequiredService<BarIndicatorService>();
+            await barService.RefreshAsync(tickerId, symbol.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to refresh bar indicators for tickerId={TickerId}", tickerId);
+        }
+    }
+
+    private async Task TryStoreTickSnapshotAsync(long tickerId)
+    {
+        var now = DateTime.UtcNow;
+        var lastSnapshot = _lastTickSnapshotTime.GetOrAdd(tickerId, DateTime.MinValue);
+        if ((now - lastSnapshot) < TimeSpan.FromSeconds(10)) return;
+
+        _lastTickSnapshotTime[tickerId] = now;
+
+        var tickData = _tickCache.GetData(tickerId);
+        if (tickData == null || tickData.LastPrice == 0) return;
+
+        var symbol = await GetSymbolByTickerIdAsync(tickerId);
+        if (symbol == null) return;
+
+        var barIndicators = _barCache.GetIndicators(tickerId);
+
+        try
+        {
+            var snapshot = new TickSnapshot
+            {
+                SymbolId = symbol.Id,
+                TickerId = tickerId,
+                Timestamp = now,
+                Price = tickData.LastPrice,
+                Open = tickData.Open,
+                High = tickData.High,
+                Low = tickData.Low,
+                Volume = tickData.Volume,
+                Vwap = barIndicators?.Vwap ?? 0,
+                Ema9 = barIndicators?.Ema9 ?? 0,
+                Ema20 = barIndicators?.Ema20 ?? 0,
+                Rsi14 = barIndicators?.Rsi14 ?? 0,
+                VolumeRatio = barIndicators?.VolumeRatio ?? 0,
+                UptickCount = tickData.UptickCount,
+                DowntickCount = tickData.DowntickCount,
+                TickMomentum = tickData.TickMomentum,
+            };
+
+            using var scope = _scopeFactory.CreateScope();
+            var uowManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+            var repo = scope.ServiceProvider.GetRequiredService<IRepository<TickSnapshot, Guid>>();
+            using var uow = uowManager.Begin();
+            await repo.InsertAsync(snapshot, autoSave: false);
+            await uow.CompleteAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to store tick snapshot for tickerId={TickerId}", tickerId);
         }
     }
 
@@ -302,6 +432,13 @@ public class MqttMessageProcessor
         {
             _signalStore.AddSignal(signal);
             await PersistSignalAsync(signal, symbol.Id, snapshot);
+
+            // Send all signals to executor — it handles entry/exit logic internally
+            _ = Task.Run(async () =>
+            {
+                try { await _paperTrader.OnSignalAsync(signal); }
+                catch (Exception ex) { _logger.LogError(ex, "Paper trade execution failed for {Ticker}", signal.Ticker); }
+            });
         }
 
         // Store to DB

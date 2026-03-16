@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using TradingPilot.EntityFrameworkCore;
@@ -12,9 +13,11 @@ using Volo.Abp.EntityFrameworkCore;
 namespace TradingPilot.Migrations
 {
     [DbContext(typeof(TradingPilotDbContext))]
-    partial class TradingPilotDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260316183918_AddPaperTradesTable")]
+    partial class AddPaperTradesTable
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -477,83 +480,6 @@ namespace TradingPilot.Migrations
                     b.ToTable("PaperTrades", (string)null);
                 });
 
-            modelBuilder.Entity("TradingPilot.Trading.TickSnapshot", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .HasColumnType("uuid");
-
-                    b.Property<int>("DowntickCount")
-                        .HasColumnType("integer");
-
-                    b.Property<decimal>("Ema20")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal>("Ema9")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal>("High")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal>("Low")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal>("Open")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal>("Price")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal>("Rsi14")
-                        .HasPrecision(8, 4)
-                        .HasColumnType("numeric(8,4)");
-
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
-
-                    b.Property<decimal>("TickMomentum")
-                        .HasPrecision(8, 6)
-                        .HasColumnType("numeric(8,6)");
-
-                    b.Property<long>("TickerId")
-                        .HasColumnType("bigint");
-
-                    b.Property<DateTime>("Timestamp")
-                        .HasColumnType("timestamp without time zone");
-
-                    b.Property<int>("UptickCount")
-                        .HasColumnType("integer");
-
-                    b.Property<long>("Volume")
-                        .HasColumnType("bigint");
-
-                    b.Property<decimal>("VolumeRatio")
-                        .HasPrecision(8, 4)
-                        .HasColumnType("numeric(8,4)");
-
-                    b.Property<decimal>("Vwap")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Timestamp")
-                        .HasDatabaseName("IX_TickSnapshots_Timestamp");
-
-                    b.HasIndex("SymbolId", "Timestamp")
-                        .HasDatabaseName("IX_TickSnapshots_SymbolId_Timestamp");
-
-                    b.HasIndex("TickerId", "Timestamp")
-                        .HasDatabaseName("IX_TickSnapshots_TickerId_Timestamp");
-
-                    b.ToTable("TickSnapshots", (string)null);
-                });
-
             modelBuilder.Entity("TradingPilot.Trading.TradingSignalRecord", b =>
                 {
                     b.Property<Guid>("Id")
@@ -715,15 +641,6 @@ namespace TradingPilot.Migrations
                 });
 
             modelBuilder.Entity("TradingPilot.Trading.PaperTrade", b =>
-                {
-                    b.HasOne("TradingPilot.Symbols.Symbol", null)
-                        .WithMany()
-                        .HasForeignKey("SymbolId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
-                });
-
-            modelBuilder.Entity("TradingPilot.Trading.TickSnapshot", b =>
                 {
                     b.HasOne("TradingPilot.Symbols.Symbol", null)
                         .WithMany()

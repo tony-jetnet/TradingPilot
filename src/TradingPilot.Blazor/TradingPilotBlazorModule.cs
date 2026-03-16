@@ -102,12 +102,27 @@ public class TradingPilotBlazorModule : AbpModule
         // L2 book cache (singleton in-memory rolling window)
         context.Services.AddSingleton<L2BookCache>();
 
+        // Tick data cache (singleton — real-time tick/quote data)
+        context.Services.AddSingleton<TickDataCache>();
+
+        // Bar indicator cache (singleton — pre-computed technical indicators)
+        context.Services.AddSingleton<BarIndicatorCache>();
+
+        // Bar indicator service (transient — computes indicators from DB bars)
+        context.Services.AddTransient<BarIndicatorService>();
+
         // Webull gRPC client (singleton — long-lived HTTP/2 channel)
         context.Services.AddSingleton<WebullGrpcClient>();
 
         // Trading signal analysis engine (singleton — analyzes L2 data for buy/sell signals)
         context.Services.AddSingleton<MarketMicrostructureAnalyzer>();
         context.Services.AddSingleton<SignalStore>();
+
+        // Paper trading client (typed HttpClient — no base address since we use full URLs)
+        context.Services.AddHttpClient<WebullPaperTradingClient>();
+
+        // Paper trading executor (singleton — auto-executes trades from signals)
+        context.Services.AddSingleton<PaperTradingExecutor>();
 
         // MQTT message processor (singleton — processes real-time MQTT data into structured DB entities)
         context.Services.AddSingleton<MqttMessageProcessor>();
