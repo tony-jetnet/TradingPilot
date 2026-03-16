@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using TradingPilot.Symbols;
+using TradingPilot.Trading;
 using Volo.Abp;
 using Volo.Abp.EntityFrameworkCore.Modeling;
 
@@ -153,6 +154,39 @@ public static class TradingPilotDbContextModelCreatingExtensions
 
             b.HasIndex(x => new { x.SymbolId, x.Date }).IsUnique()
                 .HasDatabaseName("IX_SymbolFinancialSnapshots_SymbolId_Date");
+        });
+
+        builder.Entity<TradingSignalRecord>(b =>
+        {
+            b.ToTable(TradingPilotConsts.DbTablePrefix + "TradingSignals", TradingPilotConsts.DbSchema);
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Price).HasPrecision(12, 4);
+            b.Property(x => x.Score).HasPrecision(8, 6);
+            b.Property(x => x.ObiSmoothed).HasPrecision(8, 6);
+            b.Property(x => x.Wobi).HasPrecision(8, 6);
+            b.Property(x => x.PressureRoc).HasPrecision(8, 6);
+            b.Property(x => x.SpreadSignal).HasPrecision(8, 6);
+            b.Property(x => x.LargeOrderSignal).HasPrecision(8, 6);
+            b.Property(x => x.Spread).HasPrecision(10, 4);
+            b.Property(x => x.Imbalance).HasPrecision(8, 6);
+            b.Property(x => x.Reason).HasMaxLength(500);
+            b.Property(x => x.PriceAfter1Min).HasPrecision(12, 4);
+            b.Property(x => x.PriceAfter5Min).HasPrecision(12, 4);
+            b.Property(x => x.PriceAfter15Min).HasPrecision(12, 4);
+            b.Property(x => x.PriceAfter30Min).HasPrecision(12, 4);
+            b.Property(x => x.Type).HasConversion<byte>();
+            b.Property(x => x.Strength).HasConversion<byte>();
+
+            b.HasOne<Symbol>().WithMany().HasForeignKey(x => x.SymbolId).OnDelete(DeleteBehavior.Restrict);
+
+            b.HasIndex(x => new { x.SymbolId, x.Timestamp })
+                .HasDatabaseName("IX_TradingSignals_SymbolId_Timestamp");
+            b.HasIndex(x => x.Timestamp)
+                .HasDatabaseName("IX_TradingSignals_Timestamp");
+            b.HasIndex(x => new { x.Type, x.Strength, x.Timestamp })
+                .HasDatabaseName("IX_TradingSignals_Type_Strength_Timestamp");
+            b.HasIndex(x => x.VerifiedAt)
+                .HasDatabaseName("IX_TradingSignals_VerifiedAt");
         });
     }
 }

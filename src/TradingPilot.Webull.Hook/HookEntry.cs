@@ -607,6 +607,23 @@ public static unsafe class HookEntry
             string topic = QtInterop.ReadQString(qStringRef);
             HookLog.Write($"INVOKE-SUBSCRIBE #{_subscribeCount}: topic=\"{topic}\" client=0x{thisPtr:X}");
             PipeServer.SendEvent("subscribe", topic);
+
+            // Persist auth header directly to file (since TCP doesn't carry events)
+            try
+            {
+                if (topic.Contains("\"header\""))
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(topic);
+                    if (doc.RootElement.TryGetProperty("header", out var header))
+                    {
+                        string headerJson = header.ToString();
+                        string authPath = System.IO.Path.Combine(@"D:\Third-Parties\WebullHook", "auth_header.json");
+                        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(authPath)!);
+                        System.IO.File.WriteAllText(authPath, headerJson);
+                    }
+                }
+            }
+            catch { }
         }
         catch (Exception ex)
         {

@@ -134,44 +134,148 @@ public partial class WebullHookHostedService : BackgroundService
                 }
             };
 
-            // 6. Trigger MQTT reconnect to force Webull to re-subscribe (captures auth headers)
-            // Polls until MQTT client is captured, then sends reconnect
+            // 6. Force MQTT reconnect via firewall reset to capture auth headers
+            // The hooks are installed but MQTT connected before hooks were in place,
+            // so we temporarily block MQTT ports to force a reconnect through the hooks.
             _ = Task.Run(async () =>
             {
+                const string ruleName = "TradingPilot_MQTT_Reset";
                 try
                 {
-                    // Wait for Webull to establish MQTT connection (hook captures client pointer)
-                    for (int i = 0; i < 60; i++)
+                    // Wait for hooks to be fully installed
+                    _logger.LogInformation("Firewall reset: waiting 5s for hooks to settle...");
+                    await Task.Delay(5000, stoppingToken);
+
+                    // Find active MQTT connections (ports 1883 or 8883)
+                    _logger.LogInformation("Firewall reset: scanning for active MQTT connections...");
+                    var remoteIps = new HashSet<string>();
+                    var netstatInfo = new ProcessStartInfo("netstat", "-an")
                     {
-                        await Task.Delay(5000, stoppingToken);
-                        bool hasClient;
-                        using (var statusCmd = new MqttCommandWriter())
+                        RedirectStandardOutput = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+                    using (var netstat = Process.Start(netstatInfo)!)
+                    {
+                        string output = await netstat.StandardOutput.ReadToEndAsync(stoppingToken);
+                        await netstat.WaitForExitAsync(stoppingToken);
+                        foreach (string line in output.Split('\n'))
                         {
-                            await statusCmd.ConnectAsync(5000, stoppingToken);
-                            using var status = await statusCmd.GetStatusAsync(stoppingToken);
-                            hasClient = status.RootElement.TryGetProperty("hasClient", out var hc) && hc.ValueKind == System.Text.Json.JsonValueKind.True;
+                            string trimmed = line.Trim();
+                            if (!trimmed.StartsWith("TCP", StringComparison.OrdinalIgnoreCase)) continue;
+                            if (!trimmed.Contains("ESTABLISHED", StringComparison.OrdinalIgnoreCase)) continue;
+                            // Parse: TCP    local_addr:port    remote_addr:port    ESTABLISHED
+                            var parts = trimmed.Split([' '], StringSplitOptions.RemoveEmptyEntries);
+                            if (parts.Length < 3) continue;
+                            string remoteEndpoint = parts[2];
+                            int lastColon = remoteEndpoint.LastIndexOf(':');
+                            if (lastColon < 0) continue;
+                            string portStr = remoteEndpoint[(lastColon + 1)..];
+                            if (portStr is "1883" or "8883")
+                            {
+                                string ip = remoteEndpoint[..lastColon];
+                                remoteIps.Add(ip);
+                                _logger.LogInformation("Firewall reset: found MQTT connection to {IP}:{Port}", ip, portStr);
+                            }
                         }
-                        if (hasClient)
-                        {
-                            _logger.LogInformation("MQTT client captured. Sending reconnect to force auth capture...");
-                            using var cmd = new MqttCommandWriter();
-                            await cmd.ConnectAsync(5000, stoppingToken);
-                            using var result = await cmd.ReconnectAsync(stoppingToken);
-                            _logger.LogInformation("Reconnect response: {Response}", result.RootElement.ToString());
-                            return;
-                        }
-                        if (i % 6 == 0)
-                            _logger.LogDebug("Waiting for MQTT client to be captured ({Attempt}/60)...", i + 1);
                     }
-                    _logger.LogWarning("MQTT client was never captured after 5 minutes. Auth may need manual trigger.");
+
+                    if (remoteIps.Count == 0)
+                    {
+                        _logger.LogWarning("Firewall reset: no active MQTT connections found. Auth capture may need manual trigger.");
+                        return;
+                    }
+
+                    string ipList = string.Join(',', remoteIps);
+                    _logger.LogInformation("Firewall reset: blocking MQTT to IPs: {IPs}", ipList);
+
+                    // Create temporary firewall rule to block MQTT
+                    try
+                    {
+                        var addRule = new ProcessStartInfo("netsh",
+                            $"advfirewall firewall add rule name=\"{ruleName}\" dir=out action=block protocol=TCP remoteip={ipList} remoteport=1883,8883")
+                        {
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using (var proc = Process.Start(addRule)!)
+                        {
+                            await proc.WaitForExitAsync(stoppingToken);
+                            string stdout = await proc.StandardOutput.ReadToEndAsync(stoppingToken);
+                            _logger.LogInformation("Firewall reset: rule added (exit={Exit}): {Output}",
+                                proc.ExitCode, stdout.Trim());
+                        }
+
+                        // Wait for connections to drop
+                        _logger.LogInformation("Firewall reset: waiting 3s for connections to drop...");
+                        await Task.Delay(3000, stoppingToken);
+                    }
+                    finally
+                    {
+                        // Always remove the firewall rule
+                        var delRule = new ProcessStartInfo("netsh",
+                            $"advfirewall firewall delete rule name=\"{ruleName}\"")
+                        {
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using var delProc = Process.Start(delRule)!;
+                        await delProc.WaitForExitAsync(CancellationToken.None);
+                        string delOut = await delProc.StandardOutput.ReadToEndAsync(CancellationToken.None);
+                        _logger.LogInformation("Firewall reset: rule removed (exit={Exit}): {Output}",
+                            delProc.ExitCode, delOut.Trim());
+                    }
+
+                    // Wait for Webull to reconnect and re-subscribe through the hooks
+                    _logger.LogInformation("Firewall reset: waiting 10s for Webull to reconnect...");
+                    await Task.Delay(10000, stoppingToken);
+
+                    // Read auth header from file (written by hook's invokeSubscribeResult)
+                    string authFilePath = Path.Combine(@"D:\Third-Parties\WebullHook", "auth_header.json");
+                    if (capturedHeader == null && File.Exists(authFilePath))
+                    {
+                        capturedHeader = File.ReadAllText(authFilePath).Trim();
+                        if (!string.IsNullOrEmpty(capturedHeader))
+                            _logger.LogInformation("Firewall reset: loaded auth header from file");
+                        else
+                            capturedHeader = null;
+                    }
+
+                    if (capturedHeader != null)
+                    {
+                        _logger.LogInformation("Firewall reset: auth header available, auto-subscribing...");
+                        await AutoSubscribeAsync(capturedHeader, stoppingToken);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Firewall reset: no auth header available. Open a stock in Webull to trigger subscription.");
+                    }
                 }
                 catch (OperationCanceledException) { }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning("Reconnect command failed: {Message}", ex.Message);
+                    _logger.LogWarning(ex, "Firewall reset failed");
+                    // Best-effort cleanup of firewall rule in case of unexpected error
+                    try
+                    {
+                        var cleanup = new ProcessStartInfo("netsh",
+                            $"advfirewall firewall delete rule name=\"{ruleName}\"")
+                        {
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        using var proc = Process.Start(cleanup);
+                        proc?.WaitForExit(5000);
+                    }
+                    catch { }
                 }
             }, stoppingToken);
 
+            // 7. Start reading from hook pipe (C# PipeServer receives data via native callback)
             await _mqttDataReader.StartAsync(stoppingToken);
         }
         catch (OperationCanceledException) { }

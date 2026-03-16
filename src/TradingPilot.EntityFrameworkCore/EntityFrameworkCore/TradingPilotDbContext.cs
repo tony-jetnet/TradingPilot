@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using TradingPilot.Symbols;
+using TradingPilot.Trading;
 using Volo.Abp.Data;
 using Volo.Abp.EntityFrameworkCore;
 
@@ -14,6 +15,7 @@ public class TradingPilotDbContext : AbpDbContext<TradingPilotDbContext>
     public DbSet<SymbolNews> SymbolNews { get; set; }
     public DbSet<SymbolCapitalFlow> SymbolCapitalFlows { get; set; }
     public DbSet<SymbolFinancialSnapshot> SymbolFinancialSnapshots { get; set; }
+    public DbSet<TradingSignalRecord> TradingSignals { get; set; }
 
     public TradingPilotDbContext(DbContextOptions<TradingPilotDbContext> options)
         : base(options)

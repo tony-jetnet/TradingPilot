@@ -20,6 +20,7 @@ using Volo.Abp.AspNetCore.Components.WebAssembly.Theming.Bundling;
 using Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme.Bundling;
 using Volo.Abp.Swashbuckle;
 using TradingPilot.Symbols;
+using TradingPilot.Trading;
 using TradingPilot.Webull;
 
 namespace TradingPilot.Blazor;
@@ -103,6 +104,10 @@ public class TradingPilotBlazorModule : AbpModule
 
         // Webull gRPC client (singleton — long-lived HTTP/2 channel)
         context.Services.AddSingleton<WebullGrpcClient>();
+
+        // Trading signal analysis engine (singleton — analyzes L2 data for buy/sell signals)
+        context.Services.AddSingleton<MarketMicrostructureAnalyzer>();
+        context.Services.AddSingleton<SignalStore>();
 
         // MQTT message processor (singleton — processes real-time MQTT data into structured DB entities)
         context.Services.AddSingleton<MqttMessageProcessor>();

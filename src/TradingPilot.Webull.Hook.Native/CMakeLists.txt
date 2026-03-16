@@ -39,6 +39,9 @@ target_compile_options(hook_native PRIVATE
     $<$<C_COMPILER_ID:MSVC>:/O2 /GS- /W3>
 )
 
+# Link Winsock for TCP
+target_link_libraries(hook_native PRIVATE ws2_32)
+
 # No default libraries bloat
 target_link_options(hook_native PRIVATE
     /NODEFAULTLIB:msvcrt.lib

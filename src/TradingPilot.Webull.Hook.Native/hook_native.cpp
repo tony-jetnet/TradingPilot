@@ -6,9 +6,113 @@
 // MinHook handles CFG, security cookies, and instruction relocation properly,
 // which our custom X64Hook in C# cannot do for messageReceived.
 
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <stdio.h>
 #include "MinHook.h"
+
+#pragma comment(lib, "ws2_32.lib")
+
+// ═══════════════════════════════════════════════════════════════════
+// TCP socket server — sends MQTT messages to Blazor app on localhost
+// Protocol: [1B type=0x00][4B topicLen][topic][4B payloadLen][payload]
+// Port 19880 on localhost (chosen to avoid conflicts)
+// ═══════════════════════════════════════════════════════════════════
+
+#define TCP_PORT 19880
+
+static SOCKET g_clientSocket = INVALID_SOCKET;
+static CRITICAL_SECTION g_tcpLock;
+static volatile bool g_tcpInited = false;
+static volatile bool g_tcpConnected = false;
+
+static void InitTcp() {
+    if (!g_tcpInited) {
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+        InitializeCriticalSection(&g_tcpLock);
+        g_tcpInited = true;
+    }
+}
+
+static bool SendAll(SOCKET s, const char* buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int r = send(s, buf + sent, len - sent, 0);
+        if (r <= 0) return false;
+        sent += r;
+    }
+    return true;
+}
+
+// TCP server thread — listens on localhost:19880, accepts one client
+static DWORD WINAPI TcpServerThread(LPVOID param) {
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) return 1;
+
+    // Allow quick rebind after restart
+    int reuse = 1;
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(TCP_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 only
+
+    if (bind(listenSock, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        closesocket(listenSock);
+        return 2;
+    }
+    listen(listenSock, 1);
+
+    while (true) {
+        SOCKET client = accept(listenSock, NULL, NULL);
+        if (client == INVALID_SOCKET) {
+            Sleep(1000);
+            continue;
+        }
+
+        // Disable Nagle for low latency
+        int nodelay = 1;
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
+
+        EnterCriticalSection(&g_tcpLock);
+        if (g_clientSocket != INVALID_SOCKET) closesocket(g_clientSocket);
+        g_clientSocket = client;
+        g_tcpConnected = true;
+        LeaveCriticalSection(&g_tcpLock);
+
+        // Wait until disconnected
+        while (g_tcpConnected) {
+            Sleep(100);
+        }
+    }
+    return 0;
+}
+
+static void SendToTcp(const char* topic, int topicLen, const char* payload, int payloadLen) {
+    if (!g_tcpInited || !g_tcpConnected) return;
+    EnterCriticalSection(&g_tcpLock);
+    __try {
+        if (g_clientSocket == INVALID_SOCKET || !g_tcpConnected) __leave;
+        char msgType = 0x00;
+        if (!SendAll(g_clientSocket, &msgType, 1)) goto tcp_err;
+        if (!SendAll(g_clientSocket, (const char*)&topicLen, 4)) goto tcp_err;
+        if (topicLen > 0 && !SendAll(g_clientSocket, topic, topicLen)) goto tcp_err;
+        if (!SendAll(g_clientSocket, (const char*)&payloadLen, 4)) goto tcp_err;
+        if (payloadLen > 0 && !SendAll(g_clientSocket, payload, payloadLen)) goto tcp_err;
+        __leave;
+    tcp_err:
+        g_tcpConnected = false;
+        closesocket(g_clientSocket);
+        g_clientSocket = INVALID_SOCKET;
+    }
+    __finally {
+        LeaveCriticalSection(&g_tcpLock);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // Callback type: called by the detour to forward message data to C#
@@ -79,84 +183,17 @@ static const wchar_t* ReadQStringData(void* qstrPtr, int* outLen) {
 // Detour function
 // ═══════════════════════════════════════════════════════════════════
 
-// Simple log to file for debugging
-static void DebugLog(const char* fmt, ...) {
-    static CRITICAL_SECTION logLock;
-    static bool logInit = false;
-    if (!logInit) { InitializeCriticalSection(&logLock); logInit = true; }
-    EnterCriticalSection(&logLock);
-    FILE* f = fopen("D:\\Third-Parties\\WebullHook\\hook_native.log", "a");
-    if (f) {
-        va_list args;
-        va_start(args, fmt);
-        vfprintf(f, fmt, args);
-        va_end(args);
-        fprintf(f, "\n");
-        fclose(f);
-    }
-    LeaveCriticalSection(&logLock);
-}
-
 static void __fastcall Detour_messageReceived(void* thisPtr, void* qByteArrayRef, void* qMqttTopicNameRef) {
-    LONG count = InterlockedIncrement(&g_messageCount);
+    InterlockedIncrement(&g_messageCount);
 
     __try {
-        // Debug: dump first few messages' raw QArrayData
-        if (count <= 3) {
-            DebugLog("MSG #%d: this=%p ba=%p topic=%p", count, thisPtr, qByteArrayRef, qMqttTopicNameRef);
-            if (qMqttTopicNameRef) {
-                QArrayData* td = *(QArrayData**)qMqttTopicNameRef;
-                if (td) {
-                    DebugLog("  topic QArrayData: ref=%d size=%d alloc=%u offset=%lld addr=%p",
-                        td->ref, td->size, td->alloc, td->offset, td);
-                    const char* rawData = (const char*)td + td->offset;
-                    // Dump first 40 bytes as hex
-                    char hex[128] = {0};
-                    int dumpLen = td->size * 2 < 40 ? td->size * 2 : 40;  // UTF-16 = 2 bytes per char
-                    for (int i = 0; i < dumpLen && i < 40; i++)
-                        sprintf(hex + i*2, "%02X", (unsigned char)rawData[i]);
-                    DebugLog("  topic raw data: %s", hex);
-                }
-            }
-            if (qByteArrayRef) {
-                QArrayData* bd = *(QArrayData**)qByteArrayRef;
-                if (bd) {
-                    DebugLog("  payload QArrayData: ref=%d size=%d alloc=%u offset=%lld addr=%p",
-                        bd->ref, bd->size, bd->alloc, bd->offset, bd);
-                    const char* rawData = (const char*)bd + bd->offset;
-                    // Dump first 80 bytes as text
-                    char preview[81] = {0};
-                    int previewLen = bd->size < 80 ? bd->size : 80;
-                    memcpy(preview, rawData, previewLen);
-                    // Replace non-printable chars
-                    for (int i = 0; i < previewLen; i++)
-                        if (preview[i] < 32 || preview[i] > 126) preview[i] = '.';
-                    DebugLog("  payload preview: %s", preview);
-                }
-            }
-        }
-
-        // Read topic (QString/QMqttTopicName -> UTF-16)
-        int topicWLen = 0;
-        const wchar_t* topicW = ReadQStringData(qMqttTopicNameRef, &topicWLen);
-
-        // Convert UTF-16 topic to UTF-8
-        char topicUtf8[4096];
-        int topicUtf8Len = 0;
-        if (topicW && topicWLen > 0) {
-            topicUtf8Len = WideCharToMultiByte(CP_UTF8, 0, topicW, topicWLen,
-                topicUtf8, sizeof(topicUtf8) - 1, NULL, NULL);
-            if (topicUtf8Len < 0) topicUtf8Len = 0;
-        }
-
-        // Read payload (QByteArray)
+        // Skip topic reading — QMqttTopicName always returns empty/garbage.
+        // Only read the QByteArray payload (offset=24 is standard QArrayData).
         int payloadLen = 0;
         const char* payload = ReadQByteArrayData(qByteArrayRef, &payloadLen);
 
-        // Forward to C# callback
-        if (g_callback) {
-            g_callback(topicUtf8, topicUtf8Len, payload ? payload : "", payloadLen);
-        }
+        // Send directly via TCP socket to Blazor app
+        SendToTcp("", 0, payload ? payload : "", payloadLen);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         // Silently ignore read errors to avoid crashing the host process
@@ -187,6 +224,10 @@ __declspec(dllexport) void SetMessageCallback(MessageCallback cb) {
 ///   2xx = MH_EnableHook error (200 + MH_STATUS)
 ///   Other = MH_Initialize error
 __declspec(dllexport) int InstallMessageReceivedHook(void* targetAddr) {
+    InitTcp();
+    // Start TCP server thread for sending data to Blazor app
+    CreateThread(NULL, 0, TcpServerThread, NULL, 0, NULL);
+
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
         return (int)status;
