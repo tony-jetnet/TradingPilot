@@ -86,6 +86,7 @@ internal static unsafe class CommandReceiver
                 "ping" => HandlePing(),
                 "status" => HandleStatus(),
                 "subscribe" => HandleSubscribe(root),
+                "reconnect" => HandleReconnect(),
                 _ => $$$"""{"ok":false,"error":"unknown command: {{{cmd}}}"}"""
             };
         }
@@ -104,6 +105,32 @@ internal static unsafe class CommandReceiver
     private static string HandleStatus()
     {
         return $$$"""{"ok":true,"mqttClient":"0x{{{HookEntry.MqttClient:X}}}","hasClient":{{{(HookEntry.MqttClient != 0 ? "true" : "false")}}},"hasInvokeSubscribe":{{{(HookEntry.OrigInvokeSubscribeResult != 0 ? "true" : "false")}}},"messageCount":{{{HookEntry.MessageCount}}},"subscribeCount":{{{HookEntry.SubscribeCount}}}}""";
+    }
+
+    private static string HandleReconnect()
+    {
+        nint client = HookEntry.MqttClient;
+        if (client == 0)
+            return """{"ok":false,"error":"no mqtt client"}""";
+
+        nint disconnectFn = HookEntry.OrigDisconnectFromHost;
+        nint connectFn = HookEntry.OrigConnectToHost;
+
+        if (disconnectFn == 0 || connectFn == 0)
+            return """{"ok":false,"error":"disconnect/connect trampolines not available"}""";
+
+        HookLog.Write($"CmdPipe: reconnecting client 0x{client:X}...");
+
+        var disconnect = (delegate* unmanaged<nint, void>)disconnectFn;
+        disconnect(client);
+
+        Thread.Sleep(1000);
+
+        var connect = (delegate* unmanaged<nint, void>)connectFn;
+        connect(client);
+
+        HookLog.Write("CmdPipe: reconnect initiated.");
+        return """{"ok":true,"msg":"reconnecting"}""";
     }
 
     private static string HandleSubscribe(JsonElement root)

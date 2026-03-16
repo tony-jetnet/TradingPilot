@@ -3,7 +3,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using Volo.Abp.DependencyInjection;
 
-namespace TradingPilot.Webull.Hook;
+namespace TradingPilot.Webull;
 
 /// <summary>
 /// Reads intercepted MQTT messages and hook events from the named pipe exposed by the injected hook DLL.

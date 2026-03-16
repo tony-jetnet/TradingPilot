@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using TradingPilot.EntityFrameworkCore;
@@ -12,9 +13,11 @@ using Volo.Abp.EntityFrameworkCore;
 namespace TradingPilot.Migrations
 {
     [DbContext(typeof(TradingPilotDbContext))]
-    partial class TradingPilotDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260316035821_AddSymbolNewsTable")]
+    partial class AddSymbolNewsTable
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -235,139 +238,6 @@ namespace TradingPilot.Migrations
                     b.ToTable("SymbolBookSnapshots", (string)null);
                 });
 
-            modelBuilder.Entity("TradingPilot.Symbols.SymbolCapitalFlow", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTime>("CollectedAt")
-                        .HasColumnType("timestamp without time zone");
-
-                    b.Property<DateOnly>("Date")
-                        .HasColumnType("date");
-
-                    b.Property<decimal>("LargeInflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<decimal>("LargeOutflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<decimal>("MediumInflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<decimal>("MediumOutflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<decimal>("SmallInflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<decimal>("SmallOutflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<decimal>("SuperLargeInflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<decimal>("SuperLargeOutflow")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("SymbolId", "Date")
-                        .IsUnique()
-                        .HasDatabaseName("IX_SymbolCapitalFlows_SymbolId_Date");
-
-                    b.ToTable("SymbolCapitalFlows", (string)null);
-                });
-
-            modelBuilder.Entity("TradingPilot.Symbols.SymbolFinancialSnapshot", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .HasColumnType("uuid");
-
-                    b.Property<decimal?>("AvgVolume")
-                        .HasPrecision(18, 2)
-                        .HasColumnType("numeric(18,2)");
-
-                    b.Property<decimal?>("Beta")
-                        .HasPrecision(8, 4)
-                        .HasColumnType("numeric(8,4)");
-
-                    b.Property<DateTime>("CollectedAt")
-                        .HasColumnType("timestamp without time zone");
-
-                    b.Property<DateOnly>("Date")
-                        .HasColumnType("date");
-
-                    b.Property<decimal?>("DividendYield")
-                        .HasPrecision(8, 4)
-                        .HasColumnType("numeric(8,4)");
-
-                    b.Property<decimal?>("Eps")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal?>("EstEps")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal?>("ForwardPe")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal?>("High52w")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal?>("Low52w")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<decimal?>("MarketCap")
-                        .HasPrecision(18, 2)
-                        .HasColumnType("numeric(18,2)");
-
-                    b.Property<string>("NextEarningsDate")
-                        .HasMaxLength(50)
-                        .HasColumnType("character varying(50)");
-
-                    b.Property<decimal?>("Pe")
-                        .HasPrecision(12, 4)
-                        .HasColumnType("numeric(12,4)");
-
-                    b.Property<string>("RawJson")
-                        .HasColumnType("jsonb");
-
-                    b.Property<decimal?>("ShortFloat")
-                        .HasPrecision(8, 4)
-                        .HasColumnType("numeric(8,4)");
-
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
-
-                    b.Property<decimal?>("Volume")
-                        .HasPrecision(18, 2)
-                        .HasColumnType("numeric(18,2)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("SymbolId", "Date")
-                        .IsUnique()
-                        .HasDatabaseName("IX_SymbolFinancialSnapshots_SymbolId_Date");
-
-                    b.ToTable("SymbolFinancialSnapshots", (string)null);
-                });
-
             modelBuilder.Entity("TradingPilot.Symbols.SymbolNews", b =>
                 {
                     b.Property<Guid>("Id")
@@ -424,24 +294,6 @@ namespace TradingPilot.Migrations
                 });
 
             modelBuilder.Entity("TradingPilot.Symbols.SymbolBookSnapshot", b =>
-                {
-                    b.HasOne("TradingPilot.Symbols.Symbol", null)
-                        .WithMany()
-                        .HasForeignKey("SymbolId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
-                });
-
-            modelBuilder.Entity("TradingPilot.Symbols.SymbolCapitalFlow", b =>
-                {
-                    b.HasOne("TradingPilot.Symbols.Symbol", null)
-                        .WithMany()
-                        .HasForeignKey("SymbolId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
-                });
-
-            modelBuilder.Entity("TradingPilot.Symbols.SymbolFinancialSnapshot", b =>
                 {
                     b.HasOne("TradingPilot.Symbols.Symbol", null)
                         .WithMany()

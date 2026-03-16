@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using TradingPilot.Symbols;
 using Volo.Abp.Data;
 using Volo.Abp.EntityFrameworkCore;
 
@@ -7,7 +8,12 @@ namespace TradingPilot.EntityFrameworkCore;
 [ConnectionStringName("Default")]
 public class TradingPilotDbContext : AbpDbContext<TradingPilotDbContext>
 {
-    /* Add DbSet properties for your Aggregate Roots / Entities here. */
+    public DbSet<Symbol> Symbols { get; set; }
+    public DbSet<SymbolBar> SymbolBars { get; set; }
+    public DbSet<SymbolBookSnapshot> SymbolBookSnapshots { get; set; }
+    public DbSet<SymbolNews> SymbolNews { get; set; }
+    public DbSet<SymbolCapitalFlow> SymbolCapitalFlows { get; set; }
+    public DbSet<SymbolFinancialSnapshot> SymbolFinancialSnapshots { get; set; }
 
     public TradingPilotDbContext(DbContextOptions<TradingPilotDbContext> options)
         : base(options)
@@ -18,6 +24,6 @@ public class TradingPilotDbContext : AbpDbContext<TradingPilotDbContext>
     {
         base.OnModelCreating(builder);
 
-        /* Configure your own tables/entities inside here */
+        builder.ConfigureTradingPilot();
     }
 }

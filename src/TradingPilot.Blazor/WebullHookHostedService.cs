@@ -5,7 +5,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using TradingPilot.Webull.Hook;
+using TradingPilot.Webull;
 
 namespace TradingPilot.Blazor;
 
@@ -16,15 +16,18 @@ public partial class WebullHookHostedService : BackgroundService
 {
     private readonly ILogger<WebullHookHostedService> _logger;
     private readonly MqttDataReader _mqttDataReader;
+    private readonly MqttMessageProcessor _mqttProcessor;
     private bool _weStartedWebull;
     private int? _webullPid;
 
     public WebullHookHostedService(
         ILogger<WebullHookHostedService> logger,
-        MqttDataReader mqttDataReader)
+        MqttDataReader mqttDataReader,
+        MqttMessageProcessor mqttProcessor)
     {
         _logger = logger;
         _mqttDataReader = mqttDataReader;
+        _mqttProcessor = mqttProcessor;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -86,6 +89,19 @@ public partial class WebullHookHostedService : BackgroundService
                 msgCount++;
                 if (msgCount <= 5 || msgCount % 100 == 0)
                     _logger.LogInformation("MQTT #{Count}: topic={Topic} ({Bytes} bytes)", msgCount, topic, payload.Length);
+
+                // Process message asynchronously (fire-and-forget with error logging)
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _mqttProcessor.ProcessMessageAsync(topic, payload);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "MQTT message processing failed for topic {Topic}", topic);
+                    }
+                });
             };
 
             _mqttDataReader.EventReceived += (eventType, data) =>
@@ -117,6 +133,44 @@ public partial class WebullHookHostedService : BackgroundService
                     }
                 }
             };
+
+            // 6. Trigger MQTT reconnect to force Webull to re-subscribe (captures auth headers)
+            // Polls until MQTT client is captured, then sends reconnect
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    // Wait for Webull to establish MQTT connection (hook captures client pointer)
+                    for (int i = 0; i < 60; i++)
+                    {
+                        await Task.Delay(5000, stoppingToken);
+                        bool hasClient;
+                        using (var statusCmd = new MqttCommandWriter())
+                        {
+                            await statusCmd.ConnectAsync(5000, stoppingToken);
+                            using var status = await statusCmd.GetStatusAsync(stoppingToken);
+                            hasClient = status.RootElement.TryGetProperty("hasClient", out var hc) && hc.ValueKind == System.Text.Json.JsonValueKind.True;
+                        }
+                        if (hasClient)
+                        {
+                            _logger.LogInformation("MQTT client captured. Sending reconnect to force auth capture...");
+                            using var cmd = new MqttCommandWriter();
+                            await cmd.ConnectAsync(5000, stoppingToken);
+                            using var result = await cmd.ReconnectAsync(stoppingToken);
+                            _logger.LogInformation("Reconnect response: {Response}", result.RootElement.ToString());
+                            return;
+                        }
+                        if (i % 6 == 0)
+                            _logger.LogDebug("Waiting for MQTT client to be captured ({Attempt}/60)...", i + 1);
+                    }
+                    _logger.LogWarning("MQTT client was never captured after 5 minutes. Auth may need manual trigger.");
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Reconnect command failed: {Message}", ex.Message);
+                }
+            }, stoppingToken);
 
             await _mqttDataReader.StartAsync(stoppingToken);
         }

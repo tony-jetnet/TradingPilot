@@ -4,7 +4,7 @@ using System.Text;
 using Microsoft.Extensions.Logging;
 using Volo.Abp.DependencyInjection;
 
-namespace TradingPilot.Webull.Hook;
+namespace TradingPilot.Webull;
 
 /// <summary>
 /// Injects a native DLL into a target process using CreateRemoteThread + LoadLibraryW.

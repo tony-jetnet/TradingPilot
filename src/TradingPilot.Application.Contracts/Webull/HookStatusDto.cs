@@ -1,4 +1,4 @@
-namespace TradingPilot.Webull.Hook;
+namespace TradingPilot.Webull;
 
 public class HookStatusDto
 {

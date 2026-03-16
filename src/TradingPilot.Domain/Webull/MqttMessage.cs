@@ -1,4 +1,4 @@
-namespace TradingPilot.Webull.Hook;
+namespace TradingPilot.Webull;
 
 /// <summary>
 /// Represents a captured MQTT message from the Webull hook.

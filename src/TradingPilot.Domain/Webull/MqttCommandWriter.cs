@@ -2,7 +2,7 @@ using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 
-namespace TradingPilot.Webull.Hook;
+namespace TradingPilot.Webull;
 
 /// <summary>
 /// Connects to the hook's command pipe to send commands (subscribe, ping, status).
@@ -56,6 +56,11 @@ public sealed class MqttCommandWriter : IDisposable
     public async Task<JsonDocument> SubscribeAsync(string subscriptionJson, CancellationToken ct = default)
     {
         return await SendCommandAsync(new { cmd = "subscribe", json = subscriptionJson }, ct);
+    }
+
+    public async Task<JsonDocument> ReconnectAsync(CancellationToken ct = default)
+    {
+        return await SendCommandAsync(new { cmd = "reconnect" }, ct);
     }
 
     public void Dispose()

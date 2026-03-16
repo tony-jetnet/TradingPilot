@@ -1,6 +1,6 @@
 using Volo.Abp.Application.Services;
 
-namespace TradingPilot.Webull.Hook;
+namespace TradingPilot.Webull;
 
 public interface IWebullHookAppService : IApplicationService
 {

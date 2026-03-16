@@ -17,7 +17,19 @@
       "Bash(powershell -Command \"Get-Process ''Webull Desktop'' -ErrorAction SilentlyContinue | Select-Object Id, WorkingSet64, Responding | Format-Table -AutoSize\")",
       "Read(//d/Third-Parties/TradingPilot/$LOCALAPPDATA/WebullHook/**)",
       "Bash(rm:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Read(//c/Users/chenx/.nuget/packages/volo.abp.ddd.domain/10.1.0/lib/net10.0/**)",
+      "Read(//c/Users/chenx/.nuget/packages/**)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(for dll:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Program Files \\(x86\\)/Webull Desktop/**)",
+      "Bash(done)",
+      "Bash(grep:*)",
+      "Bash(which strings:*)",
+      "Bash(redis-cli:*)",
+      "Bash(powershell -ExecutionPolicy Bypass -File D:/Third-Parties/TradingPilot/test/test_all_endpoints4.ps1 2>&1)"
     ]
   }
 }

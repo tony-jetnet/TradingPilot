@@ -4,7 +4,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Volo.Abp.Application.Services;
 
-namespace TradingPilot.Webull.Hook;
+namespace TradingPilot.Webull;
 
 public class WebullHookAppService : ApplicationService, IWebullHookAppService
 {
@@ -23,7 +23,24 @@ public class WebullHookAppService : ApplicationService, IWebullHookAppService
     private static MqttCommandWriter? _commandWriter;
     private static string? _capturedAuthHeader;
 
+    private static readonly string AuthFilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "WebullHook", "auth_header.json");
+
+    public static string? CapturedAuthHeader => _capturedAuthHeader;
+
     private const int MaxRecentMessages = 500;
+
+    static WebullHookAppService()
+    {
+        // Load persisted auth header on first access
+        try
+        {
+            if (File.Exists(AuthFilePath))
+                _capturedAuthHeader = File.ReadAllText(AuthFilePath).Trim();
+        }
+        catch { }
+    }
 
     public WebullHookAppService(
         ProcessInjector processInjector,
@@ -215,15 +232,22 @@ public class WebullHookAppService : ApplicationService, IWebullHookAppService
     private static void OnEventReceived(string eventType, byte[] data)
     {
         string text = Encoding.UTF8.GetString(data);
-        if (eventType == "subscribe" && _capturedAuthHeader == null)
+        if (eventType == "subscribe")
         {
-            // Try to extract the auth header from the subscription JSON
+            // Extract and persist the auth header from subscription JSON
             try
             {
                 using var doc = JsonDocument.Parse(text);
                 if (doc.RootElement.TryGetProperty("header", out var header))
                 {
                     _capturedAuthHeader = header.ToString();
+                    // Persist to file for reuse across restarts
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(AuthFilePath)!);
+                        File.WriteAllText(AuthFilePath, _capturedAuthHeader);
+                    }
+                    catch { }
                 }
             }
             catch { }

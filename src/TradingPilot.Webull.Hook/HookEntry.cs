@@ -92,6 +92,8 @@ public static unsafe class HookEntry
     // ═══════════════════════════════════════════════════════════════════
     internal static nint MqttClient => _mqttClient;
     internal static nint OrigInvokeSubscribeResult => _orig_invokeSubscribeResult;
+    internal static nint OrigDisconnectFromHost => _orig_disconnectFromHost;
+    internal static nint OrigConnectToHost => _orig_connectToHost;
     internal static int MessageCount => _messageCount;
     internal static int SubscribeCount => _subscribeCount;
 
