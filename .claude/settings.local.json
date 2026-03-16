@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(where:*)",
+      "Bash(python:*)",
+      "Bash(cd:*)",
+      "Bash(ls:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet restore:*)",
+      "Bash(tree:*)",
+      "Bash(export:*)",
+      "Bash(powershell -Command \"Get-ChildItem -Path 'C:\\\\Program Files \\(x86\\)\\\\Webull Desktop' -Recurse -Include '*.conf','*.ini','*.json','*.cfg','*.xml','*.yaml','*.yml','*.properties' -ErrorAction SilentlyContinue | Select-Object FullName, Length | Format-Table -AutoSize\" 2>&1)",
+      "Bash(powershell -Command \"Get-ChildItem -Path 'C:\\\\Users\\\\chenx\\\\AppData\\\\Roaming\\\\Webull Desktop\\\\Webull Desktop' -Recurse -Include '*.ini','*.json','*.db','*.sqlite' -ErrorAction SilentlyContinue | Where-Object { \\\\$_.Length -gt 0 -and \\\\$_.Length -lt 1000000 } | Select-Object FullName, Length | Sort-Object FullName | Format-Table -AutoSize\" 2>&1)",
+      "Bash(powershell -Command \"sqlite3 'C:\\\\Users\\\\chenx\\\\AppData\\\\Roaming\\\\Webull Desktop\\\\Webull Desktop\\\\settings\\\\settings.db' '.tables' 2>&1\" 2>&1)",
+      "Bash(taskkill:*)",
+      "Bash(powershell -Command \"Get-Process ''Webull Desktop'' -ErrorAction SilentlyContinue | Select-Object Id, WorkingSet64, Responding | Format-Table -AutoSize\")",
+      "Read(//d/Third-Parties/TradingPilot/$LOCALAPPDATA/WebullHook/**)",
+      "Bash(rm:*)",
+      "Bash(find:*)"
+    ]
+  }
+}

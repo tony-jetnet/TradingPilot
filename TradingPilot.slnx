@@ -1,0 +1,26 @@
+<Solution>
+    <Configurations>
+        <Platform Name="Any CPU" />
+    </Configurations>
+    <Folder Name="/src/">
+        <Project Path="src/TradingPilot.Webull.Hook/TradingPilot.Webull.Hook.csproj" />
+        <Project Path="src/TradingPilot.Domain/TradingPilot.Domain.csproj" />
+        <Project Path="src/TradingPilot.Application/TradingPilot.Application.csproj" />
+        <Project Path="src/TradingPilot.EntityFrameworkCore/TradingPilot.EntityFrameworkCore.csproj" />
+        <Project Path="src/TradingPilot.Domain.Shared/TradingPilot.Domain.Shared.csproj" />
+        <Project Path="src/TradingPilot.Application.Contracts/TradingPilot.Application.Contracts.csproj" />
+        <Project Path="src/TradingPilot.HttpApi/TradingPilot.HttpApi.csproj" />
+        <Project Path="src/TradingPilot.HttpApi.Client/TradingPilot.HttpApi.Client.csproj" />
+        <Project Path="src/TradingPilot.DbMigrator/TradingPilot.DbMigrator.csproj" />
+        <Project Path="src/TradingPilot.HttpApi.Host/TradingPilot.HttpApi.Host.csproj" />
+        <Project Path="src/TradingPilot.Blazor/TradingPilot.Blazor.csproj" />
+        <Project Path="src/TradingPilot.Blazor.Client/TradingPilot.Blazor.Client.csproj" />
+    </Folder>
+    <Folder Name="/test/">
+        <Project Path="test/TradingPilot.Application.Tests/TradingPilot.Application.Tests.csproj" />
+        <Project Path="test/TradingPilot.EntityFrameworkCore.Tests/TradingPilot.EntityFrameworkCore.Tests.csproj" />
+        <Project Path="test/TradingPilot.TestBase/TradingPilot.TestBase.csproj" />
+        <Project Path="test/TradingPilot.Domain.Tests/TradingPilot.Domain.Tests.csproj" />
+        <Project Path="test/TradingPilot.HttpApi.Client.ConsoleTestApp/TradingPilot.HttpApi.Client.ConsoleTestApp.csproj" />
+    </Folder>
+</Solution>
