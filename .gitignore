@@ -263,6 +263,7 @@ src/TradingPilot.AuthServer/Logs/*
 src/TradingPilot.HttpApi.Host/Logs/*
 src/TradingPilot.HttpApi.Host/Logs/*
 src/TradingPilot.DbMigrator/Logs/*
+src/TradingPilot.Blazor/Logs/*
 src/TradingPilot.Blazor.Server/Logs/*
 src/TradingPilot.Blazor.Server.Tiered/Logs/*
 
