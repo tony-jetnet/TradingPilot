@@ -37,12 +37,15 @@ public class RefreshFundamentalsJob
         _logger = logger;
     }
 
+    private static readonly string AuthFilePath = Path.Combine(
+        @"D:\Third-Parties\WebullHook", "auth_header.json");
+
     public async Task ExecuteAsync()
     {
-        string? authHeader = WebullHookAppService.CapturedAuthHeader;
+        string? authHeader = ResolveAuthHeader();
         if (authHeader == null)
         {
-            _logger.LogWarning("Auth header not captured yet, skipping fundamentals refresh");
+            _logger.LogWarning("No auth header available (memory or file), skipping fundamentals refresh");
             return;
         }
 
@@ -168,5 +171,23 @@ public class RefreshFundamentalsJob
 
         _logger.LogInformation("Financial snapshot saved for {Ticker}: PE={Pe}, EPS={Eps}, MCap={MCap}",
             symbol.Ticker, data.Pe, data.Eps, data.MarketCap);
+    }
+
+    private static string? ResolveAuthHeader()
+    {
+        var header = WebullHookAppService.CapturedAuthHeader;
+        if (!string.IsNullOrWhiteSpace(header))
+            return header;
+        try
+        {
+            if (File.Exists(AuthFilePath))
+            {
+                var content = File.ReadAllText(AuthFilePath).Trim();
+                if (!string.IsNullOrWhiteSpace(content))
+                    return content;
+            }
+        }
+        catch { }
+        return null;
     }
 }

@@ -114,6 +114,9 @@ public class TradingPilotBlazorModule : AbpModule
         // Webull gRPC client (singleton — long-lived HTTP/2 channel)
         context.Services.AddSingleton<WebullGrpcClient>();
 
+        // Strategy rule evaluator (singleton — evaluates AI-generated rules at runtime)
+        context.Services.AddSingleton<StrategyRuleEvaluator>();
+
         // Trading signal analysis engine (singleton — analyzes L2 data for buy/sell signals)
         context.Services.AddSingleton<MarketMicrostructureAnalyzer>();
         context.Services.AddSingleton<SignalStore>();
@@ -126,6 +129,12 @@ public class TradingPilotBlazorModule : AbpModule
 
         // MQTT message processor (singleton — processes real-time MQTT data into structured DB entities)
         context.Services.AddSingleton<MqttMessageProcessor>();
+
+        // Nightly model trainer (transient — runs after market close via Hangfire)
+        context.Services.AddTransient<NightlyModelTrainer>();
+
+        // Nightly AI strategy optimizer (transient — Bedrock Sonnet 4.6, runs after market close)
+        context.Services.AddTransient<NightlyStrategyOptimizer>();
 
         // Register the Webull hook hosted service
         context.Services.AddHostedService<WebullHookHostedService>();
@@ -158,7 +167,10 @@ public class TradingPilotBlazorModule : AbpModule
             options.SwaggerEndpoint("/swagger/v1/swagger.json", "TradingPilot API");
         });
         app.UseAbpSerilogEnrichers();
-        app.UseHangfireDashboard("/hangfire");
+        app.UseHangfireDashboard("/hangfire", new Hangfire.DashboardOptions
+        {
+            Authorization = [new HangfireNoAuthFilter()]
+        });
 
         app.UseConfiguredEndpoints(builder =>
         {
@@ -187,6 +199,12 @@ public class TradingPilotBlazorModule : AbpModule
             "poll-l2-depth",
             job => job.ExecuteAsync(),
             Cron.Minutely());
+
+        // Recurring bar refresh (every 30 min during market hours to keep data fresh)
+        recurringJobs.AddOrUpdate<LoadHistoricalBarsJob>(
+            "refresh-bars",
+            job => job.RefreshAllAsync(),
+            "*/30 * * * *");
         recurringJobs.AddOrUpdate<RefreshNewsJob>(
             "refresh-news",
             job => job.ExecuteAsync(),
@@ -196,7 +214,40 @@ public class TradingPilotBlazorModule : AbpModule
             job => job.ExecuteAsync(),
             "*/30 * * * *"); // every 30 min
 
+        // Nightly model training: 9 PM ET weekdays (after market close)
+        recurringJobs.AddOrUpdate<NightlyModelTrainer>(
+            "nightly-model-training",
+            trainer => trainer.TrainAsync(20),
+            "0 21 * * 1-5",
+            new RecurringJobOptions
+            {
+                TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
+            });
+
+        // Nightly AI strategy optimization: 9:15 PM ET weekdays (after model training)
+        recurringJobs.AddOrUpdate<NightlyStrategyOptimizer>(
+            "nightly-strategy-optimization",
+            optimizer => optimizer.OptimizeAsync(20),
+            "15 21 * * 1-5",
+            new RecurringJobOptions
+            {
+                TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
+            });
+
+        // Nightly data cleanup: 9:30 PM ET weekdays (after optimization completes)
+        // Retention: SymbolBookSnapshots=3 days, TickSnapshots=30 days, rest=forever
+        recurringJobs.AddOrUpdate<NightlyStrategyOptimizer>(
+            "nightly-data-cleanup",
+            optimizer => optimizer.CleanupOldDataAsync(),
+            "30 21 * * 1-5",
+            new RecurringJobOptions
+            {
+                TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
+            });
+
         // One-shot startup recovery (30s delay for auth capture)
+        // Lightweight: takes L2 snapshot + backfills news only.
+        // Heavy backfill (TickSnapshots + TradingSignals from bars) runs nightly.
         jobClient.Schedule<StartupRecoveryJob>(
             job => job.ExecuteAsync(),
             TimeSpan.FromSeconds(30));

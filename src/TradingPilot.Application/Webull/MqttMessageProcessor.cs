@@ -182,6 +182,9 @@ public class MqttMessageProcessor
 
         _l2Cache.AddSnapshot(decoded.TickerId, snapshot);
 
+        // Compute L2-derived features and store in TickDataCache
+        _tickCache.UpdateL2Features(decoded.TickerId, snapshot);
+
         // Analyze for trading signals
         var signal = _analyzer.AnalyzeSnapshot(decoded.TickerId, symbol.Ticker, snapshot);
         if (signal != null && signal.Type != SignalType.Hold)
@@ -322,6 +325,14 @@ public class MqttMessageProcessor
                 UptickCount = tickData.UptickCount,
                 DowntickCount = tickData.DowntickCount,
                 TickMomentum = tickData.TickMomentum,
+                // L2-derived features
+                BookDepthRatio = tickData.BookDepthRatio,
+                BidWallSize = tickData.BidWallSize,
+                AskWallSize = tickData.AskWallSize,
+                BidSweepCost = tickData.BidSweepCost,
+                AskSweepCost = tickData.AskSweepCost,
+                ImbalanceVelocity = tickData.ImbalanceVelocity,
+                SpreadPercentile = tickData.SpreadPercentile,
             };
 
             using var scope = _scopeFactory.CreateScope();
@@ -425,6 +436,9 @@ public class MqttMessageProcessor
         };
 
         _l2Cache.AddSnapshot(tickerId, snapshot);
+
+        // Compute L2-derived features and store in TickDataCache
+        _tickCache.UpdateL2Features(tickerId, snapshot);
 
         // Analyze for trading signals
         var signal = _analyzer.AnalyzeSnapshot(tickerId, symbol.Ticker, snapshot);

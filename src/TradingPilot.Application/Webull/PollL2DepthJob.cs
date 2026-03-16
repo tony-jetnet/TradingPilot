@@ -1,6 +1,7 @@
 using Hangfire;
 using Microsoft.Extensions.Logging;
 using TradingPilot.Symbols;
+using TradingPilot.Trading;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Linq;
 using Volo.Abp.Uow;
@@ -17,7 +18,11 @@ public class PollL2DepthJob
     private readonly IAsyncQueryableExecuter _asyncExecuter;
     private readonly IUnitOfWorkManager _uowManager;
     private readonly L2BookCache _cache;
+    private readonly TickDataCache _tickCache;
     private readonly ILogger<PollL2DepthJob> _logger;
+
+    private static readonly string AuthFilePath = Path.Combine(
+        @"D:\Third-Parties\WebullHook", "auth_header.json");
 
     public PollL2DepthJob(
         IWebullApiClient api,
@@ -26,6 +31,7 @@ public class PollL2DepthJob
         IAsyncQueryableExecuter asyncExecuter,
         IUnitOfWorkManager uowManager,
         L2BookCache cache,
+        TickDataCache tickCache,
         ILogger<PollL2DepthJob> logger)
     {
         _api = api;
@@ -34,6 +40,7 @@ public class PollL2DepthJob
         _asyncExecuter = asyncExecuter;
         _uowManager = uowManager;
         _cache = cache;
+        _tickCache = tickCache;
         _logger = logger;
     }
 
@@ -45,10 +52,10 @@ public class PollL2DepthJob
             return;
         }
 
-        string? authHeader = WebullHookAppService.CapturedAuthHeader;
+        string? authHeader = ResolveAuthHeader();
         if (authHeader == null)
         {
-            _logger.LogWarning("Auth header not captured yet, skipping L2 poll");
+            _logger.LogWarning("No auth header available (memory or file), skipping L2 poll");
             return;
         }
 
@@ -125,11 +132,37 @@ public class PollL2DepthJob
 
         _cache.AddSnapshot(symbol.WebullTickerId, snapshot);
 
+        // Compute L2-derived features
+        _tickCache.UpdateL2Features(symbol.WebullTickerId, snapshot);
+
         using var uow = _uowManager.Begin();
         await _snapshotRepo.InsertAsync(snapshot, autoSave: false);
         await uow.CompleteAsync();
 
         _logger.LogInformation("L2 depth: {Bids} bids, {Asks} asks for {Ticker} (spread={Spread:F4})",
             depth.Bids.Count, depth.Asks.Count, symbol.Ticker, spread);
+    }
+
+    /// <summary>
+    /// Try in-memory auth header first, then fall back to reading from disk file.
+    /// </summary>
+    private static string? ResolveAuthHeader()
+    {
+        var header = WebullHookAppService.CapturedAuthHeader;
+        if (!string.IsNullOrWhiteSpace(header))
+            return header;
+
+        try
+        {
+            if (File.Exists(AuthFilePath))
+            {
+                var content = File.ReadAllText(AuthFilePath).Trim();
+                if (!string.IsNullOrWhiteSpace(content))
+                    return content;
+            }
+        }
+        catch { }
+
+        return null;
     }
 }

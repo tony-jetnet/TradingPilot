@@ -30,4 +30,13 @@ public class TickSnapshot : Entity<Guid>
     public int UptickCount { get; set; }
     public int DowntickCount { get; set; }
     public decimal TickMomentum { get; set; }
+
+    // L2-derived features (computed from order book snapshots)
+    public decimal BookDepthRatio { get; set; }
+    public decimal BidWallSize { get; set; }
+    public decimal AskWallSize { get; set; }
+    public decimal BidSweepCost { get; set; }
+    public decimal AskSweepCost { get; set; }
+    public decimal ImbalanceVelocity { get; set; }
+    public decimal SpreadPercentile { get; set; }
 }

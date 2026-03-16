@@ -16,12 +16,18 @@
   <ItemGroup>
     <ProjectReference Include="..\TradingPilot.Domain\TradingPilot.Domain.csproj" />
     <ProjectReference Include="..\TradingPilot.Application.Contracts\TradingPilot.Application.Contracts.csproj" />
+    <ProjectReference Include="..\TradingPilot.EntityFrameworkCore\TradingPilot.EntityFrameworkCore.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Google.Protobuf" Version="3.*" />
     <PackageReference Include="Grpc.Net.Client" Version="2.*" />
     <PackageReference Include="Grpc.Tools" Version="2.*" PrivateAssets="All" />
+    <PackageReference Include="AWSSDK.BedrockRuntime" Version="4.*" />
+    <PackageReference Include="AWSSDK.SSO" Version="4.*" />
+    <PackageReference Include="AWSSDK.SSOOIDC" Version="4.*" />
+    <PackageReference Include="AWSSDK.SecurityToken" Version="4.*" />
+    <PackageReference Include="AWSSDK.Extensions.NETCore.Setup" Version="4.*" />
     <PackageReference Include="Hangfire.Core" Version="1.8.*" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="10.*" />
     <PackageReference Include="Volo.Abp.Ddd.Application" Version="10.1.0" />

@@ -17,6 +17,9 @@ public class LoadHistoricalBarsJob
     private readonly IUnitOfWorkManager _uowManager;
     private readonly ILogger<LoadHistoricalBarsJob> _logger;
 
+    private static readonly string AuthFilePath = Path.Combine(
+        @"D:\Third-Parties\WebullHook", "auth_header.json");
+
     // No date range filter — insert all bars the API returns, dedup handles duplicates
 
     public LoadHistoricalBarsJob(
@@ -35,9 +38,12 @@ public class LoadHistoricalBarsJob
         _logger = logger;
     }
 
+    /// <summary>
+    /// One-shot startup: loads bars for a specific ticker + timeframes.
+    /// </summary>
     public async Task ExecuteAsync(string ticker, string[] timeframes)
     {
-        string? authHeader = WebullHookAppService.CapturedAuthHeader;
+        string? authHeader = ResolveAuthHeader();
         if (authHeader == null)
             throw new InvalidOperationException("Auth header not captured yet. Will retry.");
 
@@ -87,6 +93,59 @@ public class LoadHistoricalBarsJob
             await uow.CompleteAsync();
         }
 
+        await LoadBarsForSymbolAsync(authHeader, symbol, timeframes);
+    }
+
+    /// <summary>
+    /// Recurring hourly refresh: loads bars for ALL watched symbols.
+    /// Called by Hangfire during market hours to keep bars fresh.
+    /// </summary>
+    public async Task RefreshAllAsync()
+    {
+        if (!MarketHoursHelper.IsMarketOpen(DateTime.UtcNow))
+        {
+            _logger.LogDebug("Market closed, skipping bar refresh");
+            return;
+        }
+
+        string? authHeader = ResolveAuthHeader();
+        if (authHeader == null)
+        {
+            _logger.LogWarning("No auth header available for bar refresh");
+            return;
+        }
+
+        List<Symbol> watched;
+        using (var uow = _uowManager.Begin())
+        {
+            watched = await _asyncExecuter.ToListAsync(
+                (await _symbolRepo.GetQueryableAsync()).Where(s => s.IsWatched));
+            await uow.CompleteAsync();
+        }
+
+        if (watched.Count == 0) return;
+
+        // Refresh short timeframes (1m, 5m) to keep data current
+        string[] timeframes = ["m1", "m5", "m15"];
+
+        foreach (var symbol in watched)
+        {
+            try
+            {
+                await LoadBarsForSymbolAsync(authHeader, symbol, timeframes);
+                await Task.Delay(500); // rate limit between symbols
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Bar refresh failed for {Ticker}", symbol.Ticker);
+            }
+        }
+
+        _logger.LogInformation("Hourly bar refresh complete for {Count} symbols", watched.Count);
+    }
+
+    private async Task LoadBarsForSymbolAsync(string authHeader, Symbol symbol, string[] timeframes)
+    {
         foreach (string tf in timeframes)
         {
             // Map our timeframe codes to Webull API type + domain enum
@@ -112,12 +171,12 @@ public class LoadHistoricalBarsJob
                 "m1" => 400,  // ~1 trading day
                 _ => 100,
             };
-            _logger.LogInformation("Fetching {Timeframe} bars for {Ticker} (count={Count})...", tf, ticker, count);
+            _logger.LogInformation("Fetching {Timeframe} bars for {Ticker} (count={Count})...", tf, symbol.Ticker, count);
 
-            var bars = await _api.GetBarsAsync(authHeader, tickerInfo.TickerId, apiType, count);
+            var bars = await _api.GetBarsAsync(authHeader, symbol.WebullTickerId, apiType, count);
             await Task.Delay(500); // rate limit
 
-            _logger.LogInformation("Got {Total} bars for {Timeframe} {Ticker}", bars.Count, tf, ticker);
+            _logger.LogInformation("Got {Total} bars for {Timeframe} {Ticker}", bars.Count, tf, symbol.Ticker);
 
             int inserted = 0, skipped = 0;
             using (var uow = _uowManager.Begin())
@@ -157,7 +216,7 @@ public class LoadHistoricalBarsJob
             }
 
             _logger.LogInformation("Loaded {Inserted} new / skipped {Skipped} existing {Timeframe} bars for {Ticker} (API returned {Total})",
-                inserted, skipped, tf, ticker, bars.Count);
+                inserted, skipped, tf, symbol.Ticker, bars.Count);
         }
     }
 
@@ -168,4 +227,24 @@ public class LoadHistoricalBarsJob
         "adr" => SecurityType.Adr,
         _ => SecurityType.Stock,
     };
+
+    private static string? ResolveAuthHeader()
+    {
+        var header = WebullHookAppService.CapturedAuthHeader;
+        if (!string.IsNullOrWhiteSpace(header))
+            return header;
+
+        try
+        {
+            if (File.Exists(AuthFilePath))
+            {
+                var content = File.ReadAllText(AuthFilePath).Trim();
+                if (!string.IsNullOrWhiteSpace(content))
+                    return content;
+            }
+        }
+        catch { }
+
+        return null;
+    }
 }

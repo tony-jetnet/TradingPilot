@@ -1,12 +1,18 @@
 using Hangfire;
 using Microsoft.Extensions.Logging;
 using TradingPilot.Symbols;
+using TradingPilot.Trading;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Linq;
 using Volo.Abp.Uow;
 
 namespace TradingPilot.Webull;
 
+/// <summary>
+/// Lightweight startup job: takes immediate L2 snapshot and backfills news.
+/// No bar/tick/signal backfill — that's handled nightly by NightlyStrategyOptimizer
+/// to avoid conflicting with real-time MQTT data during the day.
+/// </summary>
 [AutomaticRetry(Attempts = 3)]
 public class StartupRecoveryJob
 {
@@ -18,6 +24,9 @@ public class StartupRecoveryJob
     private readonly IUnitOfWorkManager _uowManager;
     private readonly L2BookCache _cache;
     private readonly ILogger<StartupRecoveryJob> _logger;
+
+    private static readonly string AuthFilePath = Path.Combine(
+        @"D:\Third-Parties\WebullHook", "auth_header.json");
 
     public StartupRecoveryJob(
         IWebullApiClient api,
@@ -41,7 +50,7 @@ public class StartupRecoveryJob
 
     public async Task ExecuteAsync()
     {
-        string? authHeader = WebullHookAppService.CapturedAuthHeader;
+        string? authHeader = ResolveAuthHeader();
         if (authHeader == null)
             throw new InvalidOperationException("Auth header not captured yet. Will retry.");
 
@@ -61,32 +70,62 @@ public class StartupRecoveryJob
 
         foreach (var symbol in watched)
         {
-            // Detect L2 gap
-            await DetectL2GapAsync(symbol);
-
-            // Take immediate L2 snapshot
-            try
+            // Take immediate L2 snapshot (if market open)
+            if (MarketHoursHelper.IsMarketOpen(DateTime.UtcNow))
             {
-                var depth = await _api.GetDepthAsync(authHeader, symbol.WebullTickerId);
-                if (depth != null && (depth.Bids.Count > 0 || depth.Asks.Count > 0))
+                try
                 {
-                    var snapshot = BuildSnapshot(symbol, depth);
-                    _cache.AddSnapshot(symbol.WebullTickerId, snapshot);
-                    using var uow = _uowManager.Begin();
-                    await _snapshotRepo.InsertAsync(snapshot, autoSave: false);
-                    await uow.CompleteAsync();
-                    _logger.LogInformation("Startup L2 snapshot taken for {Ticker}", symbol.Ticker);
+                    var depth = await _api.GetDepthAsync(authHeader, symbol.WebullTickerId);
+                    if (depth != null && (depth.Bids.Count > 0 || depth.Asks.Count > 0))
+                    {
+                        var snapshot = BuildSnapshot(symbol, depth);
+                        _cache.AddSnapshot(symbol.WebullTickerId, snapshot);
+                        using var uow = _uowManager.Begin();
+                        await _snapshotRepo.InsertAsync(snapshot, autoSave: false);
+                        await uow.CompleteAsync();
+                        _logger.LogInformation("Startup L2 snapshot taken for {Ticker}", symbol.Ticker);
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Startup L2 snapshot failed for {Ticker}", symbol.Ticker);
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Startup L2 snapshot failed for {Ticker}", symbol.Ticker);
+                }
             }
 
             // Backfill news
             try
             {
-                await BackfillNewsAsync(authHeader, symbol);
+                var items = await _api.GetTickerNewsAsync(authHeader, symbol.WebullTickerId);
+                if (items.Count > 0)
+                {
+                    int inserted = 0;
+                    using var uow = _uowManager.Begin();
+                    foreach (var item in items)
+                    {
+                        var symbolId = symbol.Id;
+                        var newsId = item.NewsId;
+                        bool exists = await _asyncExecuter.AnyAsync(
+                            (await _newsRepo.GetQueryableAsync()).Where(n =>
+                                n.SymbolId == symbolId && n.WebullNewsId == newsId));
+                        if (exists) continue;
+
+                        await _newsRepo.InsertAsync(new SymbolNews
+                        {
+                            SymbolId = symbol.Id,
+                            WebullNewsId = item.NewsId,
+                            Title = item.Title,
+                            Summary = item.Summary,
+                            SourceName = item.SourceName,
+                            Url = item.Url,
+                            PublishedAt = item.PublishedAt,
+                            CollectedAt = DateTime.UtcNow,
+                        }, autoSave: false);
+                        inserted++;
+                    }
+                    await uow.CompleteAsync();
+                    if (inserted > 0)
+                        _logger.LogInformation("Startup news backfill for {Ticker}: {New} new articles", symbol.Ticker, inserted);
+                }
             }
             catch (Exception ex)
             {
@@ -95,66 +134,6 @@ public class StartupRecoveryJob
         }
 
         _logger.LogInformation("Startup recovery complete for {Count} watched symbols", watched.Count);
-    }
-
-    private async Task DetectL2GapAsync(Symbol symbol)
-    {
-        using var uow = _uowManager.Begin();
-        var symbolId = symbol.Id;
-        var lastSnapshot = await _asyncExecuter.FirstOrDefaultAsync(
-            (await _snapshotRepo.GetQueryableAsync())
-                .Where(s => s.SymbolId == symbolId)
-                .OrderByDescending(s => s.Timestamp)
-                .Take(1));
-        await uow.CompleteAsync();
-
-        if (lastSnapshot == null)
-        {
-            _logger.LogWarning("L2 DATA GAP for {Ticker}: no prior snapshots found", symbol.Ticker);
-            return;
-        }
-
-        var gap = DateTime.UtcNow - lastSnapshot.Timestamp;
-        if (gap.TotalMinutes > 1)
-        {
-            _logger.LogWarning("L2 DATA GAP for {Ticker}: {From:HH:mm} to {To:HH:mm} ({Gap:F0} minutes) — data permanently lost",
-                symbol.Ticker, lastSnapshot.Timestamp, DateTime.UtcNow, gap.TotalMinutes);
-        }
-    }
-
-    private async Task BackfillNewsAsync(string authHeader, Symbol symbol)
-    {
-        var items = await _api.GetTickerNewsAsync(authHeader, symbol.WebullTickerId);
-        if (items.Count == 0) return;
-
-        int inserted = 0;
-        using var uow = _uowManager.Begin();
-        foreach (var item in items)
-        {
-            var symbolId = symbol.Id;
-            var newsId = item.NewsId;
-            bool exists = await _asyncExecuter.AnyAsync(
-                (await _newsRepo.GetQueryableAsync()).Where(n =>
-                    n.SymbolId == symbolId && n.WebullNewsId == newsId));
-
-            if (exists) continue;
-
-            await _newsRepo.InsertAsync(new SymbolNews
-            {
-                SymbolId = symbol.Id,
-                WebullNewsId = item.NewsId,
-                Title = item.Title,
-                Summary = item.Summary,
-                SourceName = item.SourceName,
-                Url = item.Url,
-                PublishedAt = item.PublishedAt,
-                CollectedAt = DateTime.UtcNow,
-            }, autoSave: false);
-            inserted++;
-        }
-        await uow.CompleteAsync();
-
-        _logger.LogInformation("Startup news backfill for {Ticker}: {New} new articles", symbol.Ticker, inserted);
     }
 
     private static SymbolBookSnapshot BuildSnapshot(Symbol symbol, WebullDepthData depth)
@@ -183,5 +162,23 @@ public class StartupRecoveryJob
                 ? (totalBidSize - totalAskSize) / (totalBidSize + totalAskSize) : 0,
             Depth = Math.Max(bidPrices.Length, askPrices.Length),
         };
+    }
+
+    private static string? ResolveAuthHeader()
+    {
+        var header = WebullHookAppService.CapturedAuthHeader;
+        if (!string.IsNullOrWhiteSpace(header))
+            return header;
+        try
+        {
+            if (File.Exists(AuthFilePath))
+            {
+                var content = File.ReadAllText(AuthFilePath).Trim();
+                if (!string.IsNullOrWhiteSpace(content))
+                    return content;
+            }
+        }
+        catch { }
+        return null;
     }
 }

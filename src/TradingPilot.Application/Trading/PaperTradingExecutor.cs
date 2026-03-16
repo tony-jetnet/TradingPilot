@@ -36,6 +36,7 @@ public class PaperTradingExecutor
     private readonly WebullPaperTradingClient _client;
     private readonly SignalStore _signalStore;
     private readonly L2BookCache _l2Cache;
+    private readonly MarketMicrostructureAnalyzer _analyzer;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<PaperTradingExecutor> _logger;
 
@@ -50,12 +51,14 @@ public class PaperTradingExecutor
         WebullPaperTradingClient client,
         SignalStore signalStore,
         L2BookCache l2Cache,
+        MarketMicrostructureAnalyzer analyzer,
         IServiceScopeFactory scopeFactory,
         ILogger<PaperTradingExecutor> logger)
     {
         _client = client;
         _signalStore = signalStore;
         _l2Cache = l2Cache;
+        _analyzer = analyzer;
         _scopeFactory = scopeFactory;
         _logger = logger;
     }
@@ -87,6 +90,42 @@ public class PaperTradingExecutor
         int currentShares = _currentPosition.GetValueOrDefault(signal.TickerId, 0);
         Guid? symbolId = await ResolveSymbolIdAsync(signal.TickerId);
 
+        // Check if signal came from AI rule (has per-rule parameters)
+        bool isRuleSignal = signal.Indicators.ContainsKey("RuleConfidence");
+        int ruleHoldSeconds = isRuleSignal ? (int)signal.Indicators.GetValueOrDefault("RuleHoldSeconds", 60) : 0;
+        decimal ruleStopLoss = isRuleSignal ? signal.Indicators.GetValueOrDefault("RuleStopLoss", 0.30m) : 0;
+
+        // Read learned thresholds from model config (fall back to defaults)
+        var tickerConfig = _analyzer.CurrentModelConfig?.Tickers.GetValueOrDefault(signal.TickerId);
+        decimal minScoreEntry = isRuleSignal ? 0.55m : (tickerConfig?.MinScoreToBuy ?? MinScoreToEnter);
+        decimal minScoreExit = tickerConfig?.MinScoreToExit ?? MinScoreToExit;
+        int holdSeconds = isRuleSignal ? ruleHoldSeconds : (tickerConfig?.OptimalHoldSeconds ?? 60);
+        decimal stopLoss = isRuleSignal ? ruleStopLoss : (tickerConfig?.StopLossAmount ?? 0.30m);
+
+        // For rule-based signals, check max daily trades per symbol
+        if (isRuleSignal)
+        {
+            var strategyConfig = _analyzer.RuleEvaluator.CurrentConfig;
+            if (strategyConfig != null &&
+                strategyConfig.Symbols.TryGetValue(signal.Ticker, out var symbolStrategy))
+            {
+                // MaxPositionShares from strategy
+                int maxShares = symbolStrategy.MaxPositionShares;
+                if (maxShares > 0 && maxShares < SharesPerTrade)
+                {
+                    // Strategy wants fewer shares — skip if current position already at max
+                    if (Math.Abs(currentShares) >= maxShares) return;
+                }
+            }
+        }
+
+        // Respect direction enablement from model config
+        if (tickerConfig != null && !isRuleSignal)
+        {
+            if (signal.Type == SignalType.Buy && !tickerConfig.EnableBuy) return;
+            if (signal.Type == SignalType.Sell && !tickerConfig.EnableSell) return;
+        }
+
         // ═══════════════════════════════════════════════════════════
         // CHECK MOMENTUM: get price 30s ago from L2BookCache
         // ═══════════════════════════════════════════════════════════
@@ -106,8 +145,8 @@ public class PaperTradingExecutor
         // ═══════════════════════════════════════════════════════════
         // ENTRY: Strong signal + aligned with momentum
         // ═══════════════════════════════════════════════════════════
-        bool isBuyEntry = signal.Type == SignalType.Buy && score >= MinScoreToEnter && momentum >= MomentumThreshold;
-        bool isSellEntry = signal.Type == SignalType.Sell && score <= -MinScoreToEnter && momentum <= -MomentumThreshold;
+        bool isBuyEntry = signal.Type == SignalType.Buy && score >= minScoreEntry && momentum >= MomentumThreshold;
+        bool isSellEntry = signal.Type == SignalType.Sell && score <= -minScoreEntry && momentum <= -MomentumThreshold;
 
         if ((isBuyEntry || isSellEntry) && currentShares == 0)
         {
@@ -130,19 +169,19 @@ public class PaperTradingExecutor
             bool shouldExit = false;
             string reason = "";
 
-            // 1. Time stop: 1 minute (optimal hold from backtest)
-            if (_entryTime.TryGetValue(signal.TickerId, out var et) && (DateTime.UtcNow - et).TotalSeconds >= 60)
+            // 1. Time stop: use learned hold time or default 60s
+            if (_entryTime.TryGetValue(signal.TickerId, out var et) && (DateTime.UtcNow - et).TotalSeconds >= holdSeconds)
             {
                 shouldExit = true;
                 decimal elapsed = (decimal)(DateTime.UtcNow - et).TotalSeconds;
                 reason = $"TIME {elapsed:F0}s";
             }
 
-            // 2. Stop loss: $0.30 adverse
+            // 2. Stop loss: use learned stop loss or default $0.30
             if (!shouldExit && _entryPrice.TryGetValue(signal.TickerId, out var ep))
             {
                 decimal adverse = isLong ? ep - signal.Price : signal.Price - ep;
-                if (adverse > 0.30m)
+                if (adverse > stopLoss)
                 {
                     shouldExit = true;
                     reason = $"STOP LOSS {adverse:F2}";
@@ -151,7 +190,7 @@ public class PaperTradingExecutor
 
             // 3. Strong opposing signal
             bool opposing = (isLong && signal.Type == SignalType.Sell) || (!isLong && signal.Type == SignalType.Buy);
-            if (!shouldExit && opposing && Math.Abs(score) >= MinScoreToExit)
+            if (!shouldExit && opposing && Math.Abs(score) >= minScoreExit)
             {
                 shouldExit = true;
                 reason = $"OPPOSING score={score:F3}";

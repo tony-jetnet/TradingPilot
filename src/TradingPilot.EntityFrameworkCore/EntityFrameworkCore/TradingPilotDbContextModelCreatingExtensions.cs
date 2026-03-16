@@ -207,6 +207,15 @@ public static class TradingPilotDbContextModelCreatingExtensions
             b.Property(x => x.VolumeRatio).HasPrecision(8, 4);
             b.Property(x => x.TickMomentum).HasPrecision(8, 6);
 
+            // L2-derived features
+            b.Property(x => x.BookDepthRatio).HasPrecision(8, 6);
+            b.Property(x => x.BidWallSize).HasPrecision(10, 4);
+            b.Property(x => x.AskWallSize).HasPrecision(10, 4);
+            b.Property(x => x.BidSweepCost).HasPrecision(12, 2);
+            b.Property(x => x.AskSweepCost).HasPrecision(12, 2);
+            b.Property(x => x.ImbalanceVelocity).HasPrecision(10, 6);
+            b.Property(x => x.SpreadPercentile).HasPrecision(6, 4);
+
             b.HasOne<Symbol>().WithMany().HasForeignKey(x => x.SymbolId).OnDelete(DeleteBehavior.Restrict);
 
             b.HasIndex(x => new { x.SymbolId, x.Timestamp })
