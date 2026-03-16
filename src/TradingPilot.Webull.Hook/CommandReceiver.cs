@@ -12,6 +12,7 @@ namespace TradingPilot.Webull.Hook;
 internal static unsafe class CommandReceiver
 {
     private const string PipeName = "WebullMqttHookCmd";
+    private static readonly Encoding Utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
     private static volatile bool _running;
 
     public static void Start()
@@ -43,15 +44,18 @@ internal static unsafe class CommandReceiver
                 pipe.WaitForConnection();
                 HookLog.Write("CmdPipe: client connected.");
 
-                using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
-                using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
+                using var reader = new StreamReader(pipe, Utf8NoBom, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+                using var writer = new StreamWriter(pipe, Utf8NoBom, leaveOpen: true) { AutoFlush = true };
 
                 while (pipe.IsConnected)
                 {
+                    HookLog.Write("CmdPipe: waiting for command...");
                     string? line = reader.ReadLine();
-                    if (line == null) break;
+                    if (line == null) { HookLog.Write("CmdPipe: ReadLine returned null"); break; }
 
+                    HookLog.Write($"CmdPipe: received {line[..Math.Min(line.Length, 80)]}");
                     string response = HandleCommand(line);
+                    HookLog.Write($"CmdPipe: responding {response[..Math.Min(response.Length, 80)]}");
                     writer.WriteLine(response);
                 }
 
@@ -87,7 +91,6 @@ internal static unsafe class CommandReceiver
         }
         catch (Exception ex)
         {
-            // Escape any quotes in the error message
             string escaped = ex.Message.Replace("\\", "\\\\").Replace("\"", "\\\"");
             return $$$"""{"ok":false,"error":"{{{escaped}}}"}""";
         }
@@ -117,7 +120,7 @@ internal static unsafe class CommandReceiver
         if (origFn == 0)
             return """{"ok":false,"error":"invokeSubscribeResult not hooked"}""";
 
-        HookLog.Write($"CmdPipe: subscribe json={subscriptionJson[..Math.Min(subscriptionJson.Length, 100)]}...");
+        HookLog.Write($"CmdPipe: calling invokeSubscribeResult on client 0x{client:X}...");
 
         // Build a Qt QString and call invokeSubscribeResult
         using var qstr = QtString.Create(subscriptionJson);

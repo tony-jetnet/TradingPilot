@@ -15,7 +15,7 @@ internal static class WebullProtocol
     {
         public const long RKLB = 950178054;
         // AMD ticker ID to be discovered - use 0 as placeholder
-        public const long AMD = 913256135;
+        public const long AMD = 913254235;
     }
 
     /// <summary>

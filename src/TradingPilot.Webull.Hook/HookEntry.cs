@@ -423,6 +423,7 @@ public static unsafe class HookEntry
         try
         {
             _subscribeCount++;
+            if (_mqttClient == 0) { _mqttClient = thisPtr; HookLog.Write($"Captured QMqttClient: 0x{thisPtr:X}"); }
             string topic = QtInterop.ReadQString(qStringRef);
             HookLog.Write($"INVOKE-SUBSCRIBE #{_subscribeCount}: topic=\"{topic}\" client=0x{thisPtr:X}");
             PipeServer.SendEvent("subscribe", topic);

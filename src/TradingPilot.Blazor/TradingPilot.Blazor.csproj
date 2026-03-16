@@ -8,20 +8,27 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>TradingPilot.Blazor</RootNamespace>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Serilog.AspNetCore" Version="9.0.0" />
     <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.Server" Version="10.0.2" />
     <PackageReference Include="Volo.Abp.Autofac" Version="10.1.0" />
     <PackageReference Include="Volo.Abp.AspNetCore.Mvc.UI.Bundling"  Version="10.1.0" />
-    <ProjectReference Include="..\TradingPilot.Blazor.Client\TradingPilot.Blazor.Client.csproj" />
-  </ItemGroup>
-
- <ItemGroup>
+    <PackageReference Include="Volo.Abp.Swashbuckle" Version="10.1.0" />
+    <PackageReference Include="Volo.Abp.AspNetCore.Serilog" Version="10.1.0" />
+    <PackageReference Include="Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme.Bundling" Version="10.1.0" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme.Bundling" Version="10.1.0" />
+    <ProjectReference Include="..\TradingPilot.Blazor.Client\TradingPilot.Blazor.Client.csproj" />
+    <ProjectReference Include="..\TradingPilot.Application\TradingPilot.Application.csproj" />
+    <ProjectReference Include="..\TradingPilot.HttpApi\TradingPilot.HttpApi.csproj" />
+    <ProjectReference Include="..\TradingPilot.EntityFrameworkCore\TradingPilot.EntityFrameworkCore.csproj" />
   </ItemGroup>
 
 </Project>

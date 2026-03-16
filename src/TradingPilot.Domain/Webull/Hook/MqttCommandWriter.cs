@@ -24,8 +24,8 @@ public sealed class MqttCommandWriter : IDisposable
         _pipe?.Dispose();
         _pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut);
         await _pipe.ConnectAsync(timeoutMs, ct);
-        _reader = new StreamReader(_pipe, Encoding.UTF8, leaveOpen: true);
-        _writer = new StreamWriter(_pipe, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
+        _reader = new StreamReader(_pipe, new UTF8Encoding(false), leaveOpen: true);
+        _writer = new StreamWriter(_pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
     }
 
     public async Task<JsonDocument> SendCommandAsync(object command, CancellationToken ct = default)

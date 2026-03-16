@@ -4,21 +4,30 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using TradingPilot.Blazor.Components;
 using TradingPilot.Blazor.Client;
+using TradingPilot.EntityFrameworkCore;
 using Volo.Abp;
 using Volo.Abp.AspNetCore.Components.WebAssembly.WebApp;
+using Volo.Abp.AspNetCore.Mvc;
 using Volo.Abp.AspNetCore.Mvc.UI.Bundling;
 using Volo.Abp.AspNetCore.Mvc.Libs;
+using Volo.Abp.AspNetCore.Serilog;
 using Volo.Abp.Autofac;
 using Volo.Abp.Modularity;
 using Volo.Abp.AspNetCore.Components.WebAssembly.Theming.Bundling;
 using Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme.Bundling;
+using Volo.Abp.Swashbuckle;
 
 namespace TradingPilot.Blazor;
 
 [DependsOn(
     typeof(AbpAutofacModule),
     typeof(AbpAspNetCoreComponentsWebAssemblyBasicThemeBundlingModule),
-    typeof(AbpAspNetCoreMvcUiBundlingModule)
+    typeof(AbpAspNetCoreMvcUiBundlingModule),
+    typeof(TradingPilotApplicationModule),
+    typeof(TradingPilotHttpApiModule),
+    typeof(TradingPilotEntityFrameworkCoreModule),
+    typeof(AbpSwashbuckleModule),
+    typeof(AbpAspNetCoreSerilogModule)
 )]
 public class TradingPilotBlazorModule : AbpModule
 {
@@ -46,8 +55,28 @@ public class TradingPilotBlazorModule : AbpModule
 
             var globalScripts = options.ScriptBundles.Get(BlazorWebAssemblyStandardBundles.Scripts.Global);
             globalScripts.AddContributors(typeof(TradingPilotScriptBundleContributor));
-
         });
+
+        // Auto-generate API controllers from application services
+        Configure<AbpAspNetCoreMvcOptions>(options =>
+        {
+            options.ConventionalControllers.Create(typeof(TradingPilotApplicationModule).Assembly);
+        });
+
+        // Swagger
+        context.Services.AddAbpSwaggerGen(options =>
+        {
+            options.SwaggerDoc("v1", new Microsoft.OpenApi.OpenApiInfo
+            {
+                Title = "TradingPilot API",
+                Version = "v1"
+            });
+            options.DocInclusionPredicate((_, _) => true);
+            options.CustomSchemaIds(type => type.FullName);
+        });
+
+        // Register the Webull hook hosted service
+        context.Services.AddHostedService<WebullHookHostedService>();
     }
 
     public override void OnApplicationInitialization(ApplicationInitializationContext context)
@@ -62,14 +91,21 @@ public class TradingPilotBlazorModule : AbpModule
         }
         else
         {
-            // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
             app.UseHsts();
         }
 
         app.UseHttpsRedirection();
         app.UseRouting();
         app.MapAbpStaticAssets();
+        app.UseUnitOfWork();
         app.UseAntiforgery();
+
+        app.UseSwagger();
+        app.UseAbpSwaggerUI(options =>
+        {
+            options.SwaggerEndpoint("/swagger/v1/swagger.json", "TradingPilot API");
+        });
+        app.UseAbpSerilogEnrichers();
 
         app.UseConfiguredEndpoints(builder =>
         {
