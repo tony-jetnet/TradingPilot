@@ -8,8 +8,7 @@ namespace TradingPilot.Webull.Hook;
 internal static class HookLog
 {
     private static readonly string LogPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "WebullHook",
+        @"D:\Third-Parties\WebullHook",
         "hook.log");
 
     private static readonly object _lock = new();

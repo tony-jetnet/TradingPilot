@@ -101,6 +101,9 @@ public class TradingPilotBlazorModule : AbpModule
         // L2 book cache (singleton in-memory rolling window)
         context.Services.AddSingleton<L2BookCache>();
 
+        // Webull gRPC client (singleton — long-lived HTTP/2 channel)
+        context.Services.AddSingleton<WebullGrpcClient>();
+
         // MQTT message processor (singleton — processes real-time MQTT data into structured DB entities)
         context.Services.AddSingleton<MqttMessageProcessor>();
 

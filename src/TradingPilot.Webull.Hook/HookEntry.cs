@@ -9,6 +9,26 @@ namespace TradingPilot.Webull.Hook;
 public static unsafe class HookEntry
 {
     // ═══════════════════════════════════════════════════════════════════
+    // Mangled export names from wbgrpc.dll
+    // ═══════════════════════════════════════════════════════════════════
+
+    // QString WBQuoteGrpcAsyncClientCall::getHeadMd5Sign(const QMap<QString,QString>&)
+    // MSVC x64: rcx=this, rdx=hidden return (QString*), r8=const QMap*
+    internal const string Fn_getHeadMd5Sign_Mangled =
+        "?getHeadMd5Sign@WBQuoteGrpcAsyncClientCall@@AEAA?AVQString@@AEBV?$QMap@VQString@@V1@@@@Z";
+    private const string Fn_getHeadMd5Sign = Fn_getHeadMd5Sign_Mangled;
+
+    // void WBQuoteGrpcAsyncClient::request(ClientRequest)
+    // MSVC x64: rcx=this, rdx=ClientRequest (by value → hidden pointer)
+    private const string Fn_grpcRequest =
+        "?request@WBQuoteGrpcAsyncClient@@QEAAXVClientRequest@v1@gateway@@@Z";
+
+    // int WBQuoteGrpcAsyncClientCall::write(const ClientRequest&)
+    // MSVC x64: rcx=this, rdx=const ClientRequest*
+    private const string Fn_grpcWrite =
+        "?write@WBQuoteGrpcAsyncClientCall@@AEAAHAEBVClientRequest@v1@gateway@@@Z";
+
+    // ═══════════════════════════════════════════════════════════════════
     // Mangled export names from wbmqtt.dll (dumpbin /exports)
     // ═══════════════════════════════════════════════════════════════════
 
@@ -74,6 +94,11 @@ public static unsafe class HookEntry
     private static nint _orig_publish;
     private static nint _orig_disconnectFromHost;
 
+    // gRPC hook trampolines
+    private static nint _orig_getHeadMd5Sign;
+    private static nint _orig_grpcRequest;
+    private static nint _orig_grpcWrite;
+
     // Resolved getter function pointers (not hooked, just called)
     private static nint _fn_hostname;
     private static nint _fn_port;
@@ -86,6 +111,7 @@ public static unsafe class HookEntry
     // Stats
     private static volatile int _messageCount;
     private static volatile int _subscribeCount;
+    private static volatile int _grpcRequestCount;
 
     // ═══════════════════════════════════════════════════════════════════
     // Internal accessors for CommandReceiver
@@ -96,6 +122,7 @@ public static unsafe class HookEntry
     internal static nint OrigConnectToHost => _orig_connectToHost;
     internal static int MessageCount => _messageCount;
     internal static int SubscribeCount => _subscribeCount;
+    internal static int GrpcRequestCount => _grpcRequestCount;
 
     /// <summary>
     /// Exported entry point called by the injector after LoadLibraryW.
@@ -228,6 +255,25 @@ public static unsafe class HookEntry
             InstallHook(mqttModule, "disconnectFromHost", Fn_disconnectFromHost,
                 (nint)(delegate* unmanaged<nint, void>)&Detour_disconnectFromHost,
                 out _orig_disconnectFromHost);
+
+            // ═══════════════════════════════════════════════════
+            // gRPC hooks on wbgrpc.dll
+            // ═══════════════════════════════════════════════════
+            nint grpcModule = NativeMethods.GetModuleHandleW("wbgrpc.dll");
+            if (grpcModule == 0)
+            {
+                HookLog.Write("WARN: wbgrpc.dll not found, skipping gRPC hooks.");
+            }
+            else
+            {
+                HookLog.Write($"wbgrpc.dll base: 0x{grpcModule:X}");
+
+                // grpcWrite has clean first 14 bytes (mov+push chain), safe for inline hook.
+                // getHeadMd5Sign has RIP-relative LEA in first 14 bytes — skip it.
+                InstallHook(grpcModule, "grpcWrite", Fn_grpcWrite,
+                    (nint)(delegate* unmanaged<nint, nint, int>)&Detour_grpcWrite,
+                    out _orig_grpcWrite);
+            }
 
             HookLog.Write("All hooks installed. Waiting for activity...");
             HookLog.Write("══════════════════════════════════════════════════");
@@ -490,5 +536,125 @@ public static unsafe class HookEntry
             var original = (delegate* unmanaged<nint, void>)_orig_disconnectFromHost;
             original(thisPtr);
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // gRPC Detours
+    // ═══════════════════════════════════════════════════════════════════
+
+    // ── Detour: getHeadMd5Sign(const QMap<QString,QString>&) → QString
+    // MSVC x64 with return-by-value: rcx=this, rdx=hidden return (QString*), r8=QMap*
+    // We call original, then try to read the result.
+    [UnmanagedCallersOnly]
+    private static void Detour_getHeadMd5Sign(nint thisPtr, nint resultQString, nint qMapPtr)
+    {
+        // Call original first — it fills resultQString with the MD5 sign
+        if (_orig_getHeadMd5Sign != 0)
+        {
+            var original = (delegate* unmanaged<nint, nint, nint, void>)_orig_getHeadMd5Sign;
+            original(thisPtr, resultQString, qMapPtr);
+        }
+
+        try
+        {
+            _grpcRequestCount++;
+
+            // Read the result QString (the computed sign)
+            // resultQString points to a QString constructed by the original function
+            string sign = QtInterop.ReadQString(resultQString);
+
+            HookLog.Write($"GRPC-SIGN #{_grpcRequestCount}: sign={sign}");
+            PipeServer.SendEvent("grpc_sign", sign);
+        }
+        catch (Exception ex)
+        {
+            HookLog.Write($"GRPC-SIGN error: {ex.Message}");
+        }
+    }
+
+    // ── Detour: write(const ClientRequest&)
+    // MSVC x64: rcx=this, rdx=const ClientRequest*
+    // Dumps raw memory of the C++ protobuf ClientRequest for analysis.
+    [UnmanagedCallersOnly]
+    private static int Detour_grpcWrite(nint thisPtr, nint clientRequestPtr)
+    {
+        _grpcRequestCount++;
+
+        try
+        {
+            HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: ClientRequest ptr=0x{clientRequestPtr:X}");
+
+            // Dump raw memory of the protobuf C++ object so we can analyze the layout.
+            // Also scan for embedded string fields (std::string on MSVC x64 = 32 bytes with SSO).
+            if (clientRequestPtr != 0)
+            {
+                // Dump first 512 bytes of the object as hex
+                byte[] raw = new byte[512];
+                System.Runtime.InteropServices.Marshal.Copy(clientRequestPtr, raw, 0, 512);
+                string hex = Convert.ToHexString(raw);
+                HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: raw[0..512]={hex}");
+
+                // Try to find readable ASCII/UTF-8 strings embedded in the object
+                // MSVC std::string: if size <= 15, data is inline at offset 0 of the string object;
+                // otherwise, ptr at offset 0 points to heap data, size at offset 16, capacity at offset 24.
+                // Scan every 8-byte boundary for potential string pointers and inline data.
+                for (int off = 0; off < 480; off += 8)
+                {
+                    // Try reading as a pointer to a null-terminated string
+                    long ptrVal = BitConverter.ToInt64(raw, off);
+                    if (ptrVal > 0x10000 && ptrVal < 0x7FFFFFFFFFFF)
+                    {
+                        try
+                        {
+                            byte[] strBuf = new byte[256];
+                            System.Runtime.InteropServices.Marshal.Copy((nint)ptrVal, strBuf, 0, 256);
+                            int nullIdx = Array.IndexOf(strBuf, (byte)0);
+                            if (nullIdx > 3 && nullIdx < 200)
+                            {
+                                bool printable = true;
+                                for (int i = 0; i < nullIdx; i++)
+                                    if (strBuf[i] < 32 || strBuf[i] > 126) { printable = false; break; }
+                                if (printable)
+                                {
+                                    string s = System.Text.Encoding.ASCII.GetString(strBuf, 0, nullIdx);
+                                    HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: @+{off} ptr->str({nullIdx})=\"{s}\"");
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    // Also check for inline SSO string (readable bytes directly in the object)
+                    if (off + 16 <= raw.Length)
+                    {
+                        int inlineEnd = -1;
+                        for (int i = off; i < Math.Min(off + 16, raw.Length); i++)
+                        {
+                            if (raw[i] == 0) { inlineEnd = i; break; }
+                            if (raw[i] < 32 || raw[i] > 126) break;
+                        }
+                        if (inlineEnd > off + 3)
+                        {
+                            string s = System.Text.Encoding.ASCII.GetString(raw, off, inlineEnd - off);
+                            HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: @+{off} inline=\"{s}\"");
+                        }
+                    }
+                }
+
+                // Also send the raw hex through the pipe for real-time analysis
+                PipeServer.SendEvent("grpc_write", Convert.ToHexString(raw));
+            }
+        }
+        catch (Exception ex)
+        {
+            HookLog.Write($"GRPC-WRITE #{_grpcRequestCount} error: {ex.Message}");
+        }
+
+        if (_orig_grpcWrite != 0)
+        {
+            var original = (delegate* unmanaged<nint, nint, int>)_orig_grpcWrite;
+            return original(thisPtr, clientRequestPtr);
+        }
+        return 0;
     }
 }

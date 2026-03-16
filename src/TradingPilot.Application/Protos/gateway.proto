@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package gateway.v1;
+
+option csharp_namespace = "TradingPilot.Webull.Grpc";
+
+service Gateway {
+  rpc Request (ClientRequest) returns (ClientResponse);
+  rpc StreamRequest (stream ClientRequest) returns (stream ClientResponse);
+}
+
+enum MsgType {
+  MSG_TYPE_UNSPECIFIED = 0;
+  MSG_TYPE_REQUEST = 1;
+  MSG_TYPE_RESPONSE = 2;
+}
+
+message ClientRequest {
+  MsgType type = 1;
+  string requestId = 2;
+  string module = 3;
+  bytes payload = 4;
+  map<string, string> header = 5;
+  string path = 6;
+}
+
+message ClientResponse {
+  MsgType type = 1;
+  string requestId = 2;
+  int32 code = 3;
+  bytes msg = 4;
+  string module = 5;
+  bytes payload = 6;
+  map<string, string> extras = 7;
+}

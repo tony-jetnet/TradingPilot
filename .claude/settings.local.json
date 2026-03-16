@@ -29,7 +29,10 @@
       "Bash(grep:*)",
       "Bash(which strings:*)",
       "Bash(redis-cli:*)",
-      "Bash(powershell -ExecutionPolicy Bypass -File D:/Third-Parties/TradingPilot/test/test_all_endpoints4.ps1 2>&1)"
+      "Bash(powershell -ExecutionPolicy Bypass -File D:/Third-Parties/TradingPilot/test/test_all_endpoints4.ps1 2>&1)",
+      "Bash(powershell -ExecutionPolicy Bypass -File D:/Third-Parties/TradingPilot/test/test_grpc.ps1 2>&1)",
+      "Bash(powershell -ExecutionPolicy Bypass -File D:/Third-Parties/TradingPilot/test/test_grpc2.ps1 2>&1)",
+      "Bash(powershell -ExecutionPolicy Bypass -File D:/Third-Parties/TradingPilot/test/test_grpc5.ps1 2>&1)"
     ]
   }
 }

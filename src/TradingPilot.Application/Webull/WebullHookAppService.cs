@@ -22,10 +22,13 @@ public class WebullHookAppService : ApplicationService, IWebullHookAppService
     private static string? _lastError;
     private static MqttCommandWriter? _commandWriter;
     private static string? _capturedAuthHeader;
+    private static string? _lastGrpcSign;
+    private static DateTime _lastGrpcSignTime;
+
+    public static string? LastGrpcSign => _lastGrpcSign;
 
     private static readonly string AuthFilePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "WebullHook", "auth_header.json");
+        @"D:\Third-Parties\WebullHook", "auth_header.json");
 
     public static string? CapturedAuthHeader => _capturedAuthHeader;
 
@@ -232,7 +235,12 @@ public class WebullHookAppService : ApplicationService, IWebullHookAppService
     private static void OnEventReceived(string eventType, byte[] data)
     {
         string text = Encoding.UTF8.GetString(data);
-        if (eventType == "subscribe")
+        if (eventType == "grpc_sign")
+        {
+            _lastGrpcSign = text;
+            _lastGrpcSignTime = DateTime.UtcNow;
+        }
+        else if (eventType == "subscribe")
         {
             // Extract and persist the auth header from subscription JSON
             try
