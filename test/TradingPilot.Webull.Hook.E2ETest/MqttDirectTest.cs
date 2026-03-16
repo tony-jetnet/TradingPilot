@@ -17,157 +17,73 @@ public static class MqttDirectTest
         // Broker config from mqttServer.ini + observed network connections
         (string host, int port, bool tls)[] endpoints =
         [
-            ("u-r001-push.webullfintech.com", 1883, false),
-            ("push.webullfintech.com", 1883, false),
             ("3.229.229.186", 1883, false),  // IP from active Webull connection
-            ("u-r001-push.webullfintech.com", 8883, true),  // TLS variant
-            ("push.webullfintech.com", 8883, true),
+            ("u-r001-push.webullfintech.com", 1883, false),
         ];
-        string username = "tonychen@outlook.com";
-        string password = "QZUdDfA$pz66HC_";
+        // Try multiple credential combos
+        (string? user, string? pass, string label)[] creds =
+        [
+            (null, null, "no-auth"),
+            ("0cbeb8ac323a472cd748d6b094305438", "", "did-only"),
+            ("tonychen@outlook.com", "QZUdDfA$pz66HC_", "email-pass"),
+        ];
 
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
         foreach (var (broker, port, useTls) in endpoints)
         {
-            Console.WriteLine($"Trying broker: {broker}:{port} (TLS={useTls})");
-            Console.WriteLine($"  Username: {username}");
-            Console.WriteLine();
-
-            try
+            foreach (var (user, pass, label) in creds)
             {
-                var factory = new MqttClientFactory();
-                using var client = factory.CreateMqttClient();
+                Console.WriteLine($"Trying {broker}:{port} creds={label}");
 
-                // Log all events
-                client.ApplicationMessageReceivedAsync += e =>
+                try
                 {
-                    string topic = e.ApplicationMessage.Topic;
-                    byte[] payload = e.ApplicationMessage.Payload.ToArray();
-                    string? text = TryDecodeUtf8(payload);
+                    var factory = new MqttClientFactory();
+                    using var client = factory.CreateMqttClient();
 
-                    Console.ForegroundColor = ConsoleColor.Cyan;
-                    Console.Write($"[MSG] ");
-                    Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.Write($"{topic} ");
-                    Console.ForegroundColor = ConsoleColor.Gray;
-                    Console.Write($"({payload.Length} bytes, QoS={e.ApplicationMessage.QualityOfServiceLevel})");
-                    Console.ResetColor();
-                    Console.WriteLine();
-
-                    if (text != null)
+                    client.ApplicationMessageReceivedAsync += e =>
                     {
-                        string display = text.Length > 300 ? text[..300] + "..." : text;
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"  {display}");
-                        Console.ResetColor();
-                    }
-                    else if (payload.Length > 0)
-                    {
-                        Console.ForegroundColor = ConsoleColor.DarkGray;
-                        Console.WriteLine($"  [hex] {Convert.ToHexString(payload.AsSpan(0, Math.Min(payload.Length, 100)))}");
-                        Console.ResetColor();
-                    }
-                    return Task.CompletedTask;
-                };
-
-                client.DisconnectedAsync += e =>
-                {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"[DISCONNECTED] Reason: {e.Reason}, Exception: {e.Exception?.Message}");
-                    Console.ResetColor();
-                    return Task.CompletedTask;
-                };
-
-                client.ConnectedAsync += e =>
-                {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"[CONNECTED] Result: {e.ConnectResult.ResultCode}");
-                    Console.ResetColor();
-                    return Task.CompletedTask;
-                };
-
-                // Try MQTT v3.1.1 first (most common for IoT/trading)
-                foreach (var protocol in new[] { MqttProtocolVersion.V311, MqttProtocolVersion.V500 })
-                {
-                    Console.Write($"  Connecting with MQTT {protocol}... ");
+                        Console.WriteLine($"[MSG] {e.ApplicationMessage.Topic} ({e.ApplicationMessage.Payload.Length}b)");
+                        return Task.CompletedTask;
+                    };
+                    client.ConnectedAsync += e => { Console.WriteLine($"  CONNECTED: {e.ConnectResult.ResultCode}"); return Task.CompletedTask; };
+                    client.DisconnectedAsync += e => { Console.WriteLine($"  DISCONNECTED: {e.Reason} {e.Exception?.Message}"); return Task.CompletedTask; };
 
                     var optionsBuilder = new MqttClientOptionsBuilder()
                         .WithTcpServer(broker, port)
-                        .WithCredentials(username, password)
                         .WithClientId($"wb_desktop_{Guid.NewGuid():N}"[..32])
-                        .WithProtocolVersion(protocol)
+                        .WithProtocolVersion(MqttProtocolVersion.V311)
                         .WithKeepAlivePeriod(TimeSpan.FromSeconds(60))
-                        .WithTimeout(TimeSpan.FromSeconds(8));
+                        .WithTimeout(TimeSpan.FromSeconds(5));
 
-                    if (useTls)
-                    {
-                        optionsBuilder.WithTlsOptions(o =>
-                        {
-                            o.WithAllowUntrustedCertificates();
-                            o.WithIgnoreCertificateChainErrors();
-                        });
-                    }
+                    if (user != null)
+                        optionsBuilder.WithCredentials(user, pass ?? "");
 
                     var options = optionsBuilder.Build();
+                    var result = await client.ConnectAsync(options, cts.Token);
+                    Console.WriteLine($"  Result: {result.ResultCode}");
 
-                    try
+                    if (result.ResultCode == MqttClientConnectResultCode.Success)
                     {
-                        var result = await client.ConnectAsync(options, cts.Token);
-                        Console.WriteLine($"OK! ResultCode={result.ResultCode}");
-
-                        if (result.ResultCode == MqttClientConnectResultCode.Success)
-                        {
-                            Console.ForegroundColor = ConsoleColor.Green;
-                            Console.WriteLine($"\n  CONNECTED to {broker}:{port} via {protocol}!");
-                            Console.ResetColor();
-
-                            // Subscribe to wildcard to discover all topics
-                            Console.WriteLine("  Subscribing to '#' (all topics)...");
-                            var subResult = await client.SubscribeAsync(
-                                new MqttClientSubscribeOptionsBuilder()
-                                    .WithTopicFilter("#", MqttQualityOfServiceLevel.AtMostOnce)
-                                    .Build(),
-                                cts.Token);
-
-                            foreach (var item in subResult.Items)
-                            {
-                                Console.WriteLine($"  Sub result: {item.TopicFilter.Topic} -> {item.ResultCode}");
-                            }
-
-                            Console.WriteLine();
-                            Console.WriteLine("Listening for messages... (Ctrl+C to stop)");
-                            Console.WriteLine(new string('-', 80));
-
-                            try
-                            {
-                                await Task.Delay(Timeout.Infinite, cts.Token);
-                            }
-                            catch (OperationCanceledException) { }
-
-                            await client.DisconnectAsync();
-                            Console.WriteLine("\nDisconnected cleanly.");
-                            return 0;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.WriteLine($"FAILED - {ex.Message}");
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"  SUCCESS with {label}! Subscribing to #...");
                         Console.ResetColor();
+                        await client.SubscribeAsync(new MqttClientSubscribeOptionsBuilder().WithTopicFilter("#").Build(), cts.Token);
+                        Console.WriteLine("  Listening 10s for messages...");
+                        await Task.Delay(10000, cts.Token);
+                        await client.DisconnectAsync();
+                        return 0;
                     }
                 }
-
-                Console.WriteLine();
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"  FAILED: {ex.Message}");
+                    Console.ResetColor();
+                }
             }
-            catch (Exception ex)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"  Error: {ex.Message}");
-                Console.ResetColor();
-                Console.WriteLine();
-            }
+            Console.WriteLine();
         }
 
         Console.WriteLine("All brokers failed.");

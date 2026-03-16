@@ -84,7 +84,9 @@ public static unsafe class HookEntry
     // ═══════════════════════════════════════════════════════════════════
     // Trampolines for calling original functions
     // ═══════════════════════════════════════════════════════════════════
-    private static nint _orig_messageReceived;
+    private static nint _orig_messageReceived; // set by native DLL hook (unused here)
+    private static nint _nativeHookDll; // handle to hook_native.dll
+    private static nint _nativeMessageReceivedTarget; // target addr for cleanup
     private static nint _orig_subscribe;
     private static nint _orig_connectToHost;
     private static nint _orig_connected;
@@ -202,13 +204,25 @@ public static unsafe class HookEntry
             PipeServer.Start();
             CommandReceiver.Start();
 
-            nint mqttModule = NativeMethods.GetModuleHandleW("wbmqtt.dll");
+            // Poll for wbmqtt.dll — inject happens before Webull fully loads
+            nint mqttModule = 0;
+            for (int i = 0; i < 30; i++)
+            {
+                mqttModule = NativeMethods.GetModuleHandleW("wbmqtt.dll");
+                if (mqttModule != 0) break;
+                if (i == 0) HookLog.Write("Waiting for wbmqtt.dll...");
+                Thread.Sleep(200);
+            }
             if (mqttModule == 0)
             {
-                HookLog.Write("ERROR: wbmqtt.dll not found in process.");
+                HookLog.Write("ERROR: wbmqtt.dll not found after 6s.");
                 return;
             }
-            HookLog.Write($"wbmqtt.dll base: 0x{mqttModule:X}");
+            HookLog.Write($"wbmqtt.dll found: 0x{mqttModule:X}. Installing hooks...");
+
+            HookLog.Write("Suspending other threads for safe hook installation...");
+            var suspendedThreads = SuspendOtherThreads();
+            HookLog.Write($"Suspended {suspendedThreads.Count} threads.");
 
             // Resolve getter functions (not hooked, called to read state)
             _fn_hostname = NativeMethods.GetProcAddress(mqttModule, Fn_hostname);
@@ -216,12 +230,12 @@ public static unsafe class HookEntry
             _fn_username = NativeMethods.GetProcAddress(mqttModule, Fn_username);
             _fn_clientId = NativeMethods.GetProcAddress(mqttModule, Fn_clientId);
 
-            // ── Hook: messageReceived (signal) ───────────────────────
-            InstallHook(mqttModule, "messageReceived", Fn_messageReceived,
-                (nint)(delegate* unmanaged<nint, nint, nint, void>)&Detour_messageReceived,
-                out _orig_messageReceived);
+            // ── Hook: messageReceived via native MinHook DLL ──────────
+            // The C# X64Hook crashes on messageReceived due to security cookie /
+            // anti-tamper. MinHook handles CFG, cookies, and instruction relocation.
+            InstallNativeMessageReceivedHook(mqttModule);
 
-            // ── Hook: QMqttSubscription::messageReceived ─────────────
+            // ── Hook: sub.messageReceived (per-subscription messages) ─
             InstallHook(mqttModule, "sub.messageReceived", Fn_subscriptionMessageReceived,
                 (nint)(delegate* unmanaged<nint, nint, void>)&Detour_subMessageReceived,
                 out _orig_subMessageReceived);
@@ -236,17 +250,17 @@ public static unsafe class HookEntry
                 (nint)(delegate* unmanaged<nint, void>)&Detour_connectToHost,
                 out _orig_connectToHost);
 
-            // ── Hook: connected (signal) ─────────────────────────────
-            InstallHook(mqttModule, "connected", Fn_connected,
-                (nint)(delegate* unmanaged<nint, void>)&Detour_connected,
-                out _orig_connected);
-
             // ── Hook: invokeSubscribeResult ──────────────────────────
             InstallHook(mqttModule, "invokeSubscribeResult", Fn_invokeSubscribeResult,
                 (nint)(delegate* unmanaged<nint, nint, nint>)&Detour_invokeSubscribeResult,
                 out _orig_invokeSubscribeResult);
 
-            // ── Hook: publish ────────────────────────────────────────
+            // ── Hook: connected (signal) ─────────────────────────────
+            InstallHook(mqttModule, "connected", Fn_connected,
+                (nint)(delegate* unmanaged<nint, void>)&Detour_connected,
+                out _orig_connected);
+
+            // ── Hook: publish (captures client via keepalive pings) ────
             InstallHook(mqttModule, "publish", Fn_publish,
                 (nint)(delegate* unmanaged<nint, nint, nint, byte, byte, int>)&Detour_publish,
                 out _orig_publish);
@@ -267,15 +281,14 @@ public static unsafe class HookEntry
             else
             {
                 HookLog.Write($"wbgrpc.dll base: 0x{grpcModule:X}");
-
-                // grpcWrite has clean first 14 bytes (mov+push chain), safe for inline hook.
-                // getHeadMd5Sign has RIP-relative LEA in first 14 bytes — skip it.
                 InstallHook(grpcModule, "grpcWrite", Fn_grpcWrite,
                     (nint)(delegate* unmanaged<nint, nint, int>)&Detour_grpcWrite,
                     out _orig_grpcWrite);
             }
 
-            HookLog.Write("All hooks installed. Waiting for activity...");
+            HookLog.Write("All hooks installed. Resuming threads...");
+            ResumeThreads(suspendedThreads);
+            HookLog.Write($"Resumed {suspendedThreads.Count} threads. Waiting for activity...");
             HookLog.Write("══════════════════════════════════════════════════");
         }
         catch (Exception ex)
@@ -294,37 +307,126 @@ public static unsafe class HookEntry
             return;
         }
 
-        trampoline = X64Hook.Install(addr, detour);
-        HookLog.Write($"  HOOK {name} at 0x{addr:X} -> trampoline 0x{trampoline:X}");
+        // Dump first 20 bytes for debugging instruction alignment
+        byte[] pre = new byte[20];
+        Marshal.Copy(addr, pre, 0, 20);
+        HookLog.Write($"  {name} at 0x{addr:X} bytes: {Convert.ToHexString(pre)}");
+
+        try
+        {
+            trampoline = X64Hook.Install(addr, detour);
+            HookLog.Write($"  HOOK {name} -> trampoline 0x{trampoline:X}");
+        }
+        catch (Exception ex)
+        {
+            HookLog.Write($"  HOOK {name} FAILED: {ex.Message}");
+            trampoline = 0;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Detour: QMqttClient::messageReceived(QByteArray&, QMqttTopicName&)
-    // x64 ABI: rcx=this, rdx=QByteArray*, r8=QMqttTopicName*
+    // Native MinHook DLL integration for messageReceived
     // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Load hook_native.dll and install a MinHook-based hook on messageReceived.
+    /// The native DLL calls back into NativeMessageCallback with decoded message data.
+    /// </summary>
+    private static void InstallNativeMessageReceivedHook(nint mqttModule)
+    {
+        try
+        {
+            // Resolve messageReceived target address
+            nint msgRecvAddr = NativeMethods.GetProcAddress(mqttModule, Fn_messageReceived);
+            if (msgRecvAddr == 0)
+            {
+                HookLog.Write("  SKIP messageReceived: export not found");
+                return;
+            }
+
+            // Dump first bytes for debugging
+            byte[] pre = new byte[20];
+            Marshal.Copy(msgRecvAddr, pre, 0, 20);
+            HookLog.Write($"  messageReceived at 0x{msgRecvAddr:X} bytes: {Convert.ToHexString(pre)}");
+
+            // Load hook_native.dll from same directory as this DLL
+            // In NativeAOT, Assembly.Location is empty. Use GetModuleHandleW + GetModuleFileName
+            // or just try loading from the current working directory / known paths.
+            nint hNative = NativeMethods.LoadLibraryW("hook_native.dll");
+            if (hNative == 0)
+            {
+                // Try from the WebullHook directory
+                hNative = NativeMethods.LoadLibraryW(@"D:\Third-Parties\WebullHook\hook_native.dll");
+            }
+            if (hNative == 0)
+            {
+                HookLog.Write("  WARN: hook_native.dll not found, messageReceived hook skipped.");
+                HookLog.Write("  Place hook_native.dll next to the hook DLL or in D:\\Third-Parties\\WebullHook\\");
+                return;
+            }
+            _nativeHookDll = hNative;
+            HookLog.Write($"  hook_native.dll loaded at 0x{hNative:X}");
+
+            // Resolve exports
+            nint setCallbackFn = NativeMethods.GetProcAddress(hNative, "SetMessageCallback");
+            nint installFn = NativeMethods.GetProcAddress(hNative, "InstallMessageReceivedHook");
+
+            if (setCallbackFn == 0 || installFn == 0)
+            {
+                HookLog.Write("  ERROR: hook_native.dll exports not found");
+                return;
+            }
+
+            // Set callback: the native detour will call this with decoded UTF-8 topic + raw payload
+            var setCallback = (delegate* unmanaged<nint, void>)setCallbackFn;
+            setCallback((nint)(delegate* unmanaged<byte*, int, byte*, int, void>)&NativeMessageCallback);
+            HookLog.Write("  Native callback registered");
+
+            // Install the MinHook hook
+            var install = (delegate* unmanaged<nint, int>)installFn;
+            int result = install(msgRecvAddr);
+
+            if (result == 0)
+            {
+                _nativeMessageReceivedTarget = msgRecvAddr;
+                HookLog.Write($"  HOOK messageReceived (native MinHook) -> OK");
+            }
+            else
+            {
+                HookLog.Write($"  HOOK messageReceived (native MinHook) FAILED: error code {result}");
+            }
+        }
+        catch (Exception ex)
+        {
+            HookLog.Write($"  HOOK messageReceived (native) EXCEPTION: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Callback invoked by hook_native.dll's detour with decoded message data.
+    /// Parameters are UTF-8 topic and raw payload bytes.
+    /// </summary>
     [UnmanagedCallersOnly]
-    private static void Detour_messageReceived(nint thisPtr, nint qByteArrayRef, nint qMqttTopicNameRef)
+    private static void NativeMessageCallback(byte* topicUtf8, int topicLen, byte* payload, int payloadLen)
     {
         try
         {
             _messageCount++;
-            if (_mqttClient == 0) { _mqttClient = thisPtr; HookLog.Write($"Captured QMqttClient: 0x{thisPtr:X}"); }
 
-            string topic = QtInterop.ReadQMqttTopicName(qMqttTopicNameRef);
-            ReadOnlySpan<byte> payload = QtInterop.ReadQByteArray(qByteArrayRef);
+            string topic = topicLen > 0
+                ? System.Text.Encoding.UTF8.GetString(topicUtf8, topicLen)
+                : string.Empty;
 
-            if (_messageCount <= 20 || _messageCount % 100 == 0)
-                HookLog.Write($"MSG #{_messageCount}: topic={topic} ({payload.Length} bytes)");
+            ReadOnlySpan<byte> payloadSpan = payloadLen > 0
+                ? new ReadOnlySpan<byte>(payload, payloadLen)
+                : [];
 
-            PipeServer.SendMessage(topic, payload);
+            if (_messageCount <= 20 || _messageCount % 500 == 0)
+                HookLog.Write($"MSG #{_messageCount}: topic={topic} ({payloadSpan.Length} bytes)");
+
+            PipeServer.SendMessage(topic, payloadSpan);
         }
         catch { }
-
-        if (_orig_messageReceived != 0)
-        {
-            var original = (delegate* unmanaged<nint, nint, nint, void>)_orig_messageReceived;
-            original(thisPtr, qByteArrayRef, qMqttTopicNameRef);
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -338,17 +440,47 @@ public static unsafe class HookEntry
         try
         {
             _messageCount++;
-            if (_messageCount <= 20 || _messageCount % 100 == 0)
-                HookLog.Write($"SUB-MSG #{_messageCount} on subscription 0x{thisPtr:X}");
 
-            // QMqttMessage contains topic and payload - try to read them
-            // QMqttMessage layout (approximate):
-            // - QMqttTopicName m_topic
-            // - QByteArray m_payload
-            // - other fields...
-            // For now just log that we received it
+            // QMqttMessage (Qt5, MSVC x64) is passed by hidden pointer in rdx.
+            // Layout: QMqttMessagePrivate* d_ptr (8 bytes)
+            // QMqttMessagePrivate layout:
+            //   QSharedData base (4 bytes ref count + padding)
+            //   QMqttTopicName m_topic  → { QString → QArrayData* }
+            //   QByteArray m_payload → { QArrayData* }
+            //   quint16 m_id
+            //   quint8 m_qos
+            //   bool m_duplicate
+            //   bool m_retain
+            // Try reading topic and payload from the QMqttMessage
+            if (qMqttMessagePtr != 0)
+            {
+                // QMqttMessage has a d_ptr to QMqttMessagePrivate
+                nint dPtr = *(nint*)qMqttMessagePtr;
+                if (dPtr != 0)
+                {
+                    // QMqttMessagePrivate: skip QSharedData (8 bytes on x64 with alignment)
+                    // m_topic at offset 8 (QMqttTopicName = QString = { QArrayData* d })
+                    // m_payload at offset 16 (QByteArray = { QArrayData* d })
+                    nint topicField = dPtr + 8;
+                    nint payloadField = dPtr + 16;
+
+                    string topic = QtInterop.ReadQString(topicField);
+                    ReadOnlySpan<byte> payload = QtInterop.ReadQByteArray(payloadField);
+
+                    if (_messageCount <= 5)
+                        HookLog.Write($"SUB-MSG #{_messageCount}: topic={topic} ({payload.Length}b) sub=0x{thisPtr:X}");
+                    else if (_messageCount % 500 == 0)
+                        HookLog.Write($"SUB-MSG #{_messageCount}: topic={topic} ({payload.Length}b)");
+
+                    PipeServer.SendMessage(topic, payload);
+                }
+            }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            if (_messageCount <= 5)
+                HookLog.Write($"SUB-MSG #{_messageCount} ERROR: {ex.Message}");
+        }
 
         if (_orig_subMessageReceived != 0)
         {
@@ -500,9 +632,10 @@ public static unsafe class HookEntry
     {
         try
         {
+            if (_mqttClient == 0) { _mqttClient = thisPtr; HookLog.Write($"Captured QMqttClient via publish: 0x{thisPtr:X}"); }
             string topic = QtInterop.ReadQMqttTopicName(topicNameRef);
             ReadOnlySpan<byte> payload = QtInterop.ReadQByteArray(qByteArrayRef);
-            HookLog.Write($"PUBLISH: topic=\"{topic}\" payload={payload.Length}b qos={qos} retain={retain} client=0x{thisPtr:X}");
+            HookLog.Write($"PUBLISH: topic=\"{topic}\" payload={payload.Length}b qos={qos} retain={retain}");
         }
         catch (Exception ex)
         {
@@ -584,65 +717,10 @@ public static unsafe class HookEntry
         {
             HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: ClientRequest ptr=0x{clientRequestPtr:X}");
 
-            // Dump raw memory of the protobuf C++ object so we can analyze the layout.
-            // Also scan for embedded string fields (std::string on MSVC x64 = 32 bytes with SSO).
+            // Log that we saw the gRPC write (skip raw memory dump to avoid crashes)
             if (clientRequestPtr != 0)
             {
-                // Dump first 512 bytes of the object as hex
-                byte[] raw = new byte[512];
-                System.Runtime.InteropServices.Marshal.Copy(clientRequestPtr, raw, 0, 512);
-                string hex = Convert.ToHexString(raw);
-                HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: raw[0..512]={hex}");
-
-                // Try to find readable ASCII/UTF-8 strings embedded in the object
-                // MSVC std::string: if size <= 15, data is inline at offset 0 of the string object;
-                // otherwise, ptr at offset 0 points to heap data, size at offset 16, capacity at offset 24.
-                // Scan every 8-byte boundary for potential string pointers and inline data.
-                for (int off = 0; off < 480; off += 8)
-                {
-                    // Try reading as a pointer to a null-terminated string
-                    long ptrVal = BitConverter.ToInt64(raw, off);
-                    if (ptrVal > 0x10000 && ptrVal < 0x7FFFFFFFFFFF)
-                    {
-                        try
-                        {
-                            byte[] strBuf = new byte[256];
-                            System.Runtime.InteropServices.Marshal.Copy((nint)ptrVal, strBuf, 0, 256);
-                            int nullIdx = Array.IndexOf(strBuf, (byte)0);
-                            if (nullIdx > 3 && nullIdx < 200)
-                            {
-                                bool printable = true;
-                                for (int i = 0; i < nullIdx; i++)
-                                    if (strBuf[i] < 32 || strBuf[i] > 126) { printable = false; break; }
-                                if (printable)
-                                {
-                                    string s = System.Text.Encoding.ASCII.GetString(strBuf, 0, nullIdx);
-                                    HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: @+{off} ptr->str({nullIdx})=\"{s}\"");
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-
-                    // Also check for inline SSO string (readable bytes directly in the object)
-                    if (off + 16 <= raw.Length)
-                    {
-                        int inlineEnd = -1;
-                        for (int i = off; i < Math.Min(off + 16, raw.Length); i++)
-                        {
-                            if (raw[i] == 0) { inlineEnd = i; break; }
-                            if (raw[i] < 32 || raw[i] > 126) break;
-                        }
-                        if (inlineEnd > off + 3)
-                        {
-                            string s = System.Text.Encoding.ASCII.GetString(raw, off, inlineEnd - off);
-                            HookLog.Write($"GRPC-WRITE #{_grpcRequestCount}: @+{off} inline=\"{s}\"");
-                        }
-                    }
-                }
-
-                // Also send the raw hex through the pipe for real-time analysis
-                PipeServer.SendEvent("grpc_write", Convert.ToHexString(raw));
+                PipeServer.SendEvent("grpc_write", $"ptr=0x{clientRequestPtr:X}");
             }
         }
         catch (Exception ex)
@@ -656,5 +734,52 @@ public static unsafe class HookEntry
             return original(thisPtr, clientRequestPtr);
         }
         return 0;
+    }
+
+    /// <summary>Suspend all threads in the current process except our own.</summary>
+    private static List<nint> SuspendOtherThreads()
+    {
+        var handles = new List<nint>();
+        uint myTid = NativeMethods.GetCurrentThreadId();
+        uint myPid = NativeMethods.GetCurrentProcessId();
+
+        nint snap = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPTHREAD, 0);
+        if (snap == -1) return handles;
+
+        try
+        {
+            var te = new NativeMethods.THREADENTRY32 { dwSize = (uint)Marshal.SizeOf<NativeMethods.THREADENTRY32>() };
+            if (NativeMethods.Thread32First(snap, ref te))
+            {
+                do
+                {
+                    if (te.th32OwnerProcessID == myPid && te.th32ThreadID != myTid)
+                    {
+                        nint hThread = NativeMethods.OpenThread(NativeMethods.THREAD_SUSPEND_RESUME, false, te.th32ThreadID);
+                        if (hThread != 0)
+                        {
+                            NativeMethods.SuspendThread(hThread);
+                            handles.Add(hThread);
+                        }
+                    }
+                } while (NativeMethods.Thread32Next(snap, ref te));
+            }
+        }
+        finally
+        {
+            NativeMethods.CloseHandle(snap);
+        }
+
+        return handles;
+    }
+
+    /// <summary>Resume previously suspended threads.</summary>
+    private static void ResumeThreads(List<nint> handles)
+    {
+        foreach (nint h in handles)
+        {
+            NativeMethods.ResumeThread(h);
+            NativeMethods.CloseHandle(h);
+        }
     }
 }

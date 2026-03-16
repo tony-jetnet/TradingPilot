@@ -292,9 +292,10 @@ public partial class WebullHookHostedService : BackgroundService
             var proc = FindWebull();
             if (proc != null)
             {
-                // Extra time for full load
-                _logger.LogInformation("Webull Desktop started (PID {Pid}). Waiting for full load...", proc.Id);
-                await Task.Delay(10000, ct);
+                // Inject immediately — wbmqtt.dll must be loaded for hooks to install.
+                // If it's not loaded yet, the hook will retry internally.
+                _logger.LogInformation("Webull Desktop started (PID {Pid}). Injecting immediately...", proc.Id);
+                await Task.Delay(1000, ct);
                 return proc;
             }
         }
