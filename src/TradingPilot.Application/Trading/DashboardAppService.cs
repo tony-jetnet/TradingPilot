@@ -149,8 +149,17 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
             }).ToList() ?? new(),
         };
 
-        // Hook status
-        dto.HookStatus = WebullHookAppService.CapturedAuthHeader != null ? "Connected" : "Disconnected";
+        // Hook status — check streaming health + static state
+        if (dto.StreamingHealth.TotalMqttMessages > 0)
+            dto.HookStatus = "Streaming";
+        else if (WebullHookAppService.IsPipeConnected)
+            dto.HookStatus = "Pipe Connected";
+        else if (WebullHookAppService.IsInjected)
+            dto.HookStatus = "Injected";
+        else if (WebullHookAppService.CapturedAuthHeader != null)
+            dto.HookStatus = "Auth Only";
+        else
+            dto.HookStatus = "Disconnected";
 
         // Streaming health
         dto.StreamingHealth = _mqttProcessor.GetHealthMetrics();

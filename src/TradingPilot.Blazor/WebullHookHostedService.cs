@@ -17,17 +17,20 @@ public partial class WebullHookHostedService : BackgroundService
     private readonly ILogger<WebullHookHostedService> _logger;
     private readonly MqttDataReader _mqttDataReader;
     private readonly MqttMessageProcessor _mqttProcessor;
+    private readonly IServiceScopeFactory _scopeFactory;
     private bool _weStartedWebull;
     private int? _webullPid;
 
     public WebullHookHostedService(
         ILogger<WebullHookHostedService> logger,
         MqttDataReader mqttDataReader,
-        MqttMessageProcessor mqttProcessor)
+        MqttMessageProcessor mqttProcessor,
+        IServiceScopeFactory scopeFactory)
     {
         _logger = logger;
         _mqttDataReader = mqttDataReader;
         _mqttProcessor = mqttProcessor;
+        _scopeFactory = scopeFactory;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -78,6 +81,9 @@ public partial class WebullHookHostedService : BackgroundService
                 // Wait for hook to start pipe servers
                 await Task.Delay(3000, stoppingToken);
             }
+
+            // Update shared state so dashboard reflects actual status
+            WebullHookAppService.IsInjected = true;
 
             // 5. Start reading data pipe + auto-subscribe
             _logger.LogInformation("Connecting to hook data pipe...");
@@ -276,6 +282,7 @@ public partial class WebullHookHostedService : BackgroundService
             }, stoppingToken);
 
             // 7. Start reading from hook pipe (C# PipeServer receives data via native callback)
+            WebullHookAppService.IsPipeConnected = true;
             await _mqttDataReader.StartAsync(stoppingToken);
         }
         catch (OperationCanceledException) { }
@@ -321,7 +328,15 @@ public partial class WebullHookHostedService : BackgroundService
     {
         try
         {
-            _logger.LogInformation("Auto-subscribe: connecting to command pipe...");
+            // Load all watched symbols from DB
+            var watchedSymbols = await GetWatchedSymbolsAsync();
+            if (watchedSymbols.Count == 0)
+            {
+                _logger.LogWarning("Auto-subscribe: no watched symbols found in DB");
+                return;
+            }
+
+            _logger.LogInformation("Auto-subscribe: connecting to command pipe for {Count} symbols...", watchedSymbols.Count);
             using var cmdPipe = new NamedPipeClientStream(".", "WebullMqttHookCmd", PipeDirection.InOut);
             await cmdPipe.ConnectAsync(5000, ct);
             _logger.LogInformation("Auto-subscribe: command pipe connected.");
@@ -329,36 +344,50 @@ public partial class WebullHookHostedService : BackgroundService
             using var reader = new StreamReader(cmdPipe, Utf8NoBom, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
             using var writer = new StreamWriter(cmdPipe, Utf8NoBom, leaveOpen: true) { AutoFlush = true };
 
-            // Ping first to verify pipe works
-            _logger.LogInformation("Auto-subscribe: sending ping...");
+            // Ping first
             await writer.WriteLineAsync("""{"cmd":"ping"}""".AsMemory(), ct);
             string? pong = await reader.ReadLineAsync(ct);
-            _logger.LogInformation("Auto-subscribe: ping response: {Response}", pong);
+            _logger.LogInformation("Auto-subscribe: ping: {Response}", pong);
 
-            // Ticker IDs: AMD = 913254235, RKLB = 950178054
-            long[] tickers = [913254235, 950178054];
-            string[] tickerNames = ["AMD", "RKLB"];
+            // Subscribe types: 91=L2depth, 92=quote, 100=tick, 102=trade, 104=order, 105=L2depth2
             int[] types = [91, 92, 100, 102, 104, 105];
 
-            for (int t = 0; t < tickers.Length; t++)
+            foreach (var (ticker, tickerId) in watchedSymbols)
             {
                 foreach (int type in types)
                 {
                     string flag = type is 91 or 105 ? "1,50,1" : "1";
-                    string subJson = $$"""{"flag":"{{flag}}","header":{{headerJson}},"module":"[\"OtherStocks\"]","tickerIds":[{{tickers[t]}}],"type":"{{type}}"}""";
+                    string subJson = $$"""{"flag":"{{flag}}","header":{{headerJson}},"module":"[\"OtherStocks\"]","tickerIds":[{{tickerId}}],"type":"{{type}}"}""";
                     string cmd = JsonSerializer.Serialize(new { cmd = "subscribe", json = subJson });
-                    _logger.LogInformation("Auto-subscribe: sending {Ticker} type={Type}...", tickerNames[t], type);
                     await writer.WriteLineAsync(cmd.AsMemory(), ct);
                     string? resp = await reader.ReadLineAsync(ct);
-                    _logger.LogInformation("Subscribe {Ticker} type={Type}: {Response}", tickerNames[t], type, resp);
                 }
+                _logger.LogInformation("Auto-subscribe: {Ticker} (tickerId={TickerId}) — all 6 types", ticker, tickerId);
             }
 
-            _logger.LogInformation("Auto-subscribe complete for AMD + RKLB (all 6 types each).");
+            _logger.LogInformation("Auto-subscribe complete for {Count} symbols ({Names}).",
+                watchedSymbols.Count, string.Join(", ", watchedSymbols.Select(s => s.Ticker)));
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Auto-subscribe failed");
+        }
+    }
+
+    private async Task<List<(string Ticker, long TickerId)>> GetWatchedSymbolsAsync()
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilot.EntityFrameworkCore.TradingPilotDbContext>();
+            var symbols = await Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ToListAsync(
+                dbContext.Symbols.Where(s => s.IsWatched).OrderBy(s => s.Id));
+            return symbols.Select(s => (s.Id, s.WebullTickerId)).ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to load watched symbols for auto-subscribe");
+            return [];
         }
     }
 

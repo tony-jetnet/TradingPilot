@@ -31,6 +31,8 @@ public class WebullHookAppService : ApplicationService, IWebullHookAppService
         @"D:\Third-Parties\WebullHook", "auth_header.json");
 
     public static string? CapturedAuthHeader => _capturedAuthHeader;
+    public static bool IsInjected { get => _isInjected; set => _isInjected = value; }
+    public static bool IsPipeConnected { get => _isPipeConnected; set => _isPipeConnected = value; }
 
     private const int MaxRecentMessages = 500;
 
