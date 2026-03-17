@@ -4,7 +4,7 @@ namespace TradingPilot.Symbols;
 
 public class SymbolFinancialSnapshot : Entity<Guid>
 {
-    public Guid SymbolId { get; set; }
+    public string SymbolId { get; set; } = null!;
     public DateOnly Date { get; set; }
     public decimal? Pe { get; set; }
     public decimal? ForwardPe { get; set; }

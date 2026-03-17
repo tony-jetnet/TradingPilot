@@ -130,9 +130,6 @@ public class TradingPilotBlazorModule : AbpModule
         // MQTT message processor (singleton — processes real-time MQTT data into structured DB entities)
         context.Services.AddSingleton<MqttMessageProcessor>();
 
-        // Nightly model trainer (transient — runs after market close via Hangfire)
-        context.Services.AddTransient<NightlyModelTrainer>();
-
         // Nightly AI strategy optimizer (transient — Bedrock Sonnet 4.6, runs after market close)
         context.Services.AddTransient<NightlyStrategyOptimizer>();
 
@@ -183,7 +180,7 @@ public class TradingPilotBlazorModule : AbpModule
         var recurringJobs = context.ServiceProvider.GetRequiredService<IRecurringJobManager>();
 
         // Schedule historical bars load (staggered, 30s delay for auth capture)
-        string[] tickers = ["AMD", "RKLB"];
+        string[] tickers = ["AMD", "RKLB", "NVDA", "TSLA", "PLTR", "SOFI", "SMCI", "RIVN", "SMR", "LLY"];
         string[] timeframes = ["d", "m1", "m5", "m15", "m30", "h1"];
         for (int i = 0; i < tickers.Length; i++)
         {
@@ -191,14 +188,11 @@ public class TradingPilotBlazorModule : AbpModule
             var tf = timeframes;
             jobClient.Schedule<LoadHistoricalBarsJob>(
                 job => job.ExecuteAsync(ticker, tf),
-                TimeSpan.FromSeconds(30 + i * 60)); // stagger by 60s
+                TimeSpan.FromSeconds(30 + i * 15)); // stagger by 15s
         }
 
-        // Schedule recurring L2 depth polling (every minute, job internally polls 12x at 5s)
-        recurringJobs.AddOrUpdate<PollL2DepthJob>(
-            "poll-l2-depth",
-            job => job.ExecuteAsync(),
-            Cron.Minutely());
+        // Remove deprecated L2 polling job (MQTT streaming handles this)
+        recurringJobs.RemoveIfExists("poll-l2-depth");
 
         // Recurring bar refresh (every 30 min during market hours to keep data fresh)
         recurringJobs.AddOrUpdate<LoadHistoricalBarsJob>(
@@ -214,21 +208,15 @@ public class TradingPilotBlazorModule : AbpModule
             job => job.ExecuteAsync(),
             "*/30 * * * *"); // every 30 min
 
-        // Nightly model training: 9 PM ET weekdays (after market close)
-        recurringJobs.AddOrUpdate<NightlyModelTrainer>(
-            "nightly-model-training",
-            trainer => trainer.TrainAsync(20),
-            "0 21 * * 1-5",
-            new RecurringJobOptions
-            {
-                TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
-            });
+        // Remove deprecated job (replaced by NightlyStrategyOptimizer)
+        recurringJobs.RemoveIfExists("nightly-model-training");
 
-        // Nightly AI strategy optimization: 9:15 PM ET weekdays (after model training)
+        // Nightly AI strategy optimization: 9 PM ET weekdays (after market close)
+        // Backfills gaps, then calls Bedrock Sonnet 4.6 per symbol
         recurringJobs.AddOrUpdate<NightlyStrategyOptimizer>(
             "nightly-strategy-optimization",
             optimizer => optimizer.OptimizeAsync(20),
-            "15 21 * * 1-5",
+            "0 21 * * 1-5",
             new RecurringJobOptions
             {
                 TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")

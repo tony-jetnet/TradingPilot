@@ -65,8 +65,8 @@ public class NightlyStrategyOptimizer
             {
                 try
                 {
-                    await BackfillTickSnapshotsFromBarsAsync(symbol.TickerId, symbol.Ticker, symbol.SymbolId, lookbackDays);
-                    await BackfillTradingSignalsFromSnapshotsAsync(symbol.TickerId, symbol.Ticker, symbol.SymbolId, lookbackDays);
+                    await BackfillTickSnapshotsFromBarsAsync(symbol.TickerId, symbol.Ticker, symbol.Ticker, lookbackDays);
+                    await BackfillTradingSignalsFromSnapshotsAsync(symbol.TickerId, symbol.Ticker, symbol.Ticker, lookbackDays);
                 }
                 catch (Exception ex)
                 {
@@ -85,7 +85,7 @@ public class NightlyStrategyOptimizer
             {
                 try
                 {
-                    var analysis = await PrepareSymbolAnalysisAsync(symbol.TickerId, symbol.Ticker, symbol.SymbolId, lookbackDays);
+                    var analysis = await PrepareSymbolAnalysisAsync(symbol.TickerId, symbol.Ticker, symbol.Ticker, lookbackDays);
                     if (analysis == null)
                     {
                         _logger.LogWarning("Insufficient data for {Ticker}, skipping", symbol.Ticker);
@@ -130,24 +130,35 @@ public class NightlyStrategyOptimizer
 
     #region Symbol Analysis Preparation
 
-    private async Task<string?> PrepareSymbolAnalysisAsync(long tickerId, string ticker, Guid symbolId, int lookbackDays)
+    private async Task<string?> PrepareSymbolAnalysisAsync(long tickerId, string ticker, string symbolId, int lookbackDays)
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
 
         var cutoff = DateTime.UtcNow.AddDays(-lookbackDays);
 
+        // Open connection once and keep it alive for all queries
+        var connection = dbContext.Database.GetDbConnection();
+        await connection.OpenAsync();
+
+        try
+        {
         // Query: per-hour performance
-        var hourlyStats = await GetHourlyStatsAsync(dbContext, symbolId, tickerId, cutoff);
+        var hourlyStats = await GetHourlyStatsAsync(connection, symbolId, tickerId, cutoff);
 
         // Query: indicator effectiveness
-        var indicatorStats = await GetIndicatorEffectivenessAsync(dbContext, symbolId, tickerId, cutoff);
+        var indicatorStats = await GetIndicatorEffectivenessAsync(connection, symbolId, tickerId, cutoff);
 
         // Query: recent vs historical
-        var recentStats = await GetRecentVsHistoricalAsync(dbContext, symbolId, tickerId, cutoff);
+        var recentStats = await GetRecentVsHistoricalAsync(connection, symbolId, tickerId, cutoff);
 
         // Query: combination stats
-        var comboStats = await GetIndicatorCombinationsAsync(dbContext, symbolId, tickerId, cutoff);
+        var comboStats = await GetIndicatorCombinationsAsync(connection, symbolId, tickerId, cutoff);
+
+        // Query: fundamental + sentiment context
+        var fundamentals = await GetLatestFinancialsAsync(connection, symbolId);
+        var capitalFlows = await GetRecentCapitalFlowsAsync(connection, symbolId, lookbackDays);
+        var recentNews = await GetRecentNewsAsync(connection, symbolId, lookbackDays);
 
         int totalSignals = hourlyStats.Sum(h => h.TotalSignals);
         if (totalSignals < 100)
@@ -220,11 +231,68 @@ public class NightlyStrategyOptimizer
             sb.AppendLine($"| Last {lookbackDays} days | {buyWinRate * 100:F1}% | {sellWinRate * 100:F1}% | ${recentStats.FullAvgSpread:F4} | {recentStats.FullAvgVolume:N0} |");
         }
 
+        // Fundamentals
+        if (fundamentals != null)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Fundamentals");
+            sb.AppendLine($"- P/E: {fundamentals.Pe?.ToString("F1") ?? "N/A"} | Forward P/E: {fundamentals.ForwardPe?.ToString("F1") ?? "N/A"}");
+            sb.AppendLine($"- EPS: {fundamentals.Eps?.ToString("F2") ?? "N/A"} | Est EPS: {fundamentals.EstEps?.ToString("F2") ?? "N/A"}");
+            sb.AppendLine($"- Market Cap: {FormatLargeNumber(fundamentals.MarketCap)}");
+            sb.AppendLine($"- Beta: {fundamentals.Beta?.ToString("F2") ?? "N/A"} | Short Float: {fundamentals.ShortFloat?.ToString("P1") ?? "N/A"}");
+            sb.AppendLine($"- 52W High: ${fundamentals.High52w?.ToString("F2") ?? "N/A"} | 52W Low: ${fundamentals.Low52w?.ToString("F2") ?? "N/A"}");
+            if (fundamentals.NextEarningsDate != null)
+                sb.AppendLine($"- Next Earnings: {fundamentals.NextEarningsDate}");
+        }
+
+        // Capital flows (institutional money movement)
+        if (capitalFlows.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Institutional Capital Flow (recent days)");
+            sb.AppendLine("| Date | Large Net | SuperLarge Net | Total Net | Signal |");
+            sb.AppendLine("|------|-----------|---------------|-----------|--------|");
+            foreach (var flow in capitalFlows)
+            {
+                decimal largeNet = flow.LargeInflow - flow.LargeOutflow;
+                decimal superLargeNet = flow.SuperLargeInflow - flow.SuperLargeOutflow;
+                decimal totalNet = largeNet + superLargeNet + (flow.MediumInflow - flow.MediumOutflow);
+                string signal = totalNet > 0 ? "INFLOW" : "OUTFLOW";
+                sb.AppendLine($"| {flow.Date} | {FormatLargeNumber(largeNet)} | {FormatLargeNumber(superLargeNet)} | {FormatLargeNumber(totalNet)} | {signal} |");
+            }
+        }
+
+        // Recent news headlines
+        if (recentNews.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Recent News (last 5 days)");
+            foreach (var news in recentNews.Take(10))
+            {
+                sb.AppendLine($"- [{news.PublishedAt:MMM dd}] {news.Title}");
+            }
+        }
+
         return sb.ToString();
+        }
+        finally
+        {
+            await connection.CloseAsync();
+        }
+    }
+
+    private static string FormatLargeNumber(decimal? value)
+    {
+        if (!value.HasValue) return "N/A";
+        var v = value.Value;
+        if (Math.Abs(v) >= 1_000_000_000) return $"${v / 1_000_000_000:F1}B";
+        if (Math.Abs(v) >= 1_000_000) return $"${v / 1_000_000:F1}M";
+        if (Math.Abs(v) >= 1_000) return $"${v / 1_000:F0}K";
+        return $"${v:F0}";
     }
 
     private async Task<List<HourlyStat>> GetHourlyStatsAsync(
-        TradingPilotDbContext db, Guid symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
     {
         var sql = @"
             SELECT
@@ -244,9 +312,7 @@ public class NightlyStrategyOptimizer
             ORDER BY ""Hour""";
 
         var results = new List<HourlyStat>();
-        using var connection = db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            await connection.OpenAsync();
+        // connection is already open (passed from PrepareSymbolAnalysisAsync)
 
         using var cmd = connection.CreateCommand();
         cmd.CommandText = sql;
@@ -273,15 +339,13 @@ public class NightlyStrategyOptimizer
     }
 
     private async Task<List<IndicatorStat>> GetIndicatorEffectivenessAsync(
-        TradingPilotDbContext db, Guid symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
     {
         // Query indicator effectiveness from TickSnapshots joined with TradingSignals
         var indicators = new[] { "ObiSmoothed", "Wobi", "PressureRoc", "LargeOrderSignal", "SpreadSignal" };
         var results = new List<IndicatorStat>();
 
-        using var connection = db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            await connection.OpenAsync();
+        // connection is already open (passed from PrepareSymbolAnalysisAsync)
 
         foreach (var indName in indicators)
         {
@@ -388,7 +452,7 @@ public class NightlyStrategyOptimizer
     }
 
     private async Task<List<ComboStat>> GetIndicatorCombinationsAsync(
-        TradingPilotDbContext db, Guid symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
     {
         var results = new List<ComboStat>();
         var combos = new[]
@@ -398,9 +462,7 @@ public class NightlyStrategyOptimizer
             ("WOBI + SpreadSignal", @"""Wobi""", @"""SpreadSignal"""),
         };
 
-        using var connection = db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            await connection.OpenAsync();
+        // connection is already open (passed from PrepareSymbolAnalysisAsync)
 
         foreach (var (name, col1, col2) in combos)
         {
@@ -450,15 +512,11 @@ public class NightlyStrategyOptimizer
     }
 
     private async Task<RecentVsHistorical?> GetRecentVsHistoricalAsync(
-        TradingPilotDbContext db, Guid symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
     {
         try
         {
             var cutoff5d = DateTime.UtcNow.AddDays(-5);
-
-            using var connection = db.Database.GetDbConnection();
-            if (connection.State != System.Data.ConnectionState.Open)
-                await connection.OpenAsync();
 
             var sql = @"
                 SELECT
@@ -506,8 +564,8 @@ public class NightlyStrategyOptimizer
 
     private async Task<SymbolStrategy?> CallBedrockAsync(long tickerId, string ticker, string analysisPrompt)
     {
-        var region = _configuration["Bedrock:Region"] ?? "us-west-2";
-        var modelId = _configuration["Bedrock:ModelId"] ?? "anthropic.claude-sonnet-4-6-20250514-v1:0";
+        var region = _configuration["Bedrock:Region"];
+        var modelId = _configuration["Bedrock:ModelId"];
 
         _logger.LogInformation("Calling Bedrock {Model} for {Ticker}...", modelId, ticker);
 
@@ -519,6 +577,9 @@ Your rules should:
 3. Identify indicator combinations that have high win rates
 4. Disable trading during historically unprofitable hours
 5. Set per-rule hold times and stop losses based on the data
+6. Consider fundamental context: high short float = more volatile, near earnings = widen stops
+7. Consider institutional capital flows: sustained large inflows = bullish bias, outflows = bearish
+8. Consider recent news sentiment: major catalysts may shift patterns
 
 Be conservative: only generate rules with sample sizes >= 20 and confidence >= 0.55.
 Focus on the strongest patterns in the data.";
@@ -683,9 +744,9 @@ Return ONLY the JSON object, no markdown fences or explanation.";
             using var scope = _scopeFactory.CreateScope();
             var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
             await dbContext.Database.ExecuteSqlRawAsync(@"
-                INSERT INTO ""ModelConfigs"" (""Id"", ""Key"", ""Value"", ""UpdatedAt"")
-                VALUES (gen_random_uuid(), 'strategy_rules', {0}::jsonb, {1})
-                ON CONFLICT (""Key"") DO UPDATE SET ""Value"" = {0}::jsonb, ""UpdatedAt"" = {1}",
+                INSERT INTO ""ModelConfigs"" (""Key"", ""Value"", ""UpdatedAt"")
+                VALUES ('strategy_rules', {0}, {1})
+                ON CONFLICT (""Key"") DO UPDATE SET ""Value"" = {0}, ""UpdatedAt"" = {1}",
                 json, DateTime.UtcNow);
         }
         catch (Exception ex)
@@ -729,13 +790,126 @@ Return ONLY the JSON object, no markdown fences or explanation.";
 
     #endregion
 
+    #region Fundamental + Sentiment Queries
+
+    private async Task<FinancialData?> GetLatestFinancialsAsync(
+        System.Data.Common.DbConnection connection, string symbolId)
+    {
+        try
+        {
+            var sql = @"
+                SELECT ""Pe"", ""ForwardPe"", ""Eps"", ""EstEps"", ""MarketCap"",
+                       ""Beta"", ""ShortFloat"", ""High52w"", ""Low52w"",
+                       ""DividendYield"", ""NextEarningsDate""
+                FROM ""SymbolFinancialSnapshots""
+                WHERE ""SymbolId"" = @p0
+                ORDER BY ""Date"" DESC LIMIT 1";
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = sql;
+            AddParameter(cmd, "@p0", symbolId);
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync())
+            {
+                return new FinancialData
+                {
+                    Pe = reader.IsDBNull(0) ? null : reader.GetDecimal(0),
+                    ForwardPe = reader.IsDBNull(1) ? null : reader.GetDecimal(1),
+                    Eps = reader.IsDBNull(2) ? null : reader.GetDecimal(2),
+                    EstEps = reader.IsDBNull(3) ? null : reader.GetDecimal(3),
+                    MarketCap = reader.IsDBNull(4) ? null : reader.GetDecimal(4),
+                    Beta = reader.IsDBNull(5) ? null : reader.GetDecimal(5),
+                    ShortFloat = reader.IsDBNull(6) ? null : reader.GetDecimal(6),
+                    High52w = reader.IsDBNull(7) ? null : reader.GetDecimal(7),
+                    Low52w = reader.IsDBNull(8) ? null : reader.GetDecimal(8),
+                    DividendYield = reader.IsDBNull(9) ? null : reader.GetDecimal(9),
+                    NextEarningsDate = reader.IsDBNull(10) ? null : reader.GetString(10),
+                };
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private async Task<List<CapitalFlowData>> GetRecentCapitalFlowsAsync(
+        System.Data.Common.DbConnection connection, string symbolId, int lookbackDays)
+    {
+        var results = new List<CapitalFlowData>();
+        try
+        {
+            var sql = @"
+                SELECT ""Date"", ""SuperLargeInflow"", ""SuperLargeOutflow"",
+                       ""LargeInflow"", ""LargeOutflow"", ""MediumInflow"", ""MediumOutflow""
+                FROM ""SymbolCapitalFlows""
+                WHERE ""SymbolId"" = @p0 AND ""Date"" >= @p1
+                ORDER BY ""Date"" DESC LIMIT 10";
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = sql;
+            AddParameter(cmd, "@p0", symbolId);
+            AddParameter(cmd, "@p1", DateOnly.FromDateTime(DateTime.UtcNow.AddDays(-lookbackDays)));
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                results.Add(new CapitalFlowData
+                {
+                    Date = reader.GetFieldValue<DateOnly>(0),
+                    SuperLargeInflow = reader.GetDecimal(1),
+                    SuperLargeOutflow = reader.GetDecimal(2),
+                    LargeInflow = reader.GetDecimal(3),
+                    LargeOutflow = reader.GetDecimal(4),
+                    MediumInflow = reader.GetDecimal(5),
+                    MediumOutflow = reader.GetDecimal(6),
+                });
+            }
+        }
+        catch { }
+        return results;
+    }
+
+    private async Task<List<NewsData>> GetRecentNewsAsync(
+        System.Data.Common.DbConnection connection, string symbolId, int lookbackDays)
+    {
+        var results = new List<NewsData>();
+        try
+        {
+            // Only last 5 days of news to keep prompt concise
+            var sql = @"
+                SELECT ""Title"", ""PublishedAt""
+                FROM ""SymbolNews""
+                WHERE ""SymbolId"" = @p0 AND ""PublishedAt"" >= @p1
+                ORDER BY ""PublishedAt"" DESC LIMIT 10";
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = sql;
+            AddParameter(cmd, "@p0", symbolId);
+            AddParameter(cmd, "@p1", DateTime.UtcNow.AddDays(-5));
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                results.Add(new NewsData
+                {
+                    Title = reader.GetString(0),
+                    PublishedAt = reader.GetDateTime(1),
+                });
+            }
+        }
+        catch { }
+        return results;
+    }
+
+    #endregion
+
     #region Gap Backfill (TickSnapshots + TradingSignals from bars)
 
     /// <summary>
     /// For each day in the lookback period, create TickSnapshots from 1-minute bars
     /// where no real TickSnapshot exists (gaps from app downtime).
     /// </summary>
-    private async Task BackfillTickSnapshotsFromBarsAsync(long tickerId, string ticker, Guid symbolId, int lookbackDays)
+    private async Task BackfillTickSnapshotsFromBarsAsync(long tickerId, string ticker, string symbolId, int lookbackDays)
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
@@ -778,7 +952,7 @@ Return ONLY the JSON object, no markdown fences or explanation.";
     /// Generate approximate TradingSignals from TickSnapshots for gaps.
     /// Uses price momentum between bars and pre-computes PriceAfter1Min/5Min verification.
     /// </summary>
-    private async Task BackfillTradingSignalsFromSnapshotsAsync(long tickerId, string ticker, Guid symbolId, int lookbackDays)
+    private async Task BackfillTradingSignalsFromSnapshotsAsync(long tickerId, string ticker, string symbolId, int lookbackDays)
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
@@ -860,7 +1034,7 @@ Return ONLY the JSON object, no markdown fences or explanation.";
 
     #region Helpers
 
-    private async Task<List<(long TickerId, string Ticker, Guid SymbolId)>> GetActiveSymbolsAsync()
+    private async Task<List<(long TickerId, string Ticker)>> GetActiveSymbolsAsync()
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
@@ -868,18 +1042,17 @@ Return ONLY the JSON object, no markdown fences or explanation.";
         using var connection = dbContext.Database.GetDbConnection();
         await connection.OpenAsync();
 
-        var sql = @"SELECT ""Id"", ""Ticker"", ""WebullTickerId"" FROM ""Symbols"" WHERE ""IsWatched"" = true AND ""Status"" = 0";
+        var sql = @"SELECT ""Id"", ""WebullTickerId"" FROM ""Symbols"" WHERE ""IsWatched"" = true AND ""Status"" = 1";
         using var cmd = connection.CreateCommand();
         cmd.CommandText = sql;
 
-        var results = new List<(long, string, Guid)>();
+        var results = new List<(long, string)>();
         using var reader = await cmd.ExecuteReaderAsync();
         while (await reader.ReadAsync())
         {
             results.Add((
                 reader.GetInt64(reader.GetOrdinal("WebullTickerId")),
-                reader.GetString(reader.GetOrdinal("Ticker")),
-                reader.GetGuid(reader.GetOrdinal("Id"))
+                reader.GetString(reader.GetOrdinal("Id"))
             ));
         }
         return results;
@@ -934,6 +1107,38 @@ internal class RecentVsHistorical
     public decimal Recent5dAvgVolume { get; set; }
     public decimal FullAvgSpread { get; set; }
     public decimal FullAvgVolume { get; set; }
+}
+
+internal class FinancialData
+{
+    public decimal? Pe { get; set; }
+    public decimal? ForwardPe { get; set; }
+    public decimal? Eps { get; set; }
+    public decimal? EstEps { get; set; }
+    public decimal? MarketCap { get; set; }
+    public decimal? Beta { get; set; }
+    public decimal? ShortFloat { get; set; }
+    public decimal? High52w { get; set; }
+    public decimal? Low52w { get; set; }
+    public decimal? DividendYield { get; set; }
+    public string? NextEarningsDate { get; set; }
+}
+
+internal class CapitalFlowData
+{
+    public DateOnly Date { get; set; }
+    public decimal SuperLargeInflow { get; set; }
+    public decimal SuperLargeOutflow { get; set; }
+    public decimal LargeInflow { get; set; }
+    public decimal LargeOutflow { get; set; }
+    public decimal MediumInflow { get; set; }
+    public decimal MediumOutflow { get; set; }
+}
+
+internal class NewsData
+{
+    public string Title { get; set; } = "";
+    public DateTime PublishedAt { get; set; }
 }
 
 #endregion

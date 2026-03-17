@@ -15,9 +15,8 @@ public static class TradingPilotDbContextModelCreatingExtensions
         builder.Entity<Symbol>(b =>
         {
             b.ToTable(TradingPilotConsts.DbTablePrefix + "Symbols", TradingPilotConsts.DbSchema);
-            b.ConfigureByConvention();
-
-            b.Property(x => x.Ticker).IsRequired().HasMaxLength(10);
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Id).HasMaxLength(10);
             b.Property(x => x.Name).IsRequired().HasMaxLength(200);
             b.Property(x => x.WebullTickerId).IsRequired();
             b.Property(x => x.Exchange).HasMaxLength(20);
@@ -29,7 +28,6 @@ public static class TradingPilotDbContextModelCreatingExtensions
             b.Property(x => x.IsMarginable).IsRequired().HasDefaultValue(true);
             b.Property(x => x.IsWatched).IsRequired().HasDefaultValue(false);
 
-            b.HasIndex(x => x.Ticker).IsUnique().HasDatabaseName("IX_Symbols_Ticker");
             b.HasIndex(x => x.WebullTickerId).IsUnique().HasDatabaseName("IX_Symbols_WebullTickerId");
             b.HasIndex(x => x.IsWatched).HasFilter("\"IsWatched\" = true").HasDatabaseName("IX_Symbols_IsWatched");
         });

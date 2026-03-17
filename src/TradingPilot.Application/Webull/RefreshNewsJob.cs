@@ -12,7 +12,7 @@ namespace TradingPilot.Webull;
 public class RefreshNewsJob
 {
     private readonly IWebullApiClient _api;
-    private readonly IRepository<Symbol, Guid> _symbolRepo;
+    private readonly IRepository<Symbol, string> _symbolRepo;
     private readonly IRepository<SymbolNews, Guid> _newsRepo;
     private readonly IAsyncQueryableExecuter _asyncExecuter;
     private readonly IUnitOfWorkManager _uowManager;
@@ -20,7 +20,7 @@ public class RefreshNewsJob
 
     public RefreshNewsJob(
         IWebullApiClient api,
-        IRepository<Symbol, Guid> symbolRepo,
+        IRepository<Symbol, string> symbolRepo,
         IRepository<SymbolNews, Guid> newsRepo,
         IAsyncQueryableExecuter asyncExecuter,
         IUnitOfWorkManager uowManager,
@@ -62,7 +62,7 @@ public class RefreshNewsJob
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "News refresh failed for {Ticker}", symbol.Ticker);
+                _logger.LogError(ex, "News refresh failed for {Ticker}", symbol.Id);
             }
         }
     }
@@ -101,7 +101,7 @@ public class RefreshNewsJob
 
         await uow.CompleteAsync();
         _logger.LogInformation("News refresh for {Ticker}: {New} new articles (of {Total} fetched)",
-            symbol.Ticker, inserted, items.Count);
+            symbol.Id, inserted, items.Count);
     }
 
     private static string? ResolveAuthHeader()

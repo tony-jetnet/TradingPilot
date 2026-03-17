@@ -4,7 +4,7 @@ namespace TradingPilot.Symbols;
 
 public class SymbolCapitalFlow : Entity<Guid>
 {
-    public Guid SymbolId { get; set; }
+    public string SymbolId { get; set; } = null!;
     public DateOnly Date { get; set; }
     public decimal SuperLargeInflow { get; set; }
     public decimal SuperLargeOutflow { get; set; }

@@ -1,7 +1,6 @@
 using Hangfire;
 using Microsoft.Extensions.Logging;
 using TradingPilot.Symbols;
-using TradingPilot.Trading;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Linq;
 using Volo.Abp.Uow;
@@ -9,20 +8,18 @@ using Volo.Abp.Uow;
 namespace TradingPilot.Webull;
 
 /// <summary>
-/// Lightweight startup job: takes immediate L2 snapshot and backfills news.
-/// No bar/tick/signal backfill — that's handled nightly by NightlyStrategyOptimizer
-/// to avoid conflicting with real-time MQTT data during the day.
+/// Lightweight startup job: backfills news for watched symbols.
+/// L2 and tick data come from MQTT streaming — no need to fetch here.
+/// Heavy backfill (TickSnapshots + TradingSignals) runs nightly.
 /// </summary>
 [AutomaticRetry(Attempts = 3)]
 public class StartupRecoveryJob
 {
     private readonly IWebullApiClient _api;
-    private readonly IRepository<Symbol, Guid> _symbolRepo;
-    private readonly IRepository<SymbolBookSnapshot, Guid> _snapshotRepo;
+    private readonly IRepository<Symbol, string> _symbolRepo;
     private readonly IRepository<SymbolNews, Guid> _newsRepo;
     private readonly IAsyncQueryableExecuter _asyncExecuter;
     private readonly IUnitOfWorkManager _uowManager;
-    private readonly L2BookCache _cache;
     private readonly ILogger<StartupRecoveryJob> _logger;
 
     private static readonly string AuthFilePath = Path.Combine(
@@ -30,21 +27,17 @@ public class StartupRecoveryJob
 
     public StartupRecoveryJob(
         IWebullApiClient api,
-        IRepository<Symbol, Guid> symbolRepo,
-        IRepository<SymbolBookSnapshot, Guid> snapshotRepo,
+        IRepository<Symbol, string> symbolRepo,
         IRepository<SymbolNews, Guid> newsRepo,
         IAsyncQueryableExecuter asyncExecuter,
         IUnitOfWorkManager uowManager,
-        L2BookCache cache,
         ILogger<StartupRecoveryJob> logger)
     {
         _api = api;
         _symbolRepo = symbolRepo;
-        _snapshotRepo = snapshotRepo;
         _newsRepo = newsRepo;
         _asyncExecuter = asyncExecuter;
         _uowManager = uowManager;
-        _cache = cache;
         _logger = logger;
     }
 
@@ -70,29 +63,6 @@ public class StartupRecoveryJob
 
         foreach (var symbol in watched)
         {
-            // Take immediate L2 snapshot (if market open)
-            if (MarketHoursHelper.IsMarketOpen(DateTime.UtcNow))
-            {
-                try
-                {
-                    var depth = await _api.GetDepthAsync(authHeader, symbol.WebullTickerId);
-                    if (depth != null && (depth.Bids.Count > 0 || depth.Asks.Count > 0))
-                    {
-                        var snapshot = BuildSnapshot(symbol, depth);
-                        _cache.AddSnapshot(symbol.WebullTickerId, snapshot);
-                        using var uow = _uowManager.Begin();
-                        await _snapshotRepo.InsertAsync(snapshot, autoSave: false);
-                        await uow.CompleteAsync();
-                        _logger.LogInformation("Startup L2 snapshot taken for {Ticker}", symbol.Ticker);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Startup L2 snapshot failed for {Ticker}", symbol.Ticker);
-                }
-            }
-
-            // Backfill news
             try
             {
                 var items = await _api.GetTickerNewsAsync(authHeader, symbol.WebullTickerId);
@@ -124,44 +94,16 @@ public class StartupRecoveryJob
                     }
                     await uow.CompleteAsync();
                     if (inserted > 0)
-                        _logger.LogInformation("Startup news backfill for {Ticker}: {New} new articles", symbol.Ticker, inserted);
+                        _logger.LogInformation("Startup news backfill for {Ticker}: {New} new articles", symbol.Id, inserted);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Startup news backfill failed for {Ticker}", symbol.Ticker);
+                _logger.LogError(ex, "Startup news backfill failed for {Ticker}", symbol.Id);
             }
         }
 
         _logger.LogInformation("Startup recovery complete for {Count} watched symbols", watched.Count);
-    }
-
-    private static SymbolBookSnapshot BuildSnapshot(Symbol symbol, WebullDepthData depth)
-    {
-        var bidPrices = depth.Bids.Select(l => l.Price).ToArray();
-        var bidSizes = depth.Bids.Select(l => l.Volume).ToArray();
-        var askPrices = depth.Asks.Select(l => l.Price).ToArray();
-        var askSizes = depth.Asks.Select(l => l.Volume).ToArray();
-
-        decimal bestBid = bidPrices.Length > 0 ? bidPrices[0] : 0;
-        decimal bestAsk = askPrices.Length > 0 ? askPrices[0] : 0;
-        decimal totalBidSize = bidSizes.Sum();
-        decimal totalAskSize = askSizes.Sum();
-
-        return new SymbolBookSnapshot
-        {
-            SymbolId = symbol.Id,
-            Timestamp = DateTime.UtcNow,
-            BidPrices = bidPrices,
-            BidSizes = bidSizes,
-            AskPrices = askPrices,
-            AskSizes = askSizes,
-            Spread = bestAsk - bestBid,
-            MidPrice = (bestBid + bestAsk) / 2,
-            Imbalance = totalBidSize + totalAskSize > 0
-                ? (totalBidSize - totalAskSize) / (totalBidSize + totalAskSize) : 0,
-            Depth = Math.Max(bidPrices.Length, askPrices.Length),
-        };
     }
 
     private static string? ResolveAuthHeader()

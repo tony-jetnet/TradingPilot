@@ -13,7 +13,7 @@ namespace TradingPilot.Webull;
 public class PollL2DepthJob
 {
     private readonly IWebullApiClient _api;
-    private readonly IRepository<Symbol, Guid> _symbolRepo;
+    private readonly IRepository<Symbol, string> _symbolRepo;
     private readonly IRepository<SymbolBookSnapshot, Guid> _snapshotRepo;
     private readonly IAsyncQueryableExecuter _asyncExecuter;
     private readonly IUnitOfWorkManager _uowManager;
@@ -26,7 +26,7 @@ public class PollL2DepthJob
 
     public PollL2DepthJob(
         IWebullApiClient api,
-        IRepository<Symbol, Guid> symbolRepo,
+        IRepository<Symbol, string> symbolRepo,
         IRepository<SymbolBookSnapshot, Guid> snapshotRepo,
         IAsyncQueryableExecuter asyncExecuter,
         IUnitOfWorkManager uowManager,
@@ -83,7 +83,7 @@ public class PollL2DepthJob
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "L2 poll failed for {Ticker}", symbol.Ticker);
+                    _logger.LogError(ex, "L2 poll failed for {Ticker}", symbol.Id);
                 }
             }
 
@@ -97,7 +97,7 @@ public class PollL2DepthJob
         var depth = await _api.GetDepthAsync(authHeader, symbol.WebullTickerId);
         if (depth == null || (depth.Bids.Count == 0 && depth.Asks.Count == 0))
         {
-            _logger.LogDebug("Empty depth for {Ticker}", symbol.Ticker);
+            _logger.LogDebug("Empty depth for {Ticker}", symbol.Id);
             return;
         }
 
@@ -140,7 +140,7 @@ public class PollL2DepthJob
         await uow.CompleteAsync();
 
         _logger.LogInformation("L2 depth: {Bids} bids, {Asks} asks for {Ticker} (spread={Spread:F4})",
-            depth.Bids.Count, depth.Asks.Count, symbol.Ticker, spread);
+            depth.Bids.Count, depth.Asks.Count, symbol.Id, spread);
     }
 
     /// <summary>

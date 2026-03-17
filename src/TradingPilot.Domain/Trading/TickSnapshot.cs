@@ -8,7 +8,7 @@ namespace TradingPilot.Trading;
 /// </summary>
 public class TickSnapshot : Entity<Guid>
 {
-    public Guid SymbolId { get; set; }
+    public string SymbolId { get; set; } = null!;
     public long TickerId { get; set; }
     public DateTime Timestamp { get; set; }
 

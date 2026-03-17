@@ -31,7 +31,7 @@ public class BarIndicatorService
     /// <summary>
     /// Query the most recent 1-min bars from DB for the given symbol and compute indicators.
     /// </summary>
-    public async Task RefreshAsync(long tickerId, Guid symbolId)
+    public async Task RefreshAsync(long tickerId, string symbolId)
     {
         try
         {

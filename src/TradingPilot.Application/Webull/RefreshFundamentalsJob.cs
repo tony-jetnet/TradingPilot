@@ -12,7 +12,7 @@ namespace TradingPilot.Webull;
 public class RefreshFundamentalsJob
 {
     private readonly IWebullApiClient _api;
-    private readonly IRepository<Symbol, Guid> _symbolRepo;
+    private readonly IRepository<Symbol, string> _symbolRepo;
     private readonly IRepository<SymbolCapitalFlow, Guid> _flowRepo;
     private readonly IRepository<SymbolFinancialSnapshot, Guid> _financialRepo;
     private readonly IAsyncQueryableExecuter _asyncExecuter;
@@ -21,7 +21,7 @@ public class RefreshFundamentalsJob
 
     public RefreshFundamentalsJob(
         IWebullApiClient api,
-        IRepository<Symbol, Guid> symbolRepo,
+        IRepository<Symbol, string> symbolRepo,
         IRepository<SymbolCapitalFlow, Guid> flowRepo,
         IRepository<SymbolFinancialSnapshot, Guid> financialRepo,
         IAsyncQueryableExecuter asyncExecuter,
@@ -65,7 +65,7 @@ public class RefreshFundamentalsJob
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Capital flow refresh failed for {Ticker}", symbol.Ticker);
+                _logger.LogError(ex, "Capital flow refresh failed for {Ticker}", symbol.Id);
             }
 
             await Task.Delay(500); // rate limit
@@ -76,7 +76,7 @@ public class RefreshFundamentalsJob
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Financials refresh failed for {Ticker}", symbol.Ticker);
+                _logger.LogError(ex, "Financials refresh failed for {Ticker}", symbol.Id);
             }
 
             await Task.Delay(500);
@@ -90,7 +90,7 @@ public class RefreshFundamentalsJob
 
         if (!DateOnly.TryParseExact(data.Date, "yyyyMMdd", out var date))
         {
-            _logger.LogWarning("Cannot parse capital flow date '{Date}' for {Ticker}", data.Date, symbol.Ticker);
+            _logger.LogWarning("Cannot parse capital flow date '{Date}' for {Ticker}", data.Date, symbol.Id);
             return;
         }
 
@@ -102,7 +102,7 @@ public class RefreshFundamentalsJob
 
         if (exists)
         {
-            _logger.LogDebug("Capital flow already exists for {Ticker} {Date}", symbol.Ticker, date);
+            _logger.LogDebug("Capital flow already exists for {Ticker} {Date}", symbol.Id, date);
             await uow.CompleteAsync();
             return;
         }
@@ -124,7 +124,7 @@ public class RefreshFundamentalsJob
         await uow.CompleteAsync();
 
         _logger.LogInformation("Capital flow saved for {Ticker} {Date}: large net={LargeNet:F0}",
-            symbol.Ticker, date, data.LargeInflow - data.LargeOutflow);
+            symbol.Id, date, data.LargeInflow - data.LargeOutflow);
     }
 
     private async Task RefreshFinancialsAsync(string authHeader, Symbol symbol)
@@ -142,7 +142,7 @@ public class RefreshFundamentalsJob
 
         if (exists)
         {
-            _logger.LogDebug("Financial snapshot already exists for {Ticker} {Date}", symbol.Ticker, today);
+            _logger.LogDebug("Financial snapshot already exists for {Ticker} {Date}", symbol.Id, today);
             await uow.CompleteAsync();
             return;
         }
@@ -170,7 +170,7 @@ public class RefreshFundamentalsJob
         await uow.CompleteAsync();
 
         _logger.LogInformation("Financial snapshot saved for {Ticker}: PE={Pe}, EPS={Eps}, MCap={MCap}",
-            symbol.Ticker, data.Pe, data.Eps, data.MarketCap);
+            symbol.Id, data.Pe, data.Eps, data.MarketCap);
     }
 
     private static string? ResolveAuthHeader()

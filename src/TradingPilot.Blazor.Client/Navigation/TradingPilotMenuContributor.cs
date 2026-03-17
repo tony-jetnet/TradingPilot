@@ -24,13 +24,11 @@ public class TradingPilotMenuContributor : IMenuContributor
 
     private static Task ConfigureMainMenuAsync(MenuConfigurationContext context)
     {
-        var l = context.GetLocalizer<TradingPilotResource>();
-
         context.Menu.AddItem(new ApplicationMenuItem(
             TradingPilotMenus.Home,
-            l["Menu:Home"],
+            "Dashboard",
             "/",
-            icon: "fas fa-home",
+            icon: "fas fa-chart-line",
             order: 1
         ));
 

@@ -88,7 +88,7 @@ public class PaperTradingExecutor
 
         decimal score = signal.Indicators.GetValueOrDefault("CompositeScore");
         int currentShares = _currentPosition.GetValueOrDefault(signal.TickerId, 0);
-        Guid? symbolId = await ResolveSymbolIdAsync(signal.TickerId);
+        string? symbolId = await ResolveSymbolIdAsync(signal.TickerId);
 
         // Check if signal came from AI rule (has per-rule parameters)
         bool isRuleSignal = signal.Indicators.ContainsKey("RuleConfidence");
@@ -212,7 +212,7 @@ public class PaperTradingExecutor
     }
 
     private async Task PlaceOrderAsync(long tickerId, string ticker, string action, int qty,
-        decimal price, string reason, decimal score, Guid? symbolId, Guid? signalId)
+        decimal price, string reason, decimal score, string? symbolId, Guid? signalId)
     {
         // Use limit order at current price (market orders don't work in extended hours)
         // Add small buffer: pay slightly more for buys, accept slightly less for sells
@@ -335,14 +335,14 @@ public class PaperTradingExecutor
         }
     }
 
-    private async Task PersistTradeAsync(long tickerId, Guid? symbolId, string action, int qty,
+    private async Task PersistTradeAsync(long tickerId, string? symbolId, string action, int qty,
         decimal signalPrice, decimal score, string reason, long? webullOrderId, string? orderStatus, Guid? signalId)
     {
         try
         {
             var trade = new PaperTrade
             {
-                SymbolId = symbolId ?? Guid.Empty,
+                SymbolId = symbolId ?? "",
                 TickerId = tickerId,
                 Timestamp = DateTime.UtcNow,
                 Action = action,
@@ -368,13 +368,13 @@ public class PaperTradingExecutor
         }
     }
 
-    private async Task<Guid?> ResolveSymbolIdAsync(long tickerId)
+    private async Task<string?> ResolveSymbolIdAsync(long tickerId)
     {
         try
         {
             using var scope = _scopeFactory.CreateScope();
             var uowManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
-            var symbolRepo = scope.ServiceProvider.GetRequiredService<IRepository<Symbol, Guid>>();
+            var symbolRepo = scope.ServiceProvider.GetRequiredService<IRepository<Symbol, string>>();
             var asyncExecuter = scope.ServiceProvider.GetRequiredService<IAsyncQueryableExecuter>();
 
             using var uow = uowManager.Begin();

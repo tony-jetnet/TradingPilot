@@ -13,8 +13,8 @@ using Volo.Abp.EntityFrameworkCore;
 namespace TradingPilot.Migrations
 {
     [DbContext(typeof(TradingPilotDbContext))]
-    [Migration("20260316183918_AddPaperTradesTable")]
-    partial class AddPaperTradesTable
+    [Migration("20260317004112_Initial")]
+    partial class Initial
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
@@ -29,15 +29,9 @@ namespace TradingPilot.Migrations
 
             modelBuilder.Entity("TradingPilot.Symbols.Symbol", b =>
                 {
-                    b.Property<Guid>("Id")
-                        .HasColumnType("uuid");
-
-                    b.Property<string>("ConcurrencyStamp")
-                        .IsConcurrencyToken()
-                        .IsRequired()
-                        .HasMaxLength(40)
-                        .HasColumnType("character varying(40)")
-                        .HasColumnName("ConcurrencyStamp");
+                    b.Property<string>("Id")
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)");
 
                     b.Property<DateTime>("CreationTime")
                         .HasColumnType("timestamp without time zone")
@@ -51,20 +45,9 @@ namespace TradingPilot.Migrations
                         .HasMaxLength(20)
                         .HasColumnType("character varying(20)");
 
-                    b.Property<string>("ExtraProperties")
-                        .IsRequired()
-                        .HasColumnType("text")
-                        .HasColumnName("ExtraProperties");
-
                     b.Property<string>("Industry")
                         .HasMaxLength(100)
                         .HasColumnType("character varying(100)");
-
-                    b.Property<bool>("IsDeleted")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("boolean")
-                        .HasDefaultValue(false)
-                        .HasColumnName("IsDeleted");
 
                     b.Property<bool>("IsMarginable")
                         .ValueGeneratedOnAdd()
@@ -80,9 +63,6 @@ namespace TradingPilot.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("boolean")
                         .HasDefaultValue(false);
-
-                    b.Property<DateOnly?>("ListDate")
-                        .HasColumnType("date");
 
                     b.Property<string>("Name")
                         .IsRequired()
@@ -103,11 +83,6 @@ namespace TradingPilot.Migrations
                         .HasColumnType("smallint")
                         .HasDefaultValue((byte)1);
 
-                    b.Property<string>("Ticker")
-                        .IsRequired()
-                        .HasMaxLength(10)
-                        .HasColumnType("character varying(10)");
-
                     b.Property<int?>("WebullExchangeId")
                         .HasColumnType("integer");
 
@@ -119,10 +94,6 @@ namespace TradingPilot.Migrations
                     b.HasIndex("IsWatched")
                         .HasDatabaseName("IX_Symbols_IsWatched")
                         .HasFilter("\"IsWatched\" = true");
-
-                    b.HasIndex("Ticker")
-                        .IsUnique()
-                        .HasDatabaseName("IX_Symbols_Ticker");
 
                     b.HasIndex("WebullTickerId")
                         .IsUnique()
@@ -156,8 +127,9 @@ namespace TradingPilot.Migrations
                         .HasPrecision(12, 4)
                         .HasColumnType("numeric(12,4)");
 
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
 
                     b.Property<byte>("Timeframe")
                         .HasColumnType("smallint");
@@ -220,8 +192,9 @@ namespace TradingPilot.Migrations
                         .HasPrecision(10, 4)
                         .HasColumnType("numeric(10,4)");
 
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
 
                     b.Property<DateTime>("Timestamp")
                         .HasColumnType("timestamp without time zone");
@@ -281,8 +254,9 @@ namespace TradingPilot.Migrations
                         .HasPrecision(18, 4)
                         .HasColumnType("numeric(18,4)");
 
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
 
                     b.HasKey("Id");
 
@@ -355,8 +329,9 @@ namespace TradingPilot.Migrations
                         .HasPrecision(8, 4)
                         .HasColumnType("numeric(8,4)");
 
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
 
                     b.Property<decimal?>("Volume")
                         .HasPrecision(18, 2)
@@ -390,8 +365,9 @@ namespace TradingPilot.Migrations
                         .HasMaxLength(2000)
                         .HasColumnType("character varying(2000)");
 
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
 
                     b.Property<string>("Title")
                         .IsRequired()
@@ -454,8 +430,9 @@ namespace TradingPilot.Migrations
                         .HasPrecision(12, 4)
                         .HasColumnType("numeric(12,4)");
 
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
 
                     b.Property<long>("TickerId")
                         .HasColumnType("bigint");
@@ -478,6 +455,112 @@ namespace TradingPilot.Migrations
                         .HasDatabaseName("IX_PaperTrades_SymbolId_Timestamp");
 
                     b.ToTable("PaperTrades", (string)null);
+                });
+
+            modelBuilder.Entity("TradingPilot.Trading.TickSnapshot", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uuid");
+
+                    b.Property<decimal>("AskSweepCost")
+                        .HasPrecision(12, 2)
+                        .HasColumnType("numeric(12,2)");
+
+                    b.Property<decimal>("AskWallSize")
+                        .HasPrecision(10, 4)
+                        .HasColumnType("numeric(10,4)");
+
+                    b.Property<decimal>("BidSweepCost")
+                        .HasPrecision(12, 2)
+                        .HasColumnType("numeric(12,2)");
+
+                    b.Property<decimal>("BidWallSize")
+                        .HasPrecision(10, 4)
+                        .HasColumnType("numeric(10,4)");
+
+                    b.Property<decimal>("BookDepthRatio")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<int>("DowntickCount")
+                        .HasColumnType("integer");
+
+                    b.Property<decimal>("Ema20")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Ema9")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("High")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("ImbalanceVelocity")
+                        .HasPrecision(10, 6)
+                        .HasColumnType("numeric(10,6)");
+
+                    b.Property<decimal>("Low")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Open")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Price")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Rsi14")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
+                    b.Property<decimal>("SpreadPercentile")
+                        .HasPrecision(6, 4)
+                        .HasColumnType("numeric(6,4)");
+
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<decimal>("TickMomentum")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<long>("TickerId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTime>("Timestamp")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<int>("UptickCount")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("Volume")
+                        .HasColumnType("bigint");
+
+                    b.Property<decimal>("VolumeRatio")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
+                    b.Property<decimal>("Vwap")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Timestamp")
+                        .HasDatabaseName("IX_TickSnapshots_Timestamp");
+
+                    b.HasIndex("SymbolId", "Timestamp")
+                        .HasDatabaseName("IX_TickSnapshots_SymbolId_Timestamp");
+
+                    b.HasIndex("TickerId", "Timestamp")
+                        .HasDatabaseName("IX_TickSnapshots_TickerId_Timestamp");
+
+                    b.ToTable("TickSnapshots", (string)null);
                 });
 
             modelBuilder.Entity("TradingPilot.Trading.TradingSignalRecord", b =>
@@ -547,8 +630,9 @@ namespace TradingPilot.Migrations
                     b.Property<byte>("Strength")
                         .HasColumnType("smallint");
 
-                    b.Property<Guid>("SymbolId")
-                        .HasColumnType("uuid");
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
 
                     b.Property<long>("TickerId")
                         .HasColumnType("bigint");
@@ -641,6 +725,15 @@ namespace TradingPilot.Migrations
                 });
 
             modelBuilder.Entity("TradingPilot.Trading.PaperTrade", b =>
+                {
+                    b.HasOne("TradingPilot.Symbols.Symbol", null)
+                        .WithMany()
+                        .HasForeignKey("SymbolId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("TradingPilot.Trading.TickSnapshot", b =>
                 {
                     b.HasOne("TradingPilot.Symbols.Symbol", null)
                         .WithMany()

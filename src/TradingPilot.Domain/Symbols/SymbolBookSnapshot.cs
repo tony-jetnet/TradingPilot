@@ -4,7 +4,7 @@ namespace TradingPilot.Symbols;
 
 public class SymbolBookSnapshot : Entity<Guid>
 {
-    public Guid SymbolId { get; set; }
+    public string SymbolId { get; set; } = null!;
     public DateTime Timestamp { get; set; }
     public decimal[] BidPrices { get; set; } = [];
     public decimal[] BidSizes { get; set; } = [];

@@ -71,6 +71,37 @@ public class MqttMessageProcessor
         _logger = logger;
     }
 
+    /// <summary>
+    /// Returns real-time health metrics for the dashboard.
+    /// </summary>
+    public StreamingHealthDto GetHealthMetrics()
+    {
+        var now = DateTime.UtcNow;
+        int totalMessages = _topicCounts.Values.Sum();
+
+        // Per-ticker staleness: how long since the last tick snapshot was written
+        var tickerStaleness = new Dictionary<long, double>();
+        foreach (var (tickerId, lastTime) in _lastTickSnapshotTime)
+        {
+            tickerStaleness[tickerId] = (now - lastTime).TotalSeconds;
+        }
+
+        // L2 message counts by type
+        _decodedLogCounts.TryGetValue(WebullMqttMessageType.L2Depth, out int l2Count);
+        _decodedLogCounts.TryGetValue(WebullMqttMessageType.QuoteUpdate, out int quoteCount);
+        _decodedLogCounts.TryGetValue(WebullMqttMessageType.QuoteTick, out int tickCount);
+
+        return new StreamingHealthDto
+        {
+            TotalMqttMessages = totalMessages,
+            L2DepthMessages = l2Count,
+            QuoteMessages = quoteCount,
+            TickMessages = tickCount,
+            TopicPatterns = _topicCounts.Count,
+            TickerStalenessSeconds = tickerStaleness,
+        };
+    }
+
     public async Task ProcessMessageAsync(string topic, byte[] payload)
     {
         // Count messages per topic pattern
@@ -186,7 +217,7 @@ public class MqttMessageProcessor
         _tickCache.UpdateL2Features(decoded.TickerId, snapshot);
 
         // Analyze for trading signals
-        var signal = _analyzer.AnalyzeSnapshot(decoded.TickerId, symbol.Ticker, snapshot);
+        var signal = _analyzer.AnalyzeSnapshot(decoded.TickerId, symbol.Id, snapshot);
         if (signal != null && signal.Type != SignalType.Hold)
         {
             _signalStore.AddSignal(signal);
@@ -441,7 +472,7 @@ public class MqttMessageProcessor
         _tickCache.UpdateL2Features(tickerId, snapshot);
 
         // Analyze for trading signals
-        var signal = _analyzer.AnalyzeSnapshot(tickerId, symbol.Ticker, snapshot);
+        var signal = _analyzer.AnalyzeSnapshot(tickerId, symbol.Id, snapshot);
         if (signal != null && signal.Type != SignalType.Hold)
         {
             _signalStore.AddSignal(signal);
@@ -513,7 +544,7 @@ public class MqttMessageProcessor
 
         using var scope = _scopeFactory.CreateScope();
         var uowManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
-        var symbolRepo = scope.ServiceProvider.GetRequiredService<IRepository<Symbol, Guid>>();
+        var symbolRepo = scope.ServiceProvider.GetRequiredService<IRepository<Symbol, string>>();
         var asyncExecuter = scope.ServiceProvider.GetRequiredService<IAsyncQueryableExecuter>();
 
         using var uow = uowManager.Begin();
@@ -525,7 +556,7 @@ public class MqttMessageProcessor
         return symbol;
     }
 
-    private async Task PersistSignalAsync(TradingSignal signal, Guid symbolId, SymbolBookSnapshot snapshot)
+    private async Task PersistSignalAsync(TradingSignal signal, string symbolId, SymbolBookSnapshot snapshot)
     {
         try
         {

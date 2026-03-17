@@ -5,6 +5,7 @@ using Blazorise.Bootstrap5;
 using Blazorise.Icons.FontAwesome;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
 using Microsoft.Extensions.Configuration;
+using Microsoft.AspNetCore.Components.WebAssembly.Authentication;
 using Microsoft.Extensions.DependencyInjection;
 using TradingPilot.Blazor.Client.Navigation;
 using Localization.Resources.AbpUi;
@@ -21,7 +22,7 @@ namespace TradingPilot.Blazor.Client;
 [DependsOn(
     typeof(AbpAutofacWebAssemblyModule),
     typeof(AbpAspNetCoreComponentsWebAssemblyBasicThemeModule),
-    typeof(TradingPilotHttpApiClientModule)
+    typeof(TradingPilotApplicationContractsModule)
 )]
 public class TradingPilotBlazorClientModule : AbpModule
 {
@@ -29,6 +30,11 @@ public class TradingPilotBlazorClientModule : AbpModule
     {
         var environment = context.Services.GetSingletonInstance<IWebAssemblyHostEnvironment>();
         var builder = context.Services.GetSingletonInstance<WebAssemblyHostBuilder>();
+
+        // Register dummy auth services so ABP's theme/identity modules don't crash
+        context.Services.AddSingleton<IAccessTokenProvider, NoOpAccessTokenProvider>();
+        context.Services.AddAuthorizationCore();
+        context.Services.AddSingleton<Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider, NoOpAuthStateProvider>();
 
         ConfigureLocalization();
         ConfigureHttpClient(context, environment);

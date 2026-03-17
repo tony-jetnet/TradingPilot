@@ -4,7 +4,7 @@ namespace TradingPilot.Symbols;
 
 public class SymbolNews : Entity<Guid>
 {
-    public Guid SymbolId { get; set; }
+    public string SymbolId { get; set; } = null!;
     public long WebullNewsId { get; set; }
     public string Title { get; set; } = null!;
     public string? Summary { get; set; }

@@ -4,7 +4,7 @@ namespace TradingPilot.Symbols;
 
 public class SymbolBar : Entity<Guid>
 {
-    public Guid SymbolId { get; set; }
+    public string SymbolId { get; set; } = null!;
     public BarTimeframe Timeframe { get; set; }
     public DateTime Timestamp { get; set; }
     public decimal Open { get; set; }

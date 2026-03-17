@@ -11,7 +11,7 @@ namespace TradingPilot.Webull;
 public class LoadHistoricalBarsJob
 {
     private readonly IWebullApiClient _api;
-    private readonly IRepository<Symbol, Guid> _symbolRepo;
+    private readonly IRepository<Symbol, string> _symbolRepo;
     private readonly IRepository<SymbolBar, Guid> _barRepo;
     private readonly IAsyncQueryableExecuter _asyncExecuter;
     private readonly IUnitOfWorkManager _uowManager;
@@ -24,7 +24,7 @@ public class LoadHistoricalBarsJob
 
     public LoadHistoricalBarsJob(
         IWebullApiClient api,
-        IRepository<Symbol, Guid> symbolRepo,
+        IRepository<Symbol, string> symbolRepo,
         IRepository<SymbolBar, Guid> barRepo,
         IAsyncQueryableExecuter asyncExecuter,
         IUnitOfWorkManager uowManager,
@@ -64,9 +64,8 @@ public class LoadHistoricalBarsJob
 
             if (symbol == null)
             {
-                symbol = await _symbolRepo.InsertAsync(new Symbol
+                symbol = await _symbolRepo.InsertAsync(new Symbol(tickerInfo.Symbol)
                 {
-                    Ticker = tickerInfo.Symbol,
                     Name = tickerInfo.Name,
                     WebullTickerId = tickerInfo.TickerId,
                     WebullExchangeId = tickerInfo.ExchangeId,
@@ -75,20 +74,13 @@ public class LoadHistoricalBarsJob
                     Status = SymbolStatus.Active,
                     IsWatched = true,
                 });
-                _logger.LogInformation("Created new Symbol: {Ticker} (id={Id})", symbol.Ticker, symbol.Id);
+                _logger.LogInformation("Created new Symbol: {Ticker}", symbol.Id);
             }
             else if (!symbol.IsWatched)
             {
-                try
-                {
-                    symbol.IsWatched = true;
-                    await _symbolRepo.UpdateAsync(symbol);
-                    _logger.LogInformation("Set IsWatched=true for existing Symbol: {Ticker}", symbol.Ticker);
-                }
-                catch (Exception ex) when (ex is Volo.Abp.Data.AbpDbConcurrencyException)
-                {
-                    _logger.LogDebug("IsWatched update skipped (already set by another job) for {Ticker}", symbol.Ticker);
-                }
+                symbol.IsWatched = true;
+                await _symbolRepo.UpdateAsync(symbol);
+                _logger.LogInformation("Set IsWatched=true for existing Symbol: {Ticker}", symbol.Id);
             }
             await uow.CompleteAsync();
         }
@@ -137,7 +129,7 @@ public class LoadHistoricalBarsJob
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Bar refresh failed for {Ticker}", symbol.Ticker);
+                _logger.LogError(ex, "Bar refresh failed for {Ticker}", symbol.Id);
             }
         }
 
@@ -171,12 +163,12 @@ public class LoadHistoricalBarsJob
                 "m1" => 400,  // ~1 trading day
                 _ => 100,
             };
-            _logger.LogInformation("Fetching {Timeframe} bars for {Ticker} (count={Count})...", tf, symbol.Ticker, count);
+            _logger.LogInformation("Fetching {Timeframe} bars for {Ticker} (count={Count})...", tf, symbol.Id, count);
 
             var bars = await _api.GetBarsAsync(authHeader, symbol.WebullTickerId, apiType, count);
             await Task.Delay(500); // rate limit
 
-            _logger.LogInformation("Got {Total} bars for {Timeframe} {Ticker}", bars.Count, tf, symbol.Ticker);
+            _logger.LogInformation("Got {Total} bars for {Timeframe} {Ticker}", bars.Count, tf, symbol.Id);
 
             int inserted = 0, skipped = 0;
             using (var uow = _uowManager.Begin())
@@ -216,7 +208,7 @@ public class LoadHistoricalBarsJob
             }
 
             _logger.LogInformation("Loaded {Inserted} new / skipped {Skipped} existing {Timeframe} bars for {Ticker} (API returned {Total})",
-                inserted, skipped, tf, symbol.Ticker, bars.Count);
+                inserted, skipped, tf, symbol.Id, bars.Count);
         }
     }
 

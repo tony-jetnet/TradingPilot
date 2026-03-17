@@ -125,7 +125,7 @@ public class NightlyModelTrainer
         var sql = $@"
             SELECT
                 ts.""TickerId"",
-                s.""Ticker"",
+                s.""Id"" AS ""Ticker"",
                 ts.""Type""::int AS ""SignalType"",
                 ts.""Price"",
                 ts.""Score"",
@@ -566,9 +566,9 @@ public class NightlyModelTrainer
             var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
 
             await dbContext.Database.ExecuteSqlRawAsync(@"
-                INSERT INTO ""ModelConfigs"" (""Id"", ""Key"", ""Value"", ""UpdatedAt"")
-                VALUES (gen_random_uuid(), 'nightly_model_config', {0}::jsonb, {1})
-                ON CONFLICT (""Key"") DO UPDATE SET ""Value"" = {0}::jsonb, ""UpdatedAt"" = {1}",
+                INSERT INTO ""ModelConfigs"" (""Key"", ""Value"", ""UpdatedAt"")
+                VALUES ('nightly_model_config', {0}, {1})
+                ON CONFLICT (""Key"") DO UPDATE SET ""Value"" = {0}, ""UpdatedAt"" = {1}",
                 json, DateTime.UtcNow);
 
             _logger.LogInformation("Model config persisted to database");

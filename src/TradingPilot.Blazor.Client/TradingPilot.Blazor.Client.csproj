@@ -22,7 +22,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\TradingPilot.HttpApi.Client\TradingPilot.HttpApi.Client.csproj" />
+    <ProjectReference Include="..\TradingPilot.Application.Contracts\TradingPilot.Application.Contracts.csproj" />
   </ItemGroup>
 
 </Project>

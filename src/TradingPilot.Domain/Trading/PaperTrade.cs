@@ -4,7 +4,7 @@ namespace TradingPilot.Trading;
 
 public class PaperTrade : Entity<Guid>
 {
-    public Guid SymbolId { get; set; }
+    public string SymbolId { get; set; } = null!;
     public long TickerId { get; set; }
     public DateTime Timestamp { get; set; }
     public string Action { get; set; } = ""; // BUY or SELL
