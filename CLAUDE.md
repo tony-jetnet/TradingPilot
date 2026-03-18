@@ -57,7 +57,7 @@ Webull MQTT (via injected hook DLL)
 ```
 9:00 PM ET  NightlyModelTrainer.TrainAsync(20)     — hill-climbing weight optimization
 9:15 PM ET  NightlyStrategyOptimizer.OptimizeAsync  — backfill gaps + Bedrock AI per symbol
-9:30 PM ET  NightlyStrategyOptimizer.CleanupOldData — retention: L2 snapshots 3d, ticks 30d
+9:30 PM ET  NightlyStrategyOptimizer.CleanupOldData — retention: L2 snapshots 20d, ticks 30d
 ```
 
 The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars before running AI analysis, so gaps from daytime app downtime don't affect training quality.

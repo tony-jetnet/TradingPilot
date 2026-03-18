@@ -1019,7 +1019,7 @@ win_1m: 1 if trade was profitable at 1 min, 0 if not
 
     /// <summary>
     /// Data retention cleanup. Called nightly at 9:30 PM ET.
-    /// Retention: SymbolBookSnapshots=3 days, rest=forever
+    /// Retention: SymbolBookSnapshots=20 days (for Swin model training), rest=forever
     /// </summary>
     public async Task CleanupOldDataAsync()
     {
@@ -1029,7 +1029,8 @@ win_1m: 1 if trade was profitable at 1 min, 0 if not
             var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
 
             // Delete in batches of 5000 to avoid long table locks
-            var bookCutoff = DateTime.UtcNow.AddDays(-3);
+            // Retention: 20 days (for Swin vision model training — needs ~340K samples)
+            var bookCutoff = DateTime.UtcNow.AddDays(-20);
             int bookDeleted = 0;
             int batch;
             do
@@ -1041,7 +1042,7 @@ win_1m: 1 if trade was profitable at 1 min, 0 if not
                 bookDeleted += batch;
             } while (batch >= 5000);
 
-            _logger.LogWarning("Cleanup: deleted {BookCount} SymbolBookSnapshots (>3d)", bookDeleted);
+            _logger.LogWarning("Cleanup: deleted {BookCount} SymbolBookSnapshots (>20d)", bookDeleted);
         }
         catch (Exception ex)
         {

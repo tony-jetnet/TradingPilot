@@ -22,6 +22,7 @@ public class MarketMicrostructureAnalyzer
     private readonly TickDataCache _tickCache;
     private readonly BarIndicatorCache _barCache;
     private readonly StrategyRuleEvaluator _ruleEvaluator;
+    private readonly SwinPredictor _swinPredictor;
     private readonly ILogger<MarketMicrostructureAnalyzer> _logger;
 
     private readonly ConcurrentDictionary<long, TickerAnalysisState> _state = new();
@@ -75,12 +76,14 @@ public class MarketMicrostructureAnalyzer
         TickDataCache tickCache,
         BarIndicatorCache barCache,
         StrategyRuleEvaluator ruleEvaluator,
+        SwinPredictor swinPredictor,
         ILogger<MarketMicrostructureAnalyzer> logger)
     {
         _l2Cache = l2Cache;
         _tickCache = tickCache;
         _barCache = barCache;
         _ruleEvaluator = ruleEvaluator;
+        _swinPredictor = swinPredictor;
         _logger = logger;
 
         // Load model config on startup and watch for changes
@@ -358,7 +361,7 @@ public class MarketMicrostructureAnalyzer
         }
 
         // ═══════════════════════════════════════════════════════════
-        // STAGE 2: Fall back to weight-based scoring (model_config.json or defaults)
+        // STAGE 2: Swin vision model on L2 heatmap (or weighted scoring fallback)
         // ═══════════════════════════════════════════════════════════
 
         // Check if we have learned config for this ticker
@@ -371,91 +374,101 @@ public class MarketMicrostructureAnalyzer
                 return null; // Skip this hour — historically unprofitable
         }
 
-        // Compute L2 indicators (all return values in [-1, +1])
-        decimal obiScore = ComputeSmoothedObi(state);
-        decimal wobiScore = ComputeWeightedObi(snapshot);
-        decimal pressureRocScore = ComputePressureRoc(state);
-        decimal spreadScore = ComputeSpreadSignal(state, snapshot);
-        decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
-
-        // Compute tick-based indicators
-        decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
-
-        // Compute bar-based indicators
-        var barIndicators = _barCache.GetIndicators(tickerId);
-        decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
-        decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
-        decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
-        decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
-
-        // Composite score: use learned weights if available, otherwise defaults
         decimal compositeScore;
-        if (tickerConfig != null)
+        var barIndicators = _barCache.GetIndicators(tickerId);
+        bool usedSwin = false;
+
+        // Try Swin model first — it learns directly from raw L2 heatmaps
+        var swinSnapshots = _l2Cache.GetSnapshots(tickerId, 300);
+        var swinPrediction = _swinPredictor.Predict(swinSnapshots);
+
+        if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
         {
-            compositeScore =
-                obiScore * tickerConfig.WeightObi +
-                wobiScore * tickerConfig.WeightWobi +
-                pressureRocScore * tickerConfig.WeightPressureRoc +
-                spreadScore * tickerConfig.WeightSpread +
-                largeOrderScore * tickerConfig.WeightLargeOrder +
-                tickMomentumScore * tickerConfig.WeightTickMomentum +
-                trendAlignmentScore * tickerConfig.WeightTrend +
-                vwapPositionScore * tickerConfig.WeightVwap +
-                volumeConfirmationScore * tickerConfig.WeightVolume +
-                rsiFilterScore * tickerConfig.WeightRsi;
+            // Use Swin model output as composite score
+            compositeScore = (decimal)swinPrediction.Score; // [-1, +1]
+            usedSwin = true;
+
+            _logger.LogDebug(
+                "Swin prediction for {Ticker}: {Class} score={Score:F3} " +
+                "conf={Conf:F3} P(up)={Up:F3} P(down)={Down:F3}",
+                ticker, swinPrediction.PredictedClass, swinPrediction.Score,
+                swinPrediction.Confidence, swinPrediction.UpProbability,
+                swinPrediction.DownProbability);
         }
         else
         {
-            compositeScore =
-                obiScore * WeightObi +
-                wobiScore * WeightWobi +
-                pressureRocScore * WeightPressureRoc +
-                spreadScore * WeightSpread +
-                largeOrderScore * WeightLargeOrder +
-                tickMomentumScore * WeightTickMomentum +
-                trendAlignmentScore * WeightTrendAlignment +
-                vwapPositionScore * WeightVwapPosition +
-                volumeConfirmationScore * WeightVolumeConfirmation +
-                rsiFilterScore * WeightRsiFilter;
-        }
+            // Fallback to weighted scoring (original Stage 2 logic)
+            decimal obiScore = ComputeSmoothedObi(state);
+            decimal wobiScore = ComputeWeightedObi(snapshot);
+            decimal pressureRocScore = ComputePressureRoc(state);
+            decimal spreadScore = ComputeSpreadSignal(state, snapshot);
+            decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
+            decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
+            decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
+            decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
+            decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
+            decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
 
-        // Apply contextual filters from bar indicators.
-        // Filters are multiplicative but total penalty is capped at 50% to avoid
-        // killing high-conviction counter-trend signals (which often catch reversals).
-        if (barIndicators != null)
-        {
-            decimal preFilterScore = compositeScore;
-
-            // Trend filter: if EMA trend is bearish but signal is BUY, reduce score
-            if (barIndicators.TrendDirection == -1 && compositeScore > 0)
-                compositeScore *= 0.5m;
-            else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
-                compositeScore *= 0.5m; // halve sell signal in uptrend
-
-            // VWAP filter: buying below VWAP or selling above VWAP = lower confidence
-            if (!barIndicators.AboveVwap && compositeScore > 0)
-                compositeScore *= 0.7m;
-            else if (barIndicators.AboveVwap && compositeScore < 0)
-                compositeScore *= 0.7m;
-
-            // Volume confirmation: high volume = stronger signal
-            if (barIndicators.HighVolume)
-                compositeScore *= 1.3m;
-
-            // RSI filter: don't buy overbought, don't sell oversold
-            if (barIndicators.OverboughtRsi && compositeScore > 0)
-                compositeScore *= 0.5m;
-            else if (barIndicators.OversoldRsi && compositeScore < 0)
-                compositeScore *= 0.5m;
-
-            // Cap total penalty at 50%: don't let cascading filters kill strong L2 signals
-            if (preFilterScore != 0)
+            if (tickerConfig != null)
             {
-                decimal minAllowed = preFilterScore * 0.50m;
-                if (preFilterScore > 0 && compositeScore < minAllowed)
-                    compositeScore = minAllowed;
-                else if (preFilterScore < 0 && compositeScore > minAllowed)
-                    compositeScore = minAllowed;
+                compositeScore =
+                    obiScore * tickerConfig.WeightObi +
+                    wobiScore * tickerConfig.WeightWobi +
+                    pressureRocScore * tickerConfig.WeightPressureRoc +
+                    spreadScore * tickerConfig.WeightSpread +
+                    largeOrderScore * tickerConfig.WeightLargeOrder +
+                    tickMomentumScore * tickerConfig.WeightTickMomentum +
+                    trendAlignmentScore * tickerConfig.WeightTrend +
+                    vwapPositionScore * tickerConfig.WeightVwap +
+                    volumeConfirmationScore * tickerConfig.WeightVolume +
+                    rsiFilterScore * tickerConfig.WeightRsi;
+            }
+            else
+            {
+                compositeScore =
+                    obiScore * WeightObi +
+                    wobiScore * WeightWobi +
+                    pressureRocScore * WeightPressureRoc +
+                    spreadScore * WeightSpread +
+                    largeOrderScore * WeightLargeOrder +
+                    tickMomentumScore * WeightTickMomentum +
+                    trendAlignmentScore * WeightTrendAlignment +
+                    vwapPositionScore * WeightVwapPosition +
+                    volumeConfirmationScore * WeightVolumeConfirmation +
+                    rsiFilterScore * WeightRsiFilter;
+            }
+
+            // Apply contextual filters (only for weighted scoring — Swin already learned these)
+            if (barIndicators != null)
+            {
+                decimal preFilterScore = compositeScore;
+
+                if (barIndicators.TrendDirection == -1 && compositeScore > 0)
+                    compositeScore *= 0.5m;
+                else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
+                    compositeScore *= 0.5m;
+
+                if (!barIndicators.AboveVwap && compositeScore > 0)
+                    compositeScore *= 0.7m;
+                else if (barIndicators.AboveVwap && compositeScore < 0)
+                    compositeScore *= 0.7m;
+
+                if (barIndicators.HighVolume)
+                    compositeScore *= 1.3m;
+
+                if (barIndicators.OverboughtRsi && compositeScore > 0)
+                    compositeScore *= 0.5m;
+                else if (barIndicators.OversoldRsi && compositeScore < 0)
+                    compositeScore *= 0.5m;
+
+                if (preFilterScore != 0)
+                {
+                    decimal minAllowed = preFilterScore * 0.50m;
+                    if (preFilterScore > 0 && compositeScore < minAllowed)
+                        compositeScore = minAllowed;
+                    else if (preFilterScore < 0 && compositeScore > minAllowed)
+                        compositeScore = minAllowed;
+                }
             }
         }
 
@@ -489,18 +502,20 @@ public class MarketMicrostructureAnalyzer
 
         var indicators = new Dictionary<string, decimal>
         {
-            ["OBI"] = Math.Round(obiScore, 4),
-            ["WOBI"] = Math.Round(wobiScore, 4),
-            ["PressureROC"] = Math.Round(pressureRocScore, 4),
-            ["SpreadSignal"] = Math.Round(spreadScore, 4),
-            ["LargeOrderSignal"] = Math.Round(largeOrderScore, 4),
-            ["TickMomentum"] = Math.Round(tickMomentumScore, 4),
-            ["TrendAlignment"] = Math.Round(trendAlignmentScore, 4),
-            ["VwapPosition"] = Math.Round(vwapPositionScore, 4),
-            ["VolumeConfirmation"] = Math.Round(volumeConfirmationScore, 4),
-            ["RsiFilter"] = Math.Round(rsiFilterScore, 4),
             ["CompositeScore"] = Math.Round(compositeScore, 4),
         };
+
+        if (usedSwin && swinPrediction != null)
+        {
+            indicators["SwinUp"] = Math.Round((decimal)swinPrediction.UpProbability, 4);
+            indicators["SwinDown"] = Math.Round((decimal)swinPrediction.DownProbability, 4);
+            indicators["SwinConf"] = Math.Round((decimal)swinPrediction.Confidence, 4);
+            indicators["Source"] = 1; // 1 = Swin model
+        }
+        else
+        {
+            indicators["Source"] = 0; // 0 = weighted scoring
+        }
 
         // Add bar indicator context if available
         if (barIndicators != null)
@@ -533,24 +548,30 @@ public class MarketMicrostructureAnalyzer
         // Log strong signals at Warning level for visibility
         if (strength == SignalStrength.Strong)
         {
-            _logger.LogWarning(
-                "STRONG {SignalType} signal for {Ticker} (tickerId={TickerId}) at {Price:F4} | " +
-                "Score={Score:F4} OBI={OBI:F4} WOBI={WOBI:F4} PressureROC={PROCI:F4} " +
-                "Spread={Spread:F4} LargeOrder={LargeOrder:F4} " +
-                "TickMom={TickMom:F4} Trend={Trend:F4} VWAP={VWAP:F4} Vol={Vol:F4} RSI={RSI:F4}" +
-                (tickerConfig != null ? " [ML]" : ""),
-                signalType, ticker, tickerId, snapshot.MidPrice,
-                compositeScore, obiScore, wobiScore, pressureRocScore,
-                spreadScore, largeOrderScore,
-                tickMomentumScore, trendAlignmentScore, vwapPositionScore,
-                volumeConfirmationScore, rsiFilterScore);
+            if (usedSwin && swinPrediction != null)
+            {
+                _logger.LogWarning(
+                    "STRONG {SignalType} signal for {Ticker} (tickerId={TickerId}) at {Price:F4} | " +
+                    "Score={Score:F4} P(up)={PUp:F3} P(down)={PDown:F3} Conf={Conf:F3} [SWIN]",
+                    signalType, ticker, tickerId, snapshot.MidPrice,
+                    compositeScore, swinPrediction.UpProbability,
+                    swinPrediction.DownProbability, swinPrediction.Confidence);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "STRONG {SignalType} signal for {Ticker} (tickerId={TickerId}) at {Price:F4} | " +
+                    "Score={Score:F4}" +
+                    (tickerConfig != null ? " [ML]" : ""),
+                    signalType, ticker, tickerId, snapshot.MidPrice, compositeScore);
+            }
         }
         else
         {
             _logger.LogInformation(
                 "{Strength} {SignalType} signal for {Ticker} at {Price:F4} | Score={Score:F4} " +
                 "Trend={Trend} VWAP={VWAP} RSI={RSI:F1}" +
-                (tickerConfig != null ? " [ML]" : ""),
+                (usedSwin ? " [SWIN]" : tickerConfig != null ? " [ML]" : ""),
                 strength, signalType, ticker, snapshot.MidPrice, compositeScore,
                 barIndicators?.TrendDirection ?? 0,
                 barIndicators?.AboveVwap == true ? "above" : "below",

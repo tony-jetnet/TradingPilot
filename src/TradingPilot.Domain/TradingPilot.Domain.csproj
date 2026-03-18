@@ -15,6 +15,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.24.3" />
     <PackageReference Include="Volo.Abp.Caching.StackExchangeRedis" Version="10.1.0" />
     <PackageReference Include="Volo.Abp.Ddd.Domain" Version="10.1.0" />
   </ItemGroup>

@@ -117,6 +117,9 @@ public class TradingPilotBlazorModule : AbpModule
         // Strategy rule evaluator (singleton — evaluates AI-generated rules at runtime)
         context.Services.AddSingleton<StrategyRuleEvaluator>();
 
+        // Swin vision model for L2 heatmap prediction (singleton — loads ONNX model)
+        context.Services.AddSingleton<SwinPredictor>();
+
         // Trading signal analysis engine (singleton — analyzes L2 data for buy/sell signals)
         context.Services.AddSingleton<MarketMicrostructureAnalyzer>();
         context.Services.AddSingleton<SignalStore>();

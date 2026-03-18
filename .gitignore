@@ -274,3 +274,8 @@ src/TradingPilot.Blazor.Server.Tiered/Logs/*
 tempkey.rsa
 tempkey.jwk
 Logs/logs.txt
+
+# ML training pipeline (large data files, models, and archives)
+ml/data/
+ml/models/
+ml/__pycache__/
