@@ -144,7 +144,7 @@ public class WebullBrokerClient : IBrokerClient
     public async Task<BrokerOrder?> GetOrderAsync(string orderId)
     {
         // Webull doesn't have a single-order endpoint — fetch all and filter
-        var orders = await GetOrdersAsync(200);
+        var orders = await GetOrdersAsync(500);
         return orders.FirstOrDefault(o => o.OrderId == orderId);
     }
 
@@ -177,16 +177,18 @@ public class WebullBrokerClient : IBrokerClient
     /// <summary>
     /// Resolve symbol name to Webull tickerId. Public for signal pipeline integration.
     /// </summary>
-    public long ResolveTickerId(string symbol)
+    public long ResolveInternalId(string symbol)
     {
         return _symbolToTickerId.GetValueOrDefault(symbol, 0);
     }
+
+    public long ResolveTickerId(string symbol) => ResolveInternalId(symbol);
 
     private async Task<decimal> ComputeDayPnlAsync()
     {
         try
         {
-            var orders = await GetOrdersAsync(200);
+            var orders = await GetOrdersAsync(500);
             var eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
             var todayEt = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eastern).Date;
 

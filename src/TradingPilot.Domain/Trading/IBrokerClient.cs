@@ -22,6 +22,13 @@ public interface IBrokerClient
     /// <summary>Cancel an order.</summary>
     Task<bool> CancelOrderAsync(string orderId);
 
+    /// <summary>
+    /// Resolve a symbol to the broker's internal numeric ID (e.g. Webull tickerId, Questrade symbolId).
+    /// Used for correlating with real-time data caches (L2, ticks) that are keyed by broker-specific IDs.
+    /// Returns 0 if unknown.
+    /// </summary>
+    long ResolveInternalId(string symbol);
+
     bool IsAuthenticated { get; }
     string BrokerName { get; }
 }

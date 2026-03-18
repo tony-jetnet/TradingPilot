@@ -1,5 +1,8 @@
 using Hangfire;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using TradingPilot.EntityFrameworkCore;
 using TradingPilot.Symbols;
 using Volo.Abp.Domain.Repositories;
 using Volo.Abp.Linq;
@@ -170,45 +173,28 @@ public class LoadHistoricalBarsJob
 
             _logger.LogInformation("Got {Total} bars for {Timeframe} {Ticker}", bars.Count, tf, symbol.Id);
 
-            int inserted = 0, skipped = 0;
+            // Bulk upsert using ON CONFLICT DO NOTHING (avoids per-bar SELECT EXISTS)
+            int inserted = 0;
             using (var uow = _uowManager.Begin())
             {
+                var dbContext = uow.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
+                var timeframeInt = (int)timeframe;
+
                 foreach (var bar in bars)
                 {
-                    var symbolId = symbol.Id;
-                    var ts = bar.Timestamp;
-                    bool exists = await _asyncExecuter.AnyAsync(
-                        (await _barRepo.GetQueryableAsync()).Where(b =>
-                            b.SymbolId == symbolId &&
-                            b.Timeframe == timeframe &&
-                            b.Timestamp == ts));
-
-                    if (exists)
-                    {
-                        skipped++;
-                        continue;
-                    }
-
-                    await _barRepo.InsertAsync(new SymbolBar
-                    {
-                        SymbolId = symbol.Id,
-                        Timeframe = timeframe,
-                        Timestamp = bar.Timestamp,
-                        Open = bar.Open,
-                        High = bar.High,
-                        Low = bar.Low,
-                        Close = bar.Close,
-                        Volume = bar.Volume,
-                        Vwap = bar.Vwap,
-                        ChangeRatio = bar.ChangeRatio,
-                    }, autoSave: false);
-                    inserted++;
+                    int rows = await dbContext.Database.ExecuteSqlRawAsync(@"
+                        INSERT INTO ""SymbolBars"" (""Id"", ""SymbolId"", ""Timeframe"", ""Timestamp"", ""Open"", ""High"", ""Low"", ""Close"", ""Volume"", ""Vwap"", ""ChangeRatio"")
+                        VALUES ({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10})
+                        ON CONFLICT ON CONSTRAINT ""IX_SymbolBars_SymbolId_Timeframe_Timestamp"" DO NOTHING",
+                        Guid.NewGuid(), symbol.Id, timeframeInt, bar.Timestamp,
+                        bar.Open, bar.High, bar.Low, bar.Close, (long)bar.Volume, bar.Vwap ?? 0m, bar.ChangeRatio ?? 0m);
+                    inserted += rows;
                 }
                 await uow.CompleteAsync();
             }
 
-            _logger.LogInformation("Loaded {Inserted} new / skipped {Skipped} existing {Timeframe} bars for {Ticker} (API returned {Total})",
-                inserted, skipped, tf, symbol.Id, bars.Count);
+            _logger.LogInformation("Loaded {Inserted} new bars for {Timeframe} {Ticker} (API returned {Total})",
+                inserted, tf, symbol.Id, bars.Count);
         }
     }
 

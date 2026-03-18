@@ -19,6 +19,7 @@ using Volo.Abp.Modularity;
 using Volo.Abp.AspNetCore.Components.WebAssembly.Theming.Bundling;
 using Volo.Abp.AspNetCore.Components.WebAssembly.BasicTheme.Bundling;
 using Volo.Abp.Swashbuckle;
+using TradingPilot.Questrade;
 using TradingPilot.Symbols;
 using TradingPilot.Trading;
 using TradingPilot.Webull;
@@ -127,9 +128,18 @@ public class TradingPilotBlazorModule : AbpModule
         // Paper trading client (typed HttpClient — no base address since we use full URLs)
         context.Services.AddHttpClient<WebullPaperTradingClient>();
 
-        // Broker client abstraction (singleton — swap between Webull paper / Questrade live via config)
-        context.Services.AddSingleton<WebullBrokerClient>();
-        context.Services.AddSingleton<IBrokerClient>(sp => sp.GetRequiredService<WebullBrokerClient>());
+        // Broker client abstraction (singleton — swap via Broker:Type in appsettings.json)
+        var brokerType = context.Services.GetConfiguration().GetValue<string>("Broker:Type") ?? "WebullPaper";
+        if (brokerType == "Questrade")
+        {
+            context.Services.AddSingleton<QuestradeBrokerClient>();
+            context.Services.AddSingleton<IBrokerClient>(sp => sp.GetRequiredService<QuestradeBrokerClient>());
+        }
+        else
+        {
+            context.Services.AddSingleton<WebullBrokerClient>();
+            context.Services.AddSingleton<IBrokerClient>(sp => sp.GetRequiredService<WebullBrokerClient>());
+        }
 
         // Trading executor (singleton — auto-executes trades from signals via IBrokerClient)
         context.Services.AddSingleton<PaperTradingExecutor>();

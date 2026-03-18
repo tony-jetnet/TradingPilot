@@ -40,7 +40,13 @@
       "Bash(dotnet test:*)",
       "Bash(dotnet add:*)",
       "Bash(pip install:*)",
-      "Bash(grep -E \"\\\\.\\(cs\\)$\")"
+      "Bash(grep -E \"\\\\.\\(cs\\)$\")",
+      "WebFetch(domain:www.questrade.com)",
+      "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -U jetnet -d TradingPilot -t -c \"\nSELECT 'L2 Snapshots' as type, COUNT\\(*\\), MAX\\(\\\\\"Timestamp\\\\\"\\) FROM \\\\\"SymbolBookSnapshots\\\\\" WHERE \\\\\"Timestamp\\\\\" >= '2026-03-18 04:00:00'\nUNION ALL\nSELECT 'Trading Signals', COUNT\\(*\\), MAX\\(\\\\\"Timestamp\\\\\"\\) FROM \\\\\"TradingSignals\\\\\" WHERE \\\\\"Timestamp\\\\\" >= '2026-03-18 04:00:00'\nUNION ALL\nSELECT 'Symbol Bars', COUNT\\(*\\), MAX\\(\\\\\"Timestamp\\\\\"\\) FROM \\\\\"SymbolBars\\\\\" WHERE \\\\\"Timestamp\\\\\" >= '2026-03-18 04:00:00'\n\" 2>&1)",
+      "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -U jetnet -d TradingPilot -t -c \"\n-- L2 snapshots: check for gaps by looking at per-hour counts\nSELECT \n    date_trunc\\('hour', \\\\\"Timestamp\\\\\"\\) AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' as hour_et,\n    COUNT\\(*\\) as snapshots,\n    COUNT\\(DISTINCT \\\\\"SymbolId\\\\\"\\) as symbols\nFROM \\\\\"SymbolBookSnapshots\\\\\"\nWHERE \\\\\"Timestamp\\\\\" >= '2026-03-18 13:00:00'\nGROUP BY 1\nORDER BY 1\n\" 2>&1)",
+      "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -U jetnet -d TradingPilot -t -c \"\n-- Check exact cutoff time and when data resumed\nSELECT \n    \\\\\"SymbolId\\\\\",\n    MAX\\(\\\\\"Timestamp\\\\\"\\) AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' as last_data_et\nFROM \\\\\"SymbolBookSnapshots\\\\\"\nWHERE \\\\\"Timestamp\\\\\" >= '2026-03-18 13:00:00'\nGROUP BY \\\\\"SymbolId\\\\\"\nORDER BY 2 DESC\n\" 2>&1)",
+      "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -U jetnet -d TradingPilot -t -c \"\n-- Trading signals per hour\nSELECT \n    date_trunc\\('hour', \\\\\"Timestamp\\\\\"\\) AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' as hour_et,\n    COUNT\\(*\\) as signals\nFROM \\\\\"TradingSignals\\\\\"\nWHERE \\\\\"Timestamp\\\\\" >= '2026-03-18 13:00:00'\nGROUP BY 1\nORDER BY 1\n\" 2>&1)",
+      "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -U jetnet -d TradingPilot -t -c \"\nSELECT \n    \\\\\"Timeframe\\\\\",\n    COUNT\\(*\\) as bars,\n    MIN\\(\\\\\"Timestamp\\\\\"\\) AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' as earliest_et,\n    MAX\\(\\\\\"Timestamp\\\\\"\\) AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' as latest_et,\n    COUNT\\(DISTINCT \\\\\"SymbolId\\\\\"\\) as symbols\nFROM \\\\\"SymbolBars\\\\\"\nWHERE \\\\\"Timestamp\\\\\" >= '2026-03-18 04:00:00'\nGROUP BY \\\\\"Timeframe\\\\\"\nORDER BY \\\\\"Timeframe\\\\\"\n\" 2>&1)"
     ]
   }
 }

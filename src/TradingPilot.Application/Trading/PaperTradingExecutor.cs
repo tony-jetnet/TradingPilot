@@ -53,11 +53,18 @@ public class PaperTradingExecutor
         _analyzer = analyzer;
         _logger = logger;
 
-        _maxPositionDollars = configuration.GetValue<decimal>("Broker:MaxPositionDollars", 25000m);
-        _maxConcurrentPositions = configuration.GetValue<int>("Broker:MaxConcurrentPositions", 3);
-        _dailyLossLimit = configuration.GetValue<decimal>("Broker:DailyLossLimit", -2000m);
-        _rateLimitSeconds = configuration.GetValue<int>("Broker:RateLimitSeconds", 90);
-        _orderTimeoutMinutes = configuration.GetValue<int>("Broker:OrderTimeoutMinutes", 5);
+        // Read config from the active broker's section (Broker or BrokerQuestrade)
+        var brokerType = configuration.GetValue<string>("Broker:Type") ?? "WebullPaper";
+        var section = brokerType == "Questrade" ? "BrokerQuestrade" : "Broker";
+
+        _maxPositionDollars = configuration.GetValue<decimal>($"{section}:MaxPositionDollars", 25000m);
+        _maxConcurrentPositions = configuration.GetValue<int>($"{section}:MaxConcurrentPositions", 3);
+        _dailyLossLimit = configuration.GetValue<decimal>($"{section}:DailyLossLimit", -2000m);
+        _rateLimitSeconds = configuration.GetValue<int>($"{section}:RateLimitSeconds", 90);
+        _orderTimeoutMinutes = configuration.GetValue<int>($"{section}:OrderTimeoutMinutes", 5);
+
+        _logger.LogInformation("Trading executor using broker={Broker} section={Section}: maxPosition=${MaxPos} maxPositions={MaxCount} dailyLimit=${DailyLimit}",
+            brokerType, section, _maxPositionDollars, _maxConcurrentPositions, _dailyLossLimit);
     }
 
     /// <summary>
@@ -498,10 +505,11 @@ public class PaperTradingExecutor
 
                 if (!_positions.ContainsKey(symbol))
                 {
+                    long tickerId = _broker.ResolveInternalId(symbol);
                     _positions[symbol] = new PositionState
                     {
                         Symbol = symbol,
-                        TickerId = 0, // Will be resolved if needed
+                        TickerId = tickerId,
                         Shares = brokerPos.Quantity,
                         EntryPrice = brokerPos.AvgPrice,
                         EntryTime = DateTime.UtcNow,
@@ -513,8 +521,8 @@ public class PaperTradingExecutor
                         HoldSeconds = 120, // Conservative default
                         StopLoss = 0.50m,
                     };
-                    _logger.LogWarning("ADOPTED broker position: {Symbol} {Qty} shares @ {AvgPrice}",
-                        symbol, brokerPos.Quantity, brokerPos.AvgPrice);
+                    _logger.LogWarning("ADOPTED broker position: {Symbol} {Qty} shares @ {AvgPrice} (tickerId={TickerId})",
+                        symbol, brokerPos.Quantity, brokerPos.AvgPrice, tickerId);
                 }
             }
 
@@ -568,10 +576,11 @@ public class PaperTradingExecutor
             int adopted = 0;
             foreach (var brokerPos in account.Positions.Where(p => p.Quantity != 0))
             {
+                long tickerId = _broker.ResolveInternalId(brokerPos.Symbol);
                 _positions[brokerPos.Symbol] = new PositionState
                 {
                     Symbol = brokerPos.Symbol,
-                    TickerId = 0,
+                    TickerId = tickerId,
                     Shares = brokerPos.Quantity,
                     EntryPrice = brokerPos.AvgPrice,
                     EntryTime = DateTime.UtcNow,

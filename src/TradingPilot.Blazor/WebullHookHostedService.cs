@@ -281,7 +281,40 @@ public partial class WebullHookHostedService : BackgroundService
                 }
             }, stoppingToken);
 
-            // 7. Start reading from hook pipe (C# PipeServer receives data via native callback)
+            // 7. Periodic re-subscribe (every 2 min) to keep all tickers' L2 subscriptions active
+            // Webull unsubscribes when user switches tickers in the UI
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromMinutes(2), stoppingToken);
+                while (!stoppingToken.IsCancellationRequested)
+                {
+                    try
+                    {
+                        string? header = capturedHeader;
+                        if (header == null)
+                        {
+                            // Try loading from file
+                            string authPath = Path.Combine(@"D:\Third-Parties\WebullHook", "auth_header.json");
+                            if (File.Exists(authPath))
+                                header = File.ReadAllText(authPath).Trim();
+                        }
+
+                        if (!string.IsNullOrEmpty(header))
+                        {
+                            _logger.LogDebug("Re-subscribing all tickers to keep L2 data flowing...");
+                            await AutoSubscribeAsync(header, stoppingToken);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Periodic re-subscribe failed");
+                    }
+
+                    await Task.Delay(TimeSpan.FromMinutes(2), stoppingToken);
+                }
+            }, stoppingToken);
+
+            // 8. Start reading from hook pipe (C# PipeServer receives data via native callback)
             WebullHookAppService.IsPipeConnected = true;
             await _mqttDataReader.StartAsync(stoppingToken);
         }
