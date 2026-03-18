@@ -54,6 +54,10 @@ public class StrategyRuleEvaluator
             if (rule.SampleSize < config.GlobalRules.MinSampleSize)
                 continue;
 
+            // Quality gate: skip rules that aren't worth trading
+            if (!IsRuleTradeworthy(rule))
+                continue;
+
             // Evaluate all conditions
             if (!EvaluateConditions(rule.Conditions, indicators))
                 continue;
@@ -64,6 +68,18 @@ public class StrategyRuleEvaluator
         }
 
         return bestRule != null ? (bestRule, symbolStrategy) : null;
+    }
+
+    /// <summary>
+    /// Quality gate: reject rules that are not worth trading.
+    /// Filters out low-confidence, negative expected PnL, or insufficient sample size rules.
+    /// </summary>
+    public static bool IsRuleTradeworthy(StrategyRule rule)
+    {
+        if (rule.Confidence < 0.55m) return false;
+        if (rule.ExpectedPnlPer100Shares < 0) return false;
+        if (rule.SampleSize < 30) return false;
+        return true;
     }
 
     private static bool EvaluateConditions(RuleConditions c, IndicatorSnapshot ind)

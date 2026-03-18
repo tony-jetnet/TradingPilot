@@ -52,7 +52,9 @@ public class WebullPaperTradingClient
                     info.Positions.Add(new PaperPosition
                     {
                         TickerId = pos.TryGetProperty("tickerId", out var tid) ? tid.GetInt64() : 0,
-                        Ticker = pos.TryGetProperty("ticker", out var t) ? t.GetString() ?? "" : "",
+                        Ticker = pos.TryGetProperty("ticker", out var t)
+                            ? (t.ValueKind == JsonValueKind.String ? t.GetString() ?? "" : t.TryGetProperty("tickerName", out var tn) ? tn.GetString() ?? "" : t.ToString())
+                            : "",
                         Quantity = pos.TryGetProperty("position", out var q) ? (int)ParseDecimal(q) : 0,
                         CostPrice = pos.TryGetProperty("costPrice", out var cp) ? ParseDecimal(cp) : 0,
                         MarketValue = pos.TryGetProperty("marketValue", out var mv) ? ParseDecimal(mv) : 0,

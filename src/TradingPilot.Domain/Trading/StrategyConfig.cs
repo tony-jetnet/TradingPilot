@@ -44,6 +44,9 @@ public class SymbolStrategy
 
     [JsonPropertyName("maxPositionShares")]
     public int MaxPositionShares { get; set; } = 500;
+
+    [JsonPropertyName("maxPositionDollars")]
+    public decimal MaxPositionDollars { get; set; } = 25000m;
 }
 
 public class StrategyRule

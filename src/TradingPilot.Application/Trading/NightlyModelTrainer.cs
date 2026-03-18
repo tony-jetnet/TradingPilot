@@ -410,7 +410,7 @@ public class NightlyModelTrainer
                 // P&L = price movement * shares - commission
                 decimal priceDelta = row.PriceAfter1Min.Value - row.Price;
                 decimal tradePnl = (row.SignalType == 1 ? priceDelta : -priceDelta) * SimulationShares;
-                totalPnl += tradePnl - CommissionPerTrade;
+                totalPnl += tradePnl - CommissionPerTrade * 2; // Round-trip: entry + exit commission
             }
         }
 
@@ -440,7 +440,7 @@ public class NightlyModelTrainer
                 if (score >= threshold && row.PriceAfter1Min.HasValue)
                 {
                     decimal delta = row.PriceAfter1Min.Value - row.Price;
-                    buyPnl += delta * SimulationShares - CommissionPerTrade;
+                    buyPnl += delta * SimulationShares - CommissionPerTrade * 2; // Round-trip
                     buyCount++;
                 }
             }
@@ -461,7 +461,7 @@ public class NightlyModelTrainer
                 if (score <= -threshold && row.PriceAfter1Min.HasValue)
                 {
                     decimal delta = row.Price - row.PriceAfter1Min.Value;
-                    sellPnl += delta * SimulationShares - CommissionPerTrade;
+                    sellPnl += delta * SimulationShares - CommissionPerTrade * 2; // Round-trip
                     sellCount++;
                 }
             }

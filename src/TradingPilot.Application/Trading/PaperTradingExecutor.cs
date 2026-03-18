@@ -13,22 +13,26 @@ namespace TradingPilot.Trading;
 /// <summary>
 /// Auto-trading engine that connects microstructure signals to paper trading order execution.
 /// Manages position sizing, rate limiting, and trade persistence.
+/// Exit logic is handled by PositionMonitor (continuous) — OnSignalAsync only handles
+/// strong opposing signal exits (event-driven) and entries.
 /// </summary>
 public class PaperTradingExecutor
 {
-    // Configuration — backtested on 1,400+ signals, 2026-03-16
-    // ALIGNED+STRONG strategy: 57% win rate, $7.95/trade at 500 shares
-    private const int SharesPerTrade = 500;         // Need 200+ to overcome $2.99 fee
-    private const int MaxPositionShares = 500;      // Single position per ticker
-    private const int MinSecondsBetweenTrades = 90; // 90s cooldown
-    private const decimal MinScoreToEnter = 0.35m;  // Only strong signals
-    private const decimal MinScoreToExit = 0.20m;   // Exit on moderate opposing signal
-    private const decimal MomentumThreshold = 0.00m; // Signal must align with price direction
-    private const decimal CommissionPerTrade = 2.99m; // Webull CA: $2.99 per trade
+    // Configuration
+    private const int MinSecondsBetweenTrades = 90;
+    private const decimal DefaultMaxPositionDollars = 25000m;
+    private const decimal MomentumThreshold = 0.02m;
+    private const decimal CommissionPerTrade = 2.99m;
+    private const int MaxConcurrentPositions = 3;
+    private const decimal DailyLossLimit = -2000m; // Stop entries after losing $2K in a day
 
     // Fee tracking
     private int _totalTrades;
     private decimal _totalCommissions;
+
+    // Daily P&L tracking (reset at market open)
+    private decimal _dailyRealizedPnl;
+    private DateTime _dailyResetDate;
     private const long DefaultAccountId = 58226259;
     private static readonly TimeSpan AuthRefreshInterval = TimeSpan.FromMinutes(5);
     private const string AuthHeaderPath = @"D:\Third-Parties\WebullHook\auth_header.json";
@@ -45,7 +49,7 @@ public class PaperTradingExecutor
     private DateTime _authLoadedAt;
     private long _accountId = DefaultAccountId;
     private readonly ConcurrentDictionary<long, DateTime> _lastTradeTime = new();
-    private readonly ConcurrentDictionary<long, int> _currentPosition = new();
+    private readonly ConcurrentDictionary<long, PositionState> _positions = new();
 
     public PaperTradingExecutor(
         WebullPaperTradingClient client,
@@ -63,59 +67,104 @@ public class PaperTradingExecutor
         _logger = logger;
     }
 
-    // Track entry price and time for exit logic
-    private readonly ConcurrentDictionary<long, decimal> _entryPrice = new();
-    private readonly ConcurrentDictionary<long, DateTime> _entryTime = new();
-    private readonly ConcurrentDictionary<long, int> _consecutiveSellSignals = new();
+    /// <summary>
+    /// Expose open positions for PositionMonitor to evaluate.
+    /// </summary>
+    public IReadOnlyDictionary<long, PositionState> GetOpenPositions()
+        => _positions;
 
     /// <summary>
-    /// Backtested strategy (1,400+ signals, 2026-03-16):
-    /// - Entry: score >= 0.35 AND aligned with 30s price momentum
-    /// - Hold: ~1 minute (optimal from backtest)
-    /// - Exit: 1 min time stop, opposing signal >= 0.20, or $0.30 stop loss
-    /// - 500 shares per trade (need 200+ to cover $2.99 fee)
-    /// - Expected: 57% win rate, ~$5/trade net after fees
+    /// Exit a position (called by PositionMonitor or OnSignalAsync).
+    /// </summary>
+    public async Task ExitPositionAsync(long tickerId, decimal currentPrice, string reason, decimal score)
+    {
+        // Atomic remove prevents double-exit from concurrent PositionMonitor + OnSignalAsync
+        if (!_positions.TryRemove(tickerId, out var pos))
+            return;
+
+        RefreshAuthIfNeeded();
+        if (_authHeaderJson == null) return;
+
+        string action = pos.IsLong ? "SELL" : "BUY";
+        int qty = Math.Abs(pos.Shares);
+        decimal pnl = (pos.IsLong ? currentPrice - pos.EntryPrice : pos.EntryPrice - currentPrice) * qty;
+        decimal netPnl = pnl - CommissionPerTrade * 2; // Round-trip commission
+
+        // Track daily realized P&L
+        ResetDailyPnlIfNewDay();
+        _dailyRealizedPnl += netPnl;
+
+        await PlaceOrderAsync(tickerId, pos.Ticker, action, qty,
+            currentPrice, $"EXIT {reason} P&L=${netPnl:F2}net DayPnL=${_dailyRealizedPnl:F2}", score, pos.SymbolId, null);
+
+        if (_dailyRealizedPnl <= DailyLossLimit)
+        {
+            _logger.LogWarning("CIRCUIT BREAKER: Daily P&L={DailyPnl:F2} hit limit {Limit}. No new entries until tomorrow.",
+                _dailyRealizedPnl, DailyLossLimit);
+        }
+    }
+
+    /// <summary>
+    /// Handle a new trading signal — only strong opposing signal exits + entries.
+    /// Time stop, stop loss, score-based exits are handled by PositionMonitor.
     /// </summary>
     public async Task OnSignalAsync(TradingSignal signal)
     {
         RefreshAuthIfNeeded();
         if (_authHeaderJson == null) return;
 
-        // Rate limit
+        decimal score = signal.Indicators.GetValueOrDefault("CompositeScore");
+        string? symbolId = await ResolveSymbolIdAsync(signal.TickerId);
+
+        // Already in a position for this ticker — skip (PositionMonitor handles all exits)
+        if (_positions.ContainsKey(signal.TickerId))
+            return;
+
+        // ═══════════════════════════════════════════════════════════
+        // ENTRY: Circuit breaker, position limit, rate limit
+        // ═══════════════════════════════════════════════════════════
+        ResetDailyPnlIfNewDay();
+        if (_dailyRealizedPnl <= DailyLossLimit)
+        {
+            _logger.LogDebug("Skipping entry for {Ticker}: daily loss limit hit ({DailyPnl:F2})",
+                signal.Ticker, _dailyRealizedPnl);
+            return;
+        }
+
+        if (_positions.Count >= MaxConcurrentPositions)
+        {
+            _logger.LogDebug("Skipping entry for {Ticker}: max concurrent positions ({Max})",
+                signal.Ticker, MaxConcurrentPositions);
+            return;
+        }
+
         if (_lastTradeTime.TryGetValue(signal.TickerId, out var lastTime)
             && (DateTime.UtcNow - lastTime).TotalSeconds < MinSecondsBetweenTrades)
             return;
-
-        decimal score = signal.Indicators.GetValueOrDefault("CompositeScore");
-        int currentShares = _currentPosition.GetValueOrDefault(signal.TickerId, 0);
-        string? symbolId = await ResolveSymbolIdAsync(signal.TickerId);
 
         // Check if signal came from AI rule (has per-rule parameters)
         bool isRuleSignal = signal.Indicators.ContainsKey("RuleConfidence");
         int ruleHoldSeconds = isRuleSignal ? (int)signal.Indicators.GetValueOrDefault("RuleHoldSeconds", 60) : 0;
         decimal ruleStopLoss = isRuleSignal ? signal.Indicators.GetValueOrDefault("RuleStopLoss", 0.30m) : 0;
+        decimal ruleConfidence = isRuleSignal ? signal.Indicators.GetValueOrDefault("RuleConfidence", 0.55m) : 0;
+        string? ruleId = null;
 
         // Read learned thresholds from model config (fall back to defaults)
         var tickerConfig = _analyzer.CurrentModelConfig?.Tickers.GetValueOrDefault(signal.TickerId);
-        decimal minScoreEntry = isRuleSignal ? 0.55m : (tickerConfig?.MinScoreToBuy ?? MinScoreToEnter);
-        decimal minScoreExit = tickerConfig?.MinScoreToExit ?? MinScoreToExit;
-        int holdSeconds = isRuleSignal ? ruleHoldSeconds : (tickerConfig?.OptimalHoldSeconds ?? 60);
-        decimal stopLoss = isRuleSignal ? ruleStopLoss : (tickerConfig?.StopLossAmount ?? 0.30m);
 
-        // For rule-based signals, check max daily trades per symbol
+        // Stage 2: use learned MinScoreToBuy from model_config.json (not hardcoded)
+        decimal minScoreEntry = isRuleSignal ? 0.55m : (tickerConfig?.MinScoreToBuy ?? 0.35m);
+        int entryHoldSeconds = isRuleSignal ? ruleHoldSeconds : (tickerConfig?.OptimalHoldSeconds ?? 60);
+        decimal entryStopLoss = isRuleSignal ? ruleStopLoss : (tickerConfig?.StopLossAmount ?? 0.30m);
+
+        // For rule-based signals, get rule ID and check per-symbol constraints
         if (isRuleSignal)
         {
             var strategyConfig = _analyzer.RuleEvaluator.CurrentConfig;
             if (strategyConfig != null &&
                 strategyConfig.Symbols.TryGetValue(signal.Ticker, out var symbolStrategy))
             {
-                // MaxPositionShares from strategy
-                int maxShares = symbolStrategy.MaxPositionShares;
-                if (maxShares > 0 && maxShares < SharesPerTrade)
-                {
-                    // Strategy wants fewer shares — skip if current position already at max
-                    if (Math.Abs(currentShares) >= maxShares) return;
-                }
+                ruleId = signal.Reason; // Contains rule ID in the reason string
             }
         }
 
@@ -128,86 +177,135 @@ public class PaperTradingExecutor
 
         // ═══════════════════════════════════════════════════════════
         // CHECK MOMENTUM: get price 30s ago from L2BookCache
+        // Block entry if no valid momentum reading (cold ticker protection)
         // ═══════════════════════════════════════════════════════════
-        decimal momentum = 0;
         var recentSnapshots = _l2Cache.GetSnapshots(signal.TickerId, 60);
-        if (recentSnapshots.Count >= 2)
+        if (recentSnapshots.Count < 2)
         {
-            // Find snapshot ~30s ago
-            var now = recentSnapshots[^1];
-            var older = recentSnapshots.FirstOrDefault(s =>
-                (now.Timestamp - s.Timestamp).TotalSeconds >= 25 &&
-                (now.Timestamp - s.Timestamp).TotalSeconds <= 40);
-            if (older != null)
-                momentum = now.MidPrice - older.MidPrice;
+            _logger.LogDebug("Skipping entry for {Ticker}: insufficient L2 cache ({Count} snapshots)",
+                signal.Ticker, recentSnapshots.Count);
+            return;
         }
 
+        var latestSnapshot = recentSnapshots[^1];
+        var olderSnapshot = recentSnapshots.FirstOrDefault(s =>
+            (latestSnapshot.Timestamp - s.Timestamp).TotalSeconds >= 25 &&
+            (latestSnapshot.Timestamp - s.Timestamp).TotalSeconds <= 40);
+
+        if (olderSnapshot == null)
+        {
+            _logger.LogDebug("Skipping entry for {Ticker}: no L2 snapshot in 25-40s window for momentum check",
+                signal.Ticker);
+            return;
+        }
+
+        decimal momentum = latestSnapshot.MidPrice - olderSnapshot.MidPrice;
+
         // ═══════════════════════════════════════════════════════════
-        // ENTRY: Strong signal + aligned with momentum
+        // ENTRY: Strong signal + aligned with meaningful momentum
         // ═══════════════════════════════════════════════════════════
         bool isBuyEntry = signal.Type == SignalType.Buy && score >= minScoreEntry && momentum >= MomentumThreshold;
         bool isSellEntry = signal.Type == SignalType.Sell && score <= -minScoreEntry && momentum <= -MomentumThreshold;
 
-        if ((isBuyEntry || isSellEntry) && currentShares == 0)
+        if (isBuyEntry || isSellEntry)
         {
             string action = isBuyEntry ? "BUY" : "SELL";
-            int qty = SharesPerTrade;
+
+            // Dollar-based position sizing
+            decimal maxDollars = DefaultMaxPositionDollars;
+            var strategyConfig = _analyzer.RuleEvaluator.CurrentConfig;
+            if (strategyConfig != null &&
+                strategyConfig.Symbols.TryGetValue(signal.Ticker, out var symStrategy))
+            {
+                maxDollars = symStrategy.MaxPositionDollars > 0
+                    ? symStrategy.MaxPositionDollars
+                    : DefaultMaxPositionDollars;
+            }
+            int qty = Math.Max(1, (int)(maxDollars / signal.Price));
 
             await PlaceOrderAsync(signal.TickerId, signal.Ticker, action, qty,
                 signal.Price, $"{action} score={score:F3} mom={momentum:F3}", score, symbolId, null);
 
-            _entryPrice[signal.TickerId] = signal.Price;
-            _entryTime[signal.TickerId] = DateTime.UtcNow;
-            _consecutiveSellSignals[signal.TickerId] = 0;
-        }
-        // ═══════════════════════════════════════════════════════════
-        // EXIT: Time stop (1 min), opposing signal, or stop loss
-        // ═══════════════════════════════════════════════════════════
-        else if (currentShares != 0)
-        {
-            bool isLong = currentShares > 0;
-            bool shouldExit = false;
-            string reason = "";
-
-            // 1. Time stop: use learned hold time or default 60s
-            if (_entryTime.TryGetValue(signal.TickerId, out var et) && (DateTime.UtcNow - et).TotalSeconds >= holdSeconds)
+            // Create consolidated position state
+            _positions[signal.TickerId] = new PositionState
             {
-                shouldExit = true;
-                decimal elapsed = (decimal)(DateTime.UtcNow - et).TotalSeconds;
-                reason = $"TIME {elapsed:F0}s";
+                TickerId = signal.TickerId,
+                Ticker = signal.Ticker,
+                SymbolId = symbolId,
+                Shares = isBuyEntry ? qty : -qty,
+                EntryPrice = signal.Price,
+                EntryTime = DateTime.UtcNow,
+                EntryScore = score,
+                PeakFavorableScore = score,
+                PeakFavorablePrice = signal.Price,
+                EntryImbalance = latestSnapshot.Imbalance,
+                EntrySpread = latestSnapshot.Spread,
+                EntrySpreadPercentile = 0.5m,
+                EntryTrendDirection = (int)(signal.Indicators.GetValueOrDefault("TrendDir", 0)),
+                NotionalValue = signal.Price * qty,
+                EntryRuleId = ruleId,
+                RuleConfidence = ruleConfidence,
+                HoldSeconds = entryHoldSeconds,
+                StopLoss = entryStopLoss,
+
+            };
+        }
+    }
+
+    /// <summary>
+    /// Sync positions from broker API. Called by PositionMonitor every ~30s.
+    /// </summary>
+    public async Task SyncPositionsFromBrokerAsync()
+    {
+        RefreshAuthIfNeeded();
+        if (_authHeaderJson == null) return;
+
+        try
+        {
+            var account = await _client.GetAccountAsync(_authHeaderJson, _accountId);
+            if (account == null) return;
+
+            // Build map of broker positions
+            var brokerPositions = new Dictionary<long, int>();
+            foreach (var pos in account.Positions)
+            {
+                if (pos.TickerId > 0)
+                    brokerPositions[pos.TickerId] = pos.Quantity;
             }
 
-            // 2. Stop loss: use learned stop loss or default $0.30
-            if (!shouldExit && _entryPrice.TryGetValue(signal.TickerId, out var ep))
+            // Remove local positions not in broker
+            foreach (var key in _positions.Keys)
             {
-                decimal adverse = isLong ? ep - signal.Price : signal.Price - ep;
-                if (adverse > stopLoss)
+                if (!brokerPositions.ContainsKey(key))
                 {
-                    shouldExit = true;
-                    reason = $"STOP LOSS {adverse:F2}";
+                    _positions.TryRemove(key, out _);
+                    _logger.LogInformation("Position {TickerId} closed at broker, removed from local state", key);
                 }
             }
 
-            // 3. Strong opposing signal
-            bool opposing = (isLong && signal.Type == SignalType.Sell) || (!isLong && signal.Type == SignalType.Buy);
-            if (!shouldExit && opposing && Math.Abs(score) >= minScoreExit)
+            // Update share counts from broker (catches partial fills, external trades)
+            foreach (var (tickerId, qty) in brokerPositions)
             {
-                shouldExit = true;
-                reason = $"OPPOSING score={score:F3}";
+                if (_positions.TryGetValue(tickerId, out var pos))
+                {
+                    if (pos.Shares != qty)
+                    {
+                        _logger.LogInformation("Position {TickerId} shares adjusted: {Old} -> {New}",
+                            tickerId, pos.Shares, qty);
+                        pos.Shares = qty;
+                    }
+                }
+                // Note: positions opened externally are not tracked (no entry context)
             }
 
-            if (shouldExit)
-            {
-                string action = isLong ? "SELL" : "BUY";
-                int qty = Math.Abs(currentShares);
-                decimal pnl = _entryPrice.TryGetValue(signal.TickerId, out var ep3)
-                    ? (isLong ? signal.Price - ep3 : ep3 - signal.Price) * qty : 0;
-                await PlaceOrderAsync(signal.TickerId, signal.Ticker, action, qty,
-                    signal.Price, $"EXIT {reason} P&L=${pnl - CommissionPerTrade:F2}net", score, symbolId, null);
-                _entryPrice.TryRemove(signal.TickerId, out _);
-                _entryTime.TryRemove(signal.TickerId, out _);
-                _consecutiveSellSignals[signal.TickerId] = 0;
-            }
+            _logger.LogInformation(
+                "Broker sync: NetLiq={NetLiq:C} Cash={Cash:C} Positions={PosCount} OpenOrders={OrderCount}",
+                account.NetLiquidation, account.UsableCash,
+                account.Positions.Count, account.OpenOrders.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to sync paper trading positions");
         }
     }
 
@@ -235,8 +333,6 @@ public class PaperTradingExecutor
         if (result?.Success == true)
         {
             _lastTradeTime[tickerId] = DateTime.UtcNow;
-            int delta = action == "BUY" ? qty : -qty;
-            _currentPosition.AddOrUpdate(tickerId, delta, (_, current) => current + delta);
 
             _totalTrades++;
             _totalCommissions += CommissionPerTrade;
@@ -256,53 +352,20 @@ public class PaperTradingExecutor
             result?.OrderId, result?.Success == true ? "Placed" : $"Failed: {result?.ErrorMessage}", signalId);
     }
 
-    /// <summary>
-    /// Periodically sync positions from the API to keep local state accurate.
-    /// Should be called every ~60s.
-    /// </summary>
-    public async Task SyncPositionsAsync()
+    private void ResetDailyPnlIfNewDay()
     {
-        RefreshAuthIfNeeded();
-        if (_authHeaderJson == null) return;
-
-        try
+        var eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+        var etNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eastern);
+        var today = etNow.Date;
+        if (_dailyResetDate != today)
         {
-            var account = await _client.GetAccountAsync(_authHeaderJson, _accountId);
-            if (account == null) return;
-
-            // Update local position state from actual positions
-            var newPositions = new Dictionary<long, int>();
-            foreach (var pos in account.Positions)
-            {
-                if (pos.TickerId > 0)
-                    newPositions[pos.TickerId] = pos.Quantity;
-            }
-
-            // Clear positions not in API response
-            foreach (var key in _currentPosition.Keys)
-            {
-                if (!newPositions.ContainsKey(key))
-                    _currentPosition.TryRemove(key, out _);
-            }
-
-            // Update from API
-            foreach (var (tickerId, qty) in newPositions)
-            {
-                _currentPosition[tickerId] = qty;
-            }
-
-            _logger.LogInformation(
-                "Paper account sync: NetLiq={NetLiq:C} Cash={Cash:C} Positions={PosCount} OpenOrders={OrderCount}",
-                account.NetLiquidation, account.UsableCash,
-                account.Positions.Count, account.OpenOrders.Count);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to sync paper trading positions");
+            _dailyRealizedPnl = 0;
+            _dailyResetDate = today;
+            _logger.LogInformation("Daily P&L reset for {Date}", today);
         }
     }
 
-    private void RefreshAuthIfNeeded()
+    internal void RefreshAuthIfNeeded()
     {
         if (_authHeaderJson != null && (DateTime.UtcNow - _authLoadedAt) < AuthRefreshInterval)
             return;
@@ -310,6 +373,9 @@ public class PaperTradingExecutor
         _authHeaderJson = LoadAuthHeader();
         _authLoadedAt = DateTime.UtcNow;
     }
+
+    internal string? AuthHeaderJson => _authHeaderJson;
+    internal long AccountId => _accountId;
 
     private string? LoadAuthHeader()
     {

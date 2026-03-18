@@ -443,25 +443,29 @@ public static class WebullProtobufDecoder
         if (msg.RawDepthLevels == null || msg.RawDepthLevels.Count == 0)
             return;
 
+        // Sort ascending by price first to handle out-of-order levels from exchange quirks
         var levels = msg.RawDepthLevels;
+        levels.Sort((a, b) => a.Price.CompareTo(b.Price));
 
-        // Find the transition point: where price stops increasing and starts decreasing.
-        // Asks come first (ascending), then bids (descending).
+        // Find the transition point: the largest price gap between adjacent levels
+        // indicates the spread between best ask and best bid.
+        // Asks are the lower-priced levels (ascending), bids are the higher-priced levels (descending).
         int splitIndex = levels.Count;
+        decimal maxGap = 0;
         for (int i = 1; i < levels.Count; i++)
         {
-            // A significant drop indicates the transition from asks to bids.
-            // We look for a price that is lower than the previous price by more than
-            // a small tick (to avoid noise from equal prices).
-            if (levels[i].Price < levels[i - 1].Price)
+            decimal gap = levels[i].Price - levels[i - 1].Price;
+            if (gap > maxGap)
             {
+                maxGap = gap;
                 splitIndex = i;
-                break;
             }
         }
 
-        msg.Asks = levels.GetRange(0, splitIndex);
-        msg.Bids = levels.GetRange(splitIndex, levels.Count - splitIndex);
+        // After sorting ascending: levels below the gap are bids (descending), above are asks (ascending)
+        msg.Bids = levels.GetRange(0, splitIndex);
+        msg.Bids.Reverse(); // bids should be descending (best bid first)
+        msg.Asks = levels.GetRange(splitIndex, levels.Count - splitIndex);
     }
 
     #endregion

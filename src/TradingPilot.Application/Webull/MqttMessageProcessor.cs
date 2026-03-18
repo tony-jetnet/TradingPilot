@@ -150,7 +150,7 @@ public class MqttMessageProcessor
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Failed to process MQTT message on topic {Topic}", topic);
+            _logger.LogWarning(ex, "Failed to process MQTT message on topic {Topic}", topic);
         }
     }
 
@@ -375,7 +375,7 @@ public class MqttMessageProcessor
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "Failed to store tick snapshot for tickerId={TickerId}", tickerId);
+            _logger.LogWarning(ex, "Failed to store tick snapshot for tickerId={TickerId}", tickerId);
         }
     }
 

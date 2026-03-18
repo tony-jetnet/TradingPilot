@@ -57,8 +57,8 @@ public class MarketMicrostructureAnalyzer
     private const decimal ModerateSellThreshold = -0.20m;
     private const decimal WeakSellThreshold = -0.10m;
 
-    // Minimum interval between signals to avoid spam
-    private static readonly TimeSpan MinSignalInterval = TimeSpan.FromSeconds(5);
+    // Minimum interval between signals to avoid spam (2s to avoid suppressing reversals)
+    private static readonly TimeSpan MinSignalInterval = TimeSpan.FromSeconds(2);
 
     // Window sizes for rolling calculations
     private const int ShortWindow = 10;
@@ -419,9 +419,13 @@ public class MarketMicrostructureAnalyzer
                 rsiFilterScore * WeightRsiFilter;
         }
 
-        // Apply contextual filters from bar indicators
+        // Apply contextual filters from bar indicators.
+        // Filters are multiplicative but total penalty is capped at 50% to avoid
+        // killing high-conviction counter-trend signals (which often catch reversals).
         if (barIndicators != null)
         {
+            decimal preFilterScore = compositeScore;
+
             // Trend filter: if EMA trend is bearish but signal is BUY, reduce score
             if (barIndicators.TrendDirection == -1 && compositeScore > 0)
                 compositeScore *= 0.5m;
@@ -443,6 +447,16 @@ public class MarketMicrostructureAnalyzer
                 compositeScore *= 0.5m;
             else if (barIndicators.OversoldRsi && compositeScore < 0)
                 compositeScore *= 0.5m;
+
+            // Cap total penalty at 50%: don't let cascading filters kill strong L2 signals
+            if (preFilterScore != 0)
+            {
+                decimal minAllowed = preFilterScore * 0.50m;
+                if (preFilterScore > 0 && compositeScore < minAllowed)
+                    compositeScore = minAllowed;
+                else if (preFilterScore < 0 && compositeScore > minAllowed)
+                    compositeScore = minAllowed;
+            }
         }
 
         // Apply hourly score multiplier from model config
@@ -544,6 +558,117 @@ public class MarketMicrostructureAnalyzer
         }
 
         return signal;
+    }
+
+    /// <summary>
+    /// Re-compute the composite score for a ticker using the latest cached data
+    /// and learned weights. No signal generation, no throttling — just the math.
+    /// Used by PositionMonitor for continuous exit evaluation.
+    /// </summary>
+    public decimal ComputeCurrentScore(long tickerId)
+    {
+        if (!_state.TryGetValue(tickerId, out var state))
+            return 0;
+
+        if (state.RecentImbalances.Count < ShortWindow)
+            return 0;
+
+        // Get latest L2 snapshot from cache
+        var snapshots = _l2Cache.GetSnapshots(tickerId, 1);
+        if (snapshots.Count == 0)
+            return 0;
+
+        var snapshot = snapshots[^1];
+
+        var tickerConfig = _modelConfig?.Tickers.GetValueOrDefault(tickerId);
+        int etHour = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, EasternTimeZone).Hour;
+
+        // Compute all 10 indicator scores
+        decimal obiScore = ComputeSmoothedObi(state);
+        decimal wobiScore = ComputeWeightedObi(snapshot);
+        decimal pressureRocScore = ComputePressureRoc(state);
+        decimal spreadScore = ComputeSpreadSignal(state, snapshot);
+        decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
+        decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
+
+        var barIndicators = _barCache.GetIndicators(tickerId);
+        decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
+        decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
+        decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
+        decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
+
+        // Composite score with learned or default weights
+        decimal compositeScore;
+        if (tickerConfig != null)
+        {
+            compositeScore =
+                obiScore * tickerConfig.WeightObi +
+                wobiScore * tickerConfig.WeightWobi +
+                pressureRocScore * tickerConfig.WeightPressureRoc +
+                spreadScore * tickerConfig.WeightSpread +
+                largeOrderScore * tickerConfig.WeightLargeOrder +
+                tickMomentumScore * tickerConfig.WeightTickMomentum +
+                trendAlignmentScore * tickerConfig.WeightTrend +
+                vwapPositionScore * tickerConfig.WeightVwap +
+                volumeConfirmationScore * tickerConfig.WeightVolume +
+                rsiFilterScore * tickerConfig.WeightRsi;
+        }
+        else
+        {
+            compositeScore =
+                obiScore * WeightObi +
+                wobiScore * WeightWobi +
+                pressureRocScore * WeightPressureRoc +
+                spreadScore * WeightSpread +
+                largeOrderScore * WeightLargeOrder +
+                tickMomentumScore * WeightTickMomentum +
+                trendAlignmentScore * WeightTrendAlignment +
+                vwapPositionScore * WeightVwapPosition +
+                volumeConfirmationScore * WeightVolumeConfirmation +
+                rsiFilterScore * WeightRsiFilter;
+        }
+
+        // Apply contextual filters (same as AnalyzeSnapshot)
+        if (barIndicators != null)
+        {
+            decimal preFilterScore = compositeScore;
+
+            if (barIndicators.TrendDirection == -1 && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
+                compositeScore *= 0.5m;
+
+            if (!barIndicators.AboveVwap && compositeScore > 0)
+                compositeScore *= 0.7m;
+            else if (barIndicators.AboveVwap && compositeScore < 0)
+                compositeScore *= 0.7m;
+
+            if (barIndicators.HighVolume)
+                compositeScore *= 1.3m;
+
+            if (barIndicators.OverboughtRsi && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.OversoldRsi && compositeScore < 0)
+                compositeScore *= 0.5m;
+
+            if (preFilterScore != 0)
+            {
+                decimal minAllowed = preFilterScore * 0.50m;
+                if (preFilterScore > 0 && compositeScore < minAllowed)
+                    compositeScore = minAllowed;
+                else if (preFilterScore < 0 && compositeScore > minAllowed)
+                    compositeScore = minAllowed;
+            }
+        }
+
+        // Apply hourly score multiplier
+        if (tickerConfig != null)
+        {
+            if (tickerConfig.HourlyAdjustments.TryGetValue(etHour, out var hourAdj))
+                compositeScore *= hourAdj.ScoreMultiplier;
+        }
+
+        return compositeScore;
     }
 
     private static void UpdateState(TickerAnalysisState state, SymbolBookSnapshot snapshot)

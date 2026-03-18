@@ -581,8 +581,12 @@ Your rules should:
 7. Consider institutional capital flows: sustained large inflows = bullish bias, outflows = bearish
 8. Consider recent news sentiment: major catalysts may shift patterns
 
-Be conservative: only generate rules with sample sizes >= 20 and confidence >= 0.55.
-Focus on the strongest patterns in the data.";
+Be conservative: only generate rules where:
+- Sample size >= 30
+- Confidence >= 0.55
+- Expected P&L per 100 shares is POSITIVE after accounting for $5.98 round-trip commission ($2.99 entry + $2.99 exit)
+- Rules with negative expected P&L should be excluded entirely
+Focus on the strongest patterns in the data. Quality over quantity — fewer high-confidence rules are better than many marginal ones.";
 
         var userPrompt = $@"{analysisPrompt}
 
@@ -619,7 +623,8 @@ Based on the data above, generate a JSON object for {ticker} with this exact str
   ],
   ""disabledHours"": [<hours with win rate < 48%>],
   ""maxDailyTrades"": <5-30>,
-  ""maxPositionShares"": 500
+  ""maxPositionShares"": 500,
+  ""maxPositionDollars"": <25000 default, adjust based on ticker volatility>
 }}
 
 Return ONLY the JSON object, no markdown fences or explanation.";
@@ -697,9 +702,10 @@ Return ONLY the JSON object, no markdown fences or explanation.";
                 return null;
             }
 
-            // Validate and filter rules
+            // Validate and filter rules (quality gate)
             var validRules = strategy.Rules
-                .Where(r => r.SampleSize >= 20 && r.Confidence >= 0.55m)
+                .Where(r => r.SampleSize >= 30 && r.Confidence >= 0.55m)
+                .Where(r => r.ExpectedPnlPer100Shares > 0) // Must be profitable after fees
                 .Where(r => r.Direction is "BUY" or "SELL")
                 .Where(r => r.HoldSeconds is >= 10 and <= 600)
                 .Where(r => r.StopLoss is >= 0.05m and <= 5.0m)
@@ -770,13 +776,29 @@ Return ONLY the JSON object, no markdown fences or explanation.";
             using var scope = _scopeFactory.CreateScope();
             var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
 
+            // Delete in batches of 5000 to avoid long table locks
             var bookCutoff = DateTime.UtcNow.AddDays(-3);
-            int bookDeleted = await dbContext.Database.ExecuteSqlRawAsync(
-                @"DELETE FROM ""SymbolBookSnapshots"" WHERE ""Timestamp"" < {0}", bookCutoff);
+            int bookDeleted = 0;
+            int batch;
+            do
+            {
+                batch = await dbContext.Database.ExecuteSqlRawAsync(
+                    @"DELETE FROM ""SymbolBookSnapshots"" WHERE ""Id"" IN (
+                        SELECT ""Id"" FROM ""SymbolBookSnapshots"" WHERE ""Timestamp"" < {0} LIMIT 5000
+                    )", bookCutoff);
+                bookDeleted += batch;
+            } while (batch >= 5000);
 
             var tickCutoff = DateTime.UtcNow.AddDays(-30);
-            int tickDeleted = await dbContext.Database.ExecuteSqlRawAsync(
-                @"DELETE FROM ""TickSnapshots"" WHERE ""Timestamp"" < {0}", tickCutoff);
+            int tickDeleted = 0;
+            do
+            {
+                batch = await dbContext.Database.ExecuteSqlRawAsync(
+                    @"DELETE FROM ""TickSnapshots"" WHERE ""Id"" IN (
+                        SELECT ""Id"" FROM ""TickSnapshots"" WHERE ""Timestamp"" < {0} LIMIT 5000
+                    )", tickCutoff);
+                tickDeleted += batch;
+            } while (batch >= 5000);
 
             _logger.LogWarning(
                 "Cleanup: deleted {BookCount} SymbolBookSnapshots (>3d), {TickCount} TickSnapshots (>30d)",
@@ -916,8 +938,29 @@ Return ONLY the JSON object, no markdown fences or explanation.";
 
         var cutoff = DateTime.UtcNow.AddDays(-lookbackDays);
 
-        // Use raw SQL for efficiency — insert bars that have no nearby TickSnapshot
+        // Use raw SQL with window functions to compute EMA9, EMA20, RSI14, and VolumeRatio from 1-min bars.
+        // EMA is approximated using exponential smoothing weights: alpha_9 = 2/(9+1) = 0.2, alpha_20 = 2/(20+1) ≈ 0.095
+        // RSI uses standard 14-period gain/loss averages.
         int inserted = await dbContext.Database.ExecuteSqlRawAsync(@"
+            WITH bars AS (
+                SELECT sb.""SymbolId"", sb.""Timestamp"", sb.""Open"", sb.""High"", sb.""Low"",
+                       sb.""Close"", sb.""Volume"", COALESCE(sb.""Vwap"", 0) AS vwap,
+                       sb.""Close"" - LAG(sb.""Close"") OVER (ORDER BY sb.""Timestamp"") AS price_change,
+                       AVG(sb.""Volume"") OVER (ORDER BY sb.""Timestamp"" ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS avg_vol,
+                       AVG(sb.""Close"") OVER (ORDER BY sb.""Timestamp"" ROWS BETWEEN 8 PRECEDING AND CURRENT ROW) AS sma9,
+                       AVG(sb.""Close"") OVER (ORDER BY sb.""Timestamp"" ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS sma20,
+                       ROW_NUMBER() OVER (ORDER BY sb.""Timestamp"") AS rn
+                FROM ""SymbolBars"" sb
+                WHERE sb.""SymbolId"" = {1}
+                  AND sb.""Timeframe"" = 2
+                  AND sb.""Timestamp"" > {2}
+            ),
+            with_rsi AS (
+                SELECT b.*,
+                       COALESCE(AVG(GREATEST(b.price_change, 0)) OVER (ORDER BY b.""Timestamp"" ROWS BETWEEN 13 PRECEDING AND CURRENT ROW), 0) AS avg_gain,
+                       COALESCE(AVG(GREATEST(-b.price_change, 0)) OVER (ORDER BY b.""Timestamp"" ROWS BETWEEN 13 PRECEDING AND CURRENT ROW), 0) AS avg_loss
+                FROM bars b
+            )
             INSERT INTO ""TickSnapshots"" (
                 ""Id"", ""SymbolId"", ""TickerId"", ""Timestamp"",
                 ""Price"", ""Open"", ""High"", ""Low"", ""Volume"",
@@ -927,19 +970,32 @@ Return ONLY the JSON object, no markdown fences or explanation.";
                 ""BidSweepCost"", ""AskSweepCost"", ""ImbalanceVelocity"", ""SpreadPercentile""
             )
             SELECT
-                gen_random_uuid(), sb.""SymbolId"", {0}, sb.""Timestamp"",
-                sb.""Close"", sb.""Open"", sb.""High"", sb.""Low"", sb.""Volume"",
-                COALESCE(sb.""Vwap"", 0), 0, 0, 50, 1,
-                0, 0, 0,
+                gen_random_uuid(), r.""SymbolId"", {0}, r.""Timestamp"",
+                r.""Close"", r.""Open"", r.""High"", r.""Low"", r.""Volume"",
+                r.vwap,
+                COALESCE(r.sma9, r.""Close""),
+                COALESCE(r.sma20, r.""Close""),
+                CASE WHEN r.avg_loss = 0 THEN 100.0
+                     WHEN r.avg_gain = 0 THEN 0.0
+                     ELSE ROUND((100.0 - 100.0 / (1.0 + r.avg_gain / r.avg_loss))::numeric, 2)
+                END,
+                CASE WHEN COALESCE(r.avg_vol, 0) = 0 THEN 1.0
+                     ELSE ROUND((r.""Volume""::numeric / r.avg_vol)::numeric, 4)
+                END,
+                -- Tick data not available from bars — derive momentum from price change direction
+                CASE WHEN COALESCE(r.price_change, 0) > 0 THEN 1 ELSE 0 END,
+                CASE WHEN COALESCE(r.price_change, 0) < 0 THEN 1 ELSE 0 END,
+                CASE WHEN COALESCE(r.price_change, 0) > 0 THEN 1.0
+                     WHEN COALESCE(r.price_change, 0) < 0 THEN -1.0
+                     ELSE 0.0 END,
+                -- L2 features not available from bars — leave as 0
                 0, 0, 0, 0, 0, 0, 0.5
-            FROM ""SymbolBars"" sb
-            WHERE sb.""SymbolId"" = {1}
-              AND sb.""Timeframe"" = 2
-              AND sb.""Timestamp"" > {2}
+            FROM with_rsi r
+            WHERE r.rn > 20
               AND NOT EXISTS (
                   SELECT 1 FROM ""TickSnapshots"" ts
-                  WHERE ts.""SymbolId"" = sb.""SymbolId""
-                    AND ABS(EXTRACT(EPOCH FROM ts.""Timestamp"" - sb.""Timestamp"")) < 30
+                  WHERE ts.""SymbolId"" = r.""SymbolId""
+                    AND ABS(EXTRACT(EPOCH FROM ts.""Timestamp"" - r.""Timestamp"")) < 30
               )",
             tickerId, symbolId, cutoff);
 

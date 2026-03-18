@@ -127,6 +127,9 @@ public class TradingPilotBlazorModule : AbpModule
         // Paper trading executor (singleton — auto-executes trades from signals)
         context.Services.AddSingleton<PaperTradingExecutor>();
 
+        // Position monitor (singleton — continuous background exit evaluation, 5s timer)
+        context.Services.AddSingleton<PositionMonitor>();
+
         // MQTT message processor (singleton — processes real-time MQTT data into structured DB entities)
         context.Services.AddSingleton<MqttMessageProcessor>();
 
@@ -232,6 +235,12 @@ public class TradingPilotBlazorModule : AbpModule
             {
                 TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
             });
+
+        // Remove deprecated paper-position-sync job (PositionMonitor handles broker sync now)
+        recurringJobs.RemoveIfExists("paper-position-sync");
+
+        // Eagerly resolve PositionMonitor to start its timer
+        context.ServiceProvider.GetRequiredService<PositionMonitor>();
 
         // One-shot startup recovery (30s delay for auth capture)
         // Lightweight: takes L2 snapshot + backfills news only.
