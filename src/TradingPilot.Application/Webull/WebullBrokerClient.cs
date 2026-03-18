@@ -66,14 +66,17 @@ public class WebullBrokerClient : IBrokerClient
             NetLiquidation = account.NetLiquidation,
             UsableCash = account.UsableCash,
             DayPnl = dayPnl,
-            Positions = account.Positions.Select(p => new BrokerPosition
-            {
-                Symbol = ResolveSymbol(p.TickerId, p.Ticker),
-                Quantity = p.Quantity,
-                AvgPrice = p.CostPrice,
-                MarketValue = p.MarketValue,
-                UnrealizedPnl = p.UnrealizedPnl,
-            }).ToList(),
+            Positions = account.Positions
+                .Select(p => new BrokerPosition
+                {
+                    Symbol = ResolveSymbol(p.TickerId, p.Ticker),
+                    Quantity = p.Quantity,
+                    AvgPrice = p.CostPrice,
+                    MarketValue = p.MarketValue,
+                    UnrealizedPnl = p.UnrealizedPnl,
+                })
+                .Where(p => !p.Symbol.StartsWith("UNKNOWN_"))
+                .ToList(),
         };
     }
 
@@ -124,6 +127,7 @@ public class WebullBrokerClient : IBrokerClient
         await EnsureSymbolsLoadedAsync();
 
         var orders = await _client.GetOrdersAsync(_authHeaderJson, _accountId, pageSize);
+        if (orders == null) return [];
         return orders.Select(o => new BrokerOrder
         {
             OrderId = o.OrderId.ToString(),
@@ -160,7 +164,14 @@ public class WebullBrokerClient : IBrokerClient
     {
         if (_tickerIdToSymbol.TryGetValue(tickerId, out var symbol))
             return symbol;
-        return fallback ?? tickerId.ToString();
+
+        // Use the Webull-provided ticker name if available
+        if (!string.IsNullOrWhiteSpace(fallback) && !long.TryParse(fallback, out _))
+            return fallback;
+
+        // Last resort: log warning and return empty to signal unknown
+        _logger.LogWarning("Unknown tickerId {TickerId} with no symbol mapping", tickerId);
+        return $"UNKNOWN_{tickerId}";
     }
 
     /// <summary>
@@ -238,22 +249,52 @@ public class WebullBrokerClient : IBrokerClient
         {
             using var scope = _scopeFactory.CreateScope();
             var uowManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+            var mappingRepo = scope.ServiceProvider.GetRequiredService<IRepository<BrokerSymbolMapping, Guid>>();
             var symbolRepo = scope.ServiceProvider.GetRequiredService<IRepository<Symbol, string>>();
             var asyncExecuter = scope.ServiceProvider.GetRequiredService<IAsyncQueryableExecuter>();
 
             using var uow = uowManager.Begin();
-            var symbols = await asyncExecuter.ToListAsync(
-                (await symbolRepo.GetQueryableAsync()).Where(s => s.IsWatched && s.WebullTickerId > 0));
-            await uow.CompleteAsync();
 
-            foreach (var s in symbols)
+            // Load from BrokerSymbolMappings table first
+            var mappings = await asyncExecuter.ToListAsync(
+                (await mappingRepo.GetQueryableAsync()).Where(m => m.BrokerName == BrokerName));
+
+            if (mappings.Count > 0)
             {
-                _symbolToTickerId[s.Id] = s.WebullTickerId;
-                _tickerIdToSymbol[s.WebullTickerId] = s.Id;
+                foreach (var m in mappings)
+                {
+                    if (long.TryParse(m.BrokerSymbolId, out long tickerId))
+                    {
+                        _symbolToTickerId[m.SymbolId] = tickerId;
+                        _tickerIdToSymbol[tickerId] = m.SymbolId;
+                    }
+                }
+                _logger.LogInformation("WebullBrokerClient: loaded {Count} symbol mappings from BrokerSymbolMappings", mappings.Count);
+            }
+            else
+            {
+                // Fallback: migrate from legacy Symbol.WebullTickerId column
+                var symbols = await asyncExecuter.ToListAsync(
+                    (await symbolRepo.GetQueryableAsync()).Where(s => s.IsWatched && s.WebullTickerId > 0));
+
+                foreach (var s in symbols)
+                {
+                    _symbolToTickerId[s.Id] = s.WebullTickerId;
+                    _tickerIdToSymbol[s.WebullTickerId] = s.Id;
+
+                    // Auto-migrate: insert into BrokerSymbolMappings
+                    await mappingRepo.InsertAsync(new BrokerSymbolMapping
+                    {
+                        SymbolId = s.Id,
+                        BrokerName = BrokerName,
+                        BrokerSymbolId = s.WebullTickerId.ToString(),
+                    }, autoSave: false);
+                }
+                _logger.LogWarning("WebullBrokerClient: migrated {Count} symbol mappings from legacy WebullTickerId column", symbols.Count);
             }
 
+            await uow.CompleteAsync();
             _symbolsLoaded = true;
-            _logger.LogInformation("WebullBrokerClient: loaded {Count} symbol mappings", symbols.Count);
         }
         catch (Exception ex)
         {

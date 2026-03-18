@@ -189,5 +189,22 @@ public static class TradingPilotDbContextModelCreatingExtensions
 
         // TickSnapshots table removed — indicators now stored directly in TradingSignals
         // PaperTrades table removed — broker API is sole source of truth for orders/positions
+
+        builder.Entity<BrokerSymbolMapping>(b =>
+        {
+            b.ToTable(TradingPilotConsts.DbTablePrefix + "BrokerSymbolMappings", TradingPilotConsts.DbSchema);
+            b.HasKey(x => x.Id);
+            b.Property(x => x.SymbolId).IsRequired().HasMaxLength(20);
+            b.Property(x => x.BrokerName).IsRequired().HasMaxLength(50);
+            b.Property(x => x.BrokerSymbolId).IsRequired().HasMaxLength(50);
+
+            b.HasOne<Symbol>().WithMany().HasForeignKey(x => x.SymbolId).OnDelete(DeleteBehavior.Restrict);
+
+            b.HasIndex(x => new { x.SymbolId, x.BrokerName })
+                .IsUnique()
+                .HasDatabaseName("IX_BrokerSymbolMappings_Symbol_Broker");
+            b.HasIndex(x => new { x.BrokerName, x.BrokerSymbolId })
+                .HasDatabaseName("IX_BrokerSymbolMappings_Broker_BrokerId");
+        });
     }
 }

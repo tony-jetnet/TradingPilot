@@ -237,10 +237,13 @@ public class PaperTradingExecutor
                 TimeInForce = "DAY",
             });
 
-            if (result.Success)
+            if (result.Success && result.OrderId != null)
             {
                 _lastTradeTime[signal.Ticker] = DateTime.UtcNow;
-                _pendingEntries.TryAdd(signal.Ticker, new PendingOrder
+                // Invalidate cached account so next signal sees fresh state
+                _cachedAccount = null;
+
+                var pending = new PendingOrder
                 {
                     Symbol = signal.Ticker,
                     TickerId = signal.TickerId,
@@ -259,7 +262,17 @@ public class PaperTradingExecutor
                     RuleConfidence = ruleConfidence,
                     HoldSeconds = entryHoldSeconds,
                     StopLoss = entryStopLoss,
-                });
+                };
+
+                // Atomic add — if another thread already added, skip (prevents duplicate)
+                if (!_pendingEntries.TryAdd(signal.Ticker, pending))
+                {
+                    _logger.LogWarning("ENTRY ORDER PLACED but duplicate detected, cancelling: {Symbol} OrderId={OrderId}",
+                        signal.Ticker, result.OrderId);
+                    await _broker.CancelOrderAsync(result.OrderId);
+                    return;
+                }
+
                 _logger.LogWarning("ENTRY ORDER PLACED: {Action} {Qty} {Symbol} @ ~{Price} | score={Score:F3} | OrderId={OrderId}",
                     action, qty, signal.Ticker, signal.Price, score, result.OrderId);
             }
@@ -301,10 +314,9 @@ public class PaperTradingExecutor
             TimeInForce = "DAY",
         });
 
-        if (result.Success)
+        if (result.Success && result.OrderId != null)
         {
-            pos.PendingExitOrderId = result.OrderId;
-            _pendingExits.TryAdd(symbol, new PendingOrder
+            var pendingExit = new PendingOrder
             {
                 Symbol = symbol,
                 TickerId = pos.TickerId,
@@ -314,7 +326,21 @@ public class PaperTradingExecutor
                 LimitPrice = limitPrice,
                 PlacedAt = DateTime.UtcNow,
                 Purpose = OrderPurpose.Exit,
-            });
+            };
+
+            // Atomic add — if another thread already placed an exit, cancel this one
+            if (!_pendingExits.TryAdd(symbol, pendingExit))
+            {
+                _logger.LogDebug("EXIT ORDER already pending for {Symbol}, cancelling duplicate OrderId={OrderId}",
+                    symbol, result.OrderId);
+                await _broker.CancelOrderAsync(result.OrderId);
+                return;
+            }
+
+            // Update position reference (may be stale if sync removed it, but that's OK)
+            if (_positions.TryGetValue(symbol, out var currentPos))
+                currentPos.PendingExitOrderId = result.OrderId;
+
             _logger.LogWarning("EXIT ORDER PLACED: {Action} {Qty} {Symbol} @ ~{Price} | {Reason} | score={Score:F3} | OrderId={OrderId}",
                 action, qty, symbol, currentPrice, reason, score, result.OrderId);
         }
@@ -370,6 +396,7 @@ public class PaperTradingExecutor
                     };
                     _positions[symbol] = pos;
                     _pendingEntries.TryRemove(symbol, out _);
+                    _cachedAccount = null; // Invalidate so next signal check sees fresh state
                     _logger.LogWarning("ENTRY CONFIRMED: {Action} {Qty} {Symbol} @ {FilledPrice} | OrderId={OrderId}",
                         pending.Action, pending.Quantity, symbol, order.FilledPrice, pending.OrderId);
                 }
@@ -417,6 +444,7 @@ public class PaperTradingExecutor
                     }
                     _positions.TryRemove(symbol, out _);
                     _pendingExits.TryRemove(symbol, out _);
+                    _cachedAccount = null; // Invalidate cache
                 }
                 else if (order.Status is "Cancelled" or "Rejected" or "Expired")
                 {
@@ -464,7 +492,11 @@ public class PaperTradingExecutor
             // Adopt positions at broker but not locally tracked
             foreach (var (symbol, brokerPos) in brokerSymbols)
             {
-                if (!_positions.ContainsKey(symbol) && !_pendingEntries.ContainsKey(symbol))
+                // If we have a pending entry for this symbol and broker already has it, the entry filled
+                if (_pendingEntries.ContainsKey(symbol))
+                    _pendingEntries.TryRemove(symbol, out _);
+
+                if (!_positions.ContainsKey(symbol))
                 {
                     _positions[symbol] = new PositionState
                     {
