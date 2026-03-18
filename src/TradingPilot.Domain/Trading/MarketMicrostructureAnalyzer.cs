@@ -229,7 +229,10 @@ public class MarketMicrostructureAnalyzer
                 LoadStrategyConfig();
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to check/reload strategy config from {Path}", StrategyConfigPath);
+        }
     }
 
     private void WatchStrategyConfig()
@@ -604,81 +607,92 @@ public class MarketMicrostructureAnalyzer
         var tickerConfig = _modelConfig?.Tickers.GetValueOrDefault(tickerId);
         int etHour = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, EasternTimeZone).Hour;
 
-        // Compute all 10 indicator scores
-        decimal obiScore = ComputeSmoothedObi(state);
-        decimal wobiScore = ComputeWeightedObi(snapshot);
-        decimal pressureRocScore = ComputePressureRoc(state);
-        decimal spreadScore = ComputeSpreadSignal(state, snapshot);
-        decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
-        decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
-
-        var barIndicators = _barCache.GetIndicators(tickerId);
-        decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
-        decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
-        decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
-        decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
-
-        // Composite score with learned or default weights
         decimal compositeScore;
-        if (tickerConfig != null)
+        var barIndicators = _barCache.GetIndicators(tickerId);
+
+        // Try Swin model first — must match AnalyzeSnapshot entry logic
+        var swinSnapshots = _l2Cache.GetSnapshots(tickerId, 300);
+        var swinPrediction = _swinPredictor.Predict(swinSnapshots);
+
+        if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
         {
-            compositeScore =
-                obiScore * tickerConfig.WeightObi +
-                wobiScore * tickerConfig.WeightWobi +
-                pressureRocScore * tickerConfig.WeightPressureRoc +
-                spreadScore * tickerConfig.WeightSpread +
-                largeOrderScore * tickerConfig.WeightLargeOrder +
-                tickMomentumScore * tickerConfig.WeightTickMomentum +
-                trendAlignmentScore * tickerConfig.WeightTrend +
-                vwapPositionScore * tickerConfig.WeightVwap +
-                volumeConfirmationScore * tickerConfig.WeightVolume +
-                rsiFilterScore * tickerConfig.WeightRsi;
+            // Use Swin model output directly (no contextual filters — model learned them)
+            compositeScore = (decimal)swinPrediction.Score;
         }
         else
         {
-            compositeScore =
-                obiScore * WeightObi +
-                wobiScore * WeightWobi +
-                pressureRocScore * WeightPressureRoc +
-                spreadScore * WeightSpread +
-                largeOrderScore * WeightLargeOrder +
-                tickMomentumScore * WeightTickMomentum +
-                trendAlignmentScore * WeightTrendAlignment +
-                vwapPositionScore * WeightVwapPosition +
-                volumeConfirmationScore * WeightVolumeConfirmation +
-                rsiFilterScore * WeightRsiFilter;
-        }
+            // Fallback to weighted scoring
+            decimal obiScore = ComputeSmoothedObi(state);
+            decimal wobiScore = ComputeWeightedObi(snapshot);
+            decimal pressureRocScore = ComputePressureRoc(state);
+            decimal spreadScore = ComputeSpreadSignal(state, snapshot);
+            decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
+            decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
+            decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
+            decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
+            decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
+            decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
 
-        // Apply contextual filters (same as AnalyzeSnapshot)
-        if (barIndicators != null)
-        {
-            decimal preFilterScore = compositeScore;
-
-            if (barIndicators.TrendDirection == -1 && compositeScore > 0)
-                compositeScore *= 0.5m;
-            else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
-                compositeScore *= 0.5m;
-
-            if (!barIndicators.AboveVwap && compositeScore > 0)
-                compositeScore *= 0.7m;
-            else if (barIndicators.AboveVwap && compositeScore < 0)
-                compositeScore *= 0.7m;
-
-            if (barIndicators.HighVolume)
-                compositeScore *= 1.3m;
-
-            if (barIndicators.OverboughtRsi && compositeScore > 0)
-                compositeScore *= 0.5m;
-            else if (barIndicators.OversoldRsi && compositeScore < 0)
-                compositeScore *= 0.5m;
-
-            if (preFilterScore != 0)
+            if (tickerConfig != null)
             {
-                decimal minAllowed = preFilterScore * 0.50m;
-                if (preFilterScore > 0 && compositeScore < minAllowed)
-                    compositeScore = minAllowed;
-                else if (preFilterScore < 0 && compositeScore > minAllowed)
-                    compositeScore = minAllowed;
+                compositeScore =
+                    obiScore * tickerConfig.WeightObi +
+                    wobiScore * tickerConfig.WeightWobi +
+                    pressureRocScore * tickerConfig.WeightPressureRoc +
+                    spreadScore * tickerConfig.WeightSpread +
+                    largeOrderScore * tickerConfig.WeightLargeOrder +
+                    tickMomentumScore * tickerConfig.WeightTickMomentum +
+                    trendAlignmentScore * tickerConfig.WeightTrend +
+                    vwapPositionScore * tickerConfig.WeightVwap +
+                    volumeConfirmationScore * tickerConfig.WeightVolume +
+                    rsiFilterScore * tickerConfig.WeightRsi;
+            }
+            else
+            {
+                compositeScore =
+                    obiScore * WeightObi +
+                    wobiScore * WeightWobi +
+                    pressureRocScore * WeightPressureRoc +
+                    spreadScore * WeightSpread +
+                    largeOrderScore * WeightLargeOrder +
+                    tickMomentumScore * WeightTickMomentum +
+                    trendAlignmentScore * WeightTrendAlignment +
+                    vwapPositionScore * WeightVwapPosition +
+                    volumeConfirmationScore * WeightVolumeConfirmation +
+                    rsiFilterScore * WeightRsiFilter;
+            }
+
+            // Apply contextual filters (only for weighted scoring — Swin already learned these)
+            if (barIndicators != null)
+            {
+                decimal preFilterScore = compositeScore;
+
+                if (barIndicators.TrendDirection == -1 && compositeScore > 0)
+                    compositeScore *= 0.5m;
+                else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
+                    compositeScore *= 0.5m;
+
+                if (!barIndicators.AboveVwap && compositeScore > 0)
+                    compositeScore *= 0.7m;
+                else if (barIndicators.AboveVwap && compositeScore < 0)
+                    compositeScore *= 0.7m;
+
+                if (barIndicators.HighVolume)
+                    compositeScore *= 1.3m;
+
+                if (barIndicators.OverboughtRsi && compositeScore > 0)
+                    compositeScore *= 0.5m;
+                else if (barIndicators.OversoldRsi && compositeScore < 0)
+                    compositeScore *= 0.5m;
+
+                if (preFilterScore != 0)
+                {
+                    decimal minAllowed = preFilterScore * 0.50m;
+                    if (preFilterScore > 0 && compositeScore < minAllowed)
+                        compositeScore = minAllowed;
+                    else if (preFilterScore < 0 && compositeScore > minAllowed)
+                        compositeScore = minAllowed;
+                }
             }
         }
 

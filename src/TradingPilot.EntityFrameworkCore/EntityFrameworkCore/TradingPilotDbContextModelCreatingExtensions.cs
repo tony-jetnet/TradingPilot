@@ -188,30 +188,6 @@ public static class TradingPilotDbContextModelCreatingExtensions
         });
 
         // TickSnapshots table removed — indicators now stored directly in TradingSignals
-
-        builder.Entity<PaperTrade>(b =>
-        {
-            b.ToTable(TradingPilotConsts.DbTablePrefix + "PaperTrades", TradingPilotConsts.DbSchema);
-            b.HasKey(x => x.Id);
-            b.Property(x => x.SymbolId).IsRequired();
-            b.Property(x => x.TickerId).IsRequired();
-            b.Property(x => x.Timestamp).IsRequired();
-            b.Property(x => x.Action).IsRequired().HasMaxLength(10);
-            b.Property(x => x.Quantity).IsRequired();
-            b.Property(x => x.SignalPrice).HasPrecision(12, 4);
-            b.Property(x => x.FilledPrice).HasPrecision(12, 4);
-            b.Property(x => x.Score).HasPrecision(8, 6);
-            b.Property(x => x.Reason).HasMaxLength(500);
-            b.Property(x => x.OrderStatus).HasMaxLength(100);
-
-            b.HasOne<Symbol>().WithMany().HasForeignKey(x => x.SymbolId).OnDelete(DeleteBehavior.Restrict);
-
-            b.HasIndex(x => new { x.SymbolId, x.Timestamp })
-                .HasDatabaseName("IX_PaperTrades_SymbolId_Timestamp");
-            b.HasIndex(x => x.Timestamp)
-                .HasDatabaseName("IX_PaperTrades_Timestamp");
-            b.HasIndex(x => x.WebullOrderId)
-                .HasDatabaseName("IX_PaperTrades_WebullOrderId");
-        });
+        // PaperTrades table removed — broker API is sole source of truth for orders/positions
     }
 }

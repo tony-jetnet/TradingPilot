@@ -15,6 +15,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
     private readonly L2BookCache _l2Cache;
     private readonly StrategyRuleEvaluator _ruleEvaluator;
     private readonly MqttMessageProcessor _mqttProcessor;
+    private readonly IBrokerClient _broker;
     private readonly IServiceScopeFactory _scopeFactory;
 
     public DashboardAppService(
@@ -24,6 +25,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
         L2BookCache l2Cache,
         StrategyRuleEvaluator ruleEvaluator,
         MqttMessageProcessor mqttProcessor,
+        IBrokerClient broker,
         IServiceScopeFactory scopeFactory)
     {
         _signalStore = signalStore;
@@ -32,6 +34,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
         _l2Cache = l2Cache;
         _ruleEvaluator = ruleEvaluator;
         _mqttProcessor = mqttProcessor;
+        _broker = broker;
         _scopeFactory = scopeFactory;
     }
 
@@ -84,29 +87,33 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 SignalCount = recentSignals.Count,
                 LastSignalType = latestSignal?.Type.ToString(),
                 LastSignalScore = latestSignal?.Indicators.GetValueOrDefault("CompositeScore") ?? 0,
-                CurrentPosition = 0, // filled below from trades
+                CurrentPosition = 0, // filled below from broker
                 LastUpdate = tickData?.LastQuoteTime ?? DateTime.MinValue,
             });
         }
 
-        // Recent trades (today)
-        var today = DateTime.UtcNow.Date;
-        var trades = await dbContext.PaperTrades
-            .Where(t => t.Timestamp >= today)
-            .OrderByDescending(t => t.Timestamp)
-            .Take(50)
-            .ToListAsync();
+        // Recent trades from broker (filled orders today)
+        var eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+        var todayEt = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eastern).Date;
 
-        dto.RecentTrades = trades.Select(t => new TradeDto
+        var allOrders = await _broker.GetOrdersAsync(200);
+        var todayFilled = allOrders
+            .Where(o => o.Status == "Filled" && o.FilledTime.HasValue)
+            .Where(o => TimeZoneInfo.ConvertTimeFromUtc(o.FilledTime!.Value, eastern).Date == todayEt)
+            .OrderByDescending(o => o.FilledTime)
+            .Take(50)
+            .ToList();
+
+        dto.RecentTrades = todayFilled.Select(o => new TradeDto
         {
-            Ticker = t.SymbolId,
-            Timestamp = t.Timestamp,
-            Action = t.Action,
-            Quantity = t.Quantity,
-            Price = t.SignalPrice,
-            Score = t.Score,
-            Reason = t.Reason,
-            Status = t.OrderStatus,
+            Ticker = o.Symbol,
+            Timestamp = o.FilledTime ?? DateTime.UtcNow,
+            Action = o.Action,
+            Quantity = o.Quantity,
+            Price = o.FilledPrice ?? o.LimitPrice ?? 0,
+            Score = 0,
+            Reason = o.Status,
+            Status = o.Status,
         }).ToList();
 
         // Recent signals from all tickers (from in-memory store)
@@ -129,8 +136,8 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 Reason = s.Reason,
             }).ToList();
 
-        // P&L summary — compute from paired entry/exit trades
-        await ComputePnlSummaryAsync(dbContext, dto);
+        // P&L summary from broker
+        await ComputePnlSummaryAsync(dto, todayFilled);
 
         // Strategy status
         var config = _ruleEvaluator.CurrentConfig;
@@ -164,13 +171,12 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
         // Streaming health
         dto.StreamingHealth = _mqttProcessor.GetHealthMetrics();
 
-        // Per-symbol health: L2 age, quote age, tick snapshot age
+        // Per-symbol health: L2 age, quote age
         var now = DateTime.UtcNow;
         foreach (var symbol in symbols)
         {
             var l2Latest = _l2Cache.GetLatest(symbol.WebullTickerId);
             var tickData = _tickCache.GetData(symbol.WebullTickerId);
-            var barData = _barCache.GetIndicators(symbol.WebullTickerId);
 
             double l2AgeSec = l2Latest != null ? (now - l2Latest.Timestamp).TotalSeconds : -1;
             double quoteAgeSec = tickData != null && tickData.LastQuoteTime != default
@@ -178,7 +184,6 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
             double tickSnapAgeSec = dto.StreamingHealth.TickerStalenessSeconds
                 .GetValueOrDefault(symbol.WebullTickerId, -1);
 
-            // Status: Live (<10s), Stale (10-60s), Delayed (60-300s), Offline (>300s or no data)
             string status;
             if (l2AgeSec < 0 && quoteAgeSec < 0)
                 status = "Offline";
@@ -199,7 +204,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 Ticker = symbol.Id,
                 L2AgeSec = Math.Round(l2AgeSec, 1),
                 QuoteAgeSec = Math.Round(quoteAgeSec, 1),
-                TickSnapshotAgeSec = 0, // Deprecated — TickSnapshots table removed
+                TickSnapshotAgeSec = 0,
                 Status = status,
             });
         }
@@ -207,50 +212,39 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
         return dto;
     }
 
-    private async Task ComputePnlSummaryAsync(TradingPilotDbContext dbContext, DashboardDto dto)
+    private async Task ComputePnlSummaryAsync(DashboardDto dto, List<BrokerOrder> todayFilled)
     {
-        var allTrades = await dbContext.PaperTrades
-            .OrderBy(t => t.Timestamp)
-            .ToListAsync();
-
-        if (allTrades.Count == 0) return;
-
-        // Pair trades: entry (BUY with no prior position) → exit (SELL)
-        var pnls = new List<decimal>();
-        var positions = new Dictionary<string, (string Action, decimal Price, int Qty)>();
-        decimal commissionPerTrade = 2.99m;
-        var today = DateTime.UtcNow.Date;
-        var todayPnls = new List<decimal>();
-
-        foreach (var trade in allTrades)
+        // Get account info for current positions
+        var account = await _broker.GetAccountAsync();
+        if (account != null)
         {
-            if (positions.TryGetValue(trade.SymbolId, out var pos))
+            foreach (var pos in account.Positions)
             {
-                // This is an exit trade
-                decimal pnl;
-                if (pos.Action == "BUY")
-                    pnl = (trade.SignalPrice - pos.Price) * pos.Qty;
-                else
-                    pnl = (pos.Price - trade.SignalPrice) * pos.Qty;
-
-                pnl -= commissionPerTrade * 2; // entry + exit commission
-                pnls.Add(pnl);
-                if (trade.Timestamp >= today) todayPnls.Add(pnl);
-                positions.Remove(trade.SymbolId);
-            }
-            else
-            {
-                // This is an entry trade
-                positions[trade.SymbolId] = (trade.Action, trade.SignalPrice, trade.Quantity);
+                var symbolDto = dto.Symbols.FirstOrDefault(s => s.Ticker == pos.Symbol);
+                if (symbolDto != null)
+                    symbolDto.CurrentPosition = pos.Quantity;
             }
         }
 
-        // Update current positions on symbols
-        foreach (var (symbolId, pos) in positions)
+        // Pair filled orders: first per symbol = entry, next = exit
+        var pnls = new List<decimal>();
+        var openPositions = new Dictionary<string, (string Action, decimal Price, int Qty)>();
+
+        var orderedFilled = todayFilled.OrderBy(o => o.FilledTime).ToList();
+        foreach (var order in orderedFilled)
         {
-            var symbolDto = dto.Symbols.FirstOrDefault(s => s.Ticker == symbolId);
-            if (symbolDto != null)
-                symbolDto.CurrentPosition = pos.Action == "BUY" ? pos.Qty : -pos.Qty;
+            if (openPositions.TryGetValue(order.Symbol, out var entry))
+            {
+                decimal pnl = entry.Action == "BUY"
+                    ? (order.FilledPrice!.Value - entry.Price) * entry.Qty
+                    : (entry.Price - order.FilledPrice!.Value) * entry.Qty;
+                pnls.Add(pnl);
+                openPositions.Remove(order.Symbol);
+            }
+            else
+            {
+                openPositions[order.Symbol] = (order.Action, order.FilledPrice ?? 0, order.Quantity);
+            }
         }
 
         var wins = pnls.Where(p => p > 0).ToList();
@@ -262,15 +256,15 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
             WinningTrades = wins.Count,
             LosingTrades = losses.Count,
             TotalPnl = pnls.Sum(),
-            TotalCommissions = allTrades.Count * commissionPerTrade,
+            TotalCommissions = 0,
             NetPnl = pnls.Sum(),
             WinRate = pnls.Count > 0 ? (decimal)wins.Count / pnls.Count * 100 : 0,
             AvgWin = wins.Count > 0 ? wins.Average() : 0,
             AvgLoss = losses.Count > 0 ? losses.Average() : 0,
             BestTrade = pnls.Count > 0 ? pnls.Max() : 0,
             WorstTrade = pnls.Count > 0 ? pnls.Min() : 0,
-            TodayTrades = todayPnls.Count,
-            TodayPnl = todayPnls.Sum(),
+            TodayTrades = pnls.Count,
+            TodayPnl = account?.DayPnl ?? pnls.Sum(),
         };
     }
 }

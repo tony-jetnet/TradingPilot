@@ -127,7 +127,11 @@ public class TradingPilotBlazorModule : AbpModule
         // Paper trading client (typed HttpClient — no base address since we use full URLs)
         context.Services.AddHttpClient<WebullPaperTradingClient>();
 
-        // Paper trading executor (singleton — auto-executes trades from signals)
+        // Broker client abstraction (singleton — swap between Webull paper / Questrade live via config)
+        context.Services.AddSingleton<WebullBrokerClient>();
+        context.Services.AddSingleton<IBrokerClient>(sp => sp.GetRequiredService<WebullBrokerClient>());
+
+        // Trading executor (singleton — auto-executes trades from signals via IBrokerClient)
         context.Services.AddSingleton<PaperTradingExecutor>();
 
         // Position monitor (singleton — continuous background exit evaluation, 5s timer)
@@ -185,16 +189,16 @@ public class TradingPilotBlazorModule : AbpModule
         var jobClient = context.ServiceProvider.GetRequiredService<IBackgroundJobClient>();
         var recurringJobs = context.ServiceProvider.GetRequiredService<IRecurringJobManager>();
 
-        // Schedule historical bars load (staggered, 30s delay for auth capture)
+        // Schedule startup bar load — only m1 (used by BarIndicatorService for EMA/RSI/VWAP)
         string[] tickers = ["AMD", "RKLB", "NVDA", "TSLA", "PLTR", "SOFI", "SMCI", "RIVN", "SMR", "LLY"];
-        string[] timeframes = ["d", "m1", "m5", "m15", "m30", "h1"];
+        string[] startupTimeframes = ["m1"];
         for (int i = 0; i < tickers.Length; i++)
         {
             var ticker = tickers[i];
-            var tf = timeframes;
+            var tf = startupTimeframes;
             jobClient.Schedule<LoadHistoricalBarsJob>(
                 job => job.ExecuteAsync(ticker, tf),
-                TimeSpan.FromSeconds(30 + i * 15)); // stagger by 15s
+                TimeSpan.FromSeconds(30 + i * 5)); // stagger by 5s
         }
 
         // Remove deprecated L2 polling job (MQTT streaming handles this)

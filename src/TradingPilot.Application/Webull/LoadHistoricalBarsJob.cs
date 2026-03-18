@@ -152,7 +152,7 @@ public class LoadHistoricalBarsJob
                 _ => throw new ArgumentException($"Unknown timeframe: {tf}")
             };
 
-            // 1 API call per bar due to pagination; keep counts practical
+            // Keep counts minimal — BarIndicatorService only needs last 30 m1 bars
             int count = tf switch
             {
                 "d" => 30,    // ~30 trading days = 6 weeks
@@ -160,7 +160,7 @@ public class LoadHistoricalBarsJob
                 "m30" => 50,  // ~4 trading days
                 "m15" => 100, // ~4 trading days
                 "m5" => 200,  // ~2.5 trading days
-                "m1" => 400,  // ~1 trading day
+                "m1" => 50,   // ~50 minutes (covers 30-bar indicator window)
                 _ => 100,
             };
             _logger.LogInformation("Fetching {Timeframe} bars for {Ticker} (count={Count})...", tf, symbol.Id, count);

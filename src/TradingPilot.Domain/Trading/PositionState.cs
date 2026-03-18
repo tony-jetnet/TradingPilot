@@ -3,12 +3,12 @@ namespace TradingPilot.Trading;
 /// <summary>
 /// Consolidated state for an open position, tracked by PaperTradingExecutor
 /// and monitored by PositionMonitor for continuous exit evaluation.
+/// Keyed by Symbol (ticker name) in the positions dictionary.
 /// </summary>
 public class PositionState
 {
-    public long TickerId { get; set; }
-    public string Ticker { get; set; } = "";
-    public string? SymbolId { get; set; }
+    public string Symbol { get; set; } = "";
+    public long TickerId { get; set; } // Webull-specific, kept for signal correlation with L2/tick caches
     public int Shares { get; set; }
     public decimal EntryPrice { get; set; }
     public DateTime EntryTime { get; set; }
@@ -24,6 +24,9 @@ public class PositionState
     public decimal StopLoss { get; set; }
     public decimal EntrySpread { get; set; }
     public decimal PeakFavorablePrice { get; set; }
+
+    /// <summary>Tracks in-flight exit order. Null = no pending exit.</summary>
+    public string? PendingExitOrderId { get; set; }
 
     public bool IsLong => Shares > 0;
 }

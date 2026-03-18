@@ -1,14 +1,13 @@
 using Microsoft.Extensions.Logging;
 using TradingPilot.Symbols;
 using TradingPilot.Trading;
-using TradingPilot.Webull;
 
 namespace TradingPilot.Trading;
 
 /// <summary>
 /// Background monitor that continuously re-evaluates open positions every 5 seconds.
 /// Handles all exit logic except strong opposing signals (which PaperTradingExecutor handles event-driven).
-/// Also syncs position state with broker every ~30 seconds.
+/// Also verifies pending orders and syncs position state with broker.
 /// </summary>
 public class PositionMonitor : IDisposable
 {
@@ -23,6 +22,7 @@ public class PositionMonitor : IDisposable
     private int _tickCount;
     private int _evaluating; // Re-entrancy guard (0 = idle, 1 = running)
     private bool _disposed;
+    private bool _initialized;
 
     // Hard cap: never hold longer than 3x the configured hold time
     private const int MaxHoldMultiplier = 3;
@@ -62,6 +62,32 @@ public class PositionMonitor : IDisposable
         try
         {
             _tickCount++;
+
+            // First tick: initialize positions from broker
+            if (!_initialized)
+            {
+                try
+                {
+                    await _executor.InitializeFromBrokerAsync();
+                    _initialized = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "PositionMonitor: broker initialization failed, will retry");
+                }
+            }
+
+            // Verify pending orders every tick (5s)
+            try
+            {
+                await _executor.VerifyPendingOrdersAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "PositionMonitor: pending order verification failed");
+            }
+
+            // Evaluate open positions
             var positions = _executor.GetOpenPositions();
 
             if (positions.Count > 0)
@@ -69,15 +95,19 @@ public class PositionMonitor : IDisposable
                 _logger.LogDebug("PositionMonitor: checking {Count} positions", positions.Count);
             }
 
-            foreach (var (tickerId, pos) in positions)
+            foreach (var (symbol, pos) in positions)
             {
                 try
                 {
-                    await EvaluatePositionAsync(tickerId, pos);
+                    // Skip if exit order already in flight
+                    if (_executor.HasPendingExit(symbol))
+                        continue;
+
+                    await EvaluatePositionAsync(symbol, pos);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "PositionMonitor: error evaluating position for {Ticker}", pos.Ticker);
+                    _logger.LogError(ex, "PositionMonitor: error evaluating position for {Symbol}", symbol);
                 }
             }
 
@@ -86,7 +116,7 @@ public class PositionMonitor : IDisposable
             {
                 try
                 {
-                    await _executor.SyncPositionsFromBrokerAsync();
+                    await _executor.SyncWithBrokerAsync();
                 }
                 catch (Exception ex)
                 {
@@ -104,14 +134,14 @@ public class PositionMonitor : IDisposable
         }
     }
 
-    private async Task EvaluatePositionAsync(long tickerId, PositionState pos)
+    private async Task EvaluatePositionAsync(string symbol, PositionState pos)
     {
-        // Get current price from latest L2 snapshot
-        var snapshots = _l2Cache.GetSnapshots(tickerId, 1);
+        // Get current price from latest L2 snapshot (uses tickerId for cache lookup)
+        var snapshots = _l2Cache.GetSnapshots(pos.TickerId, 1);
         if (snapshots.Count == 0) return;
 
         decimal currentPrice = snapshots[^1].MidPrice;
-        decimal currentScore = _analyzer.ComputeCurrentScore(tickerId);
+        decimal currentScore = _analyzer.ComputeCurrentScore(pos.TickerId);
 
         // Update peak favorable score
         if (pos.IsLong && currentScore > pos.PeakFavorableScore)
@@ -135,10 +165,10 @@ public class PositionMonitor : IDisposable
                             (!pos.IsLong && currentScore > 0 && pos.EntryScore < 0);
         if (scoreFlipped)
         {
-            await _executor.ExitPositionAsync(tickerId, currentPrice,
+            await _executor.ExitPositionAsync(symbol, currentPrice,
                 $"SCORE FLIP entry={pos.EntryScore:F3} now={currentScore:F3} elapsed={elapsed:F0}s", currentScore);
-            _logger.LogWarning("PositionMonitor: {Ticker} EXIT SCORE FLIP entry={Entry:F3} now={Now:F3}",
-                pos.Ticker, pos.EntryScore, currentScore);
+            _logger.LogWarning("PositionMonitor: {Symbol} EXIT SCORE FLIP entry={Entry:F3} now={Now:F3}",
+                symbol, pos.EntryScore, currentScore);
             return;
         }
 
@@ -159,10 +189,10 @@ public class PositionMonitor : IDisposable
 
             if (peakAbs > 0.05m && decayFromPeak > tolerance) // Ignore tiny peaks (noise)
             {
-                await _executor.ExitPositionAsync(tickerId, currentPrice,
+                await _executor.ExitPositionAsync(symbol, currentPrice,
                     $"SCORE DECAY peak={pos.PeakFavorableScore:F3} now={currentScore:F3} decay={decayFromPeak:P0} tol={tolerance:P0} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Ticker} EXIT SCORE DECAY peak={Peak:F3} now={Now:F3} decay={Decay:P0}",
-                    pos.Ticker, pos.PeakFavorableScore, currentScore, decayFromPeak);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT SCORE DECAY peak={Peak:F3} now={Now:F3} decay={Decay:P0}",
+                    symbol, pos.PeakFavorableScore, currentScore, decayFromPeak);
                 return;
             }
         }
@@ -170,7 +200,7 @@ public class PositionMonitor : IDisposable
         // ═══════════════════════════════════════════════════════════
         // CHECK 3: Microstructure collapse — spread at 90th percentile + imbalance reversed
         // ═══════════════════════════════════════════════════════════
-        var tickData = _tickCache.GetData(tickerId);
+        var tickData = _tickCache.GetData(pos.TickerId);
         if (tickData != null)
         {
             bool spreadWide = tickData.SpreadPercentile >= 0.90m;
@@ -180,9 +210,9 @@ public class PositionMonitor : IDisposable
 
             if (spreadWide && imbalanceReversed)
             {
-                await _executor.ExitPositionAsync(tickerId, currentPrice,
+                await _executor.ExitPositionAsync(symbol, currentPrice,
                     $"MICROSTRUCTURE COLLAPSE spread_pctl={tickData.SpreadPercentile:F2} obi_entry={pos.EntryImbalance:F3} obi_now={tickData.BookDepthRatio:F3} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Ticker} EXIT MICROSTRUCTURE COLLAPSE", pos.Ticker);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT MICROSTRUCTURE COLLAPSE", symbol);
                 return;
             }
         }
@@ -199,10 +229,10 @@ public class PositionMonitor : IDisposable
 
         if (adverse > effectiveStopLoss)
         {
-            await _executor.ExitPositionAsync(tickerId, currentPrice,
+            await _executor.ExitPositionAsync(symbol, currentPrice,
                 $"STOP LOSS adverse={adverse:F2} stop={effectiveStopLoss:F2} elapsed={elapsed:F0}s", currentScore);
-            _logger.LogWarning("PositionMonitor: {Ticker} EXIT STOP LOSS adverse={Adverse:F2} stop={Stop:F2}",
-                pos.Ticker, adverse, effectiveStopLoss);
+            _logger.LogWarning("PositionMonitor: {Symbol} EXIT STOP LOSS adverse={Adverse:F2} stop={Stop:F2}",
+                symbol, adverse, effectiveStopLoss);
             return;
         }
 
@@ -229,10 +259,10 @@ public class PositionMonitor : IDisposable
 
             if (pullback > peakProfit * maxGiveBack)
             {
-                await _executor.ExitPositionAsync(tickerId, currentPrice,
+                await _executor.ExitPositionAsync(symbol, currentPrice,
                     $"TRAILING STOP peak_profit={peakProfit:F2} now={currentProfit:F2} pullback={pullback:F2} max_giveback={maxGiveBack:P0} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Ticker} EXIT TRAILING STOP peak={PeakProfit:F2} now={CurrentProfit:F2}",
-                    pos.Ticker, peakProfit, currentProfit);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT TRAILING STOP peak={PeakProfit:F2} now={CurrentProfit:F2}",
+                    symbol, peakProfit, currentProfit);
                 return;
             }
         }
@@ -247,9 +277,9 @@ public class PositionMonitor : IDisposable
             // Hard cap: never hold beyond 3x the configured hold time
             if (elapsed >= pos.HoldSeconds * MaxHoldMultiplier)
             {
-                await _executor.ExitPositionAsync(tickerId, currentPrice,
+                await _executor.ExitPositionAsync(symbol, currentPrice,
                     $"TIME CAP {elapsed:F0}s (max={pos.HoldSeconds * MaxHoldMultiplier}s) score={currentScore:F3}", currentScore);
-                _logger.LogWarning("PositionMonitor: {Ticker} EXIT TIME CAP {Elapsed:F0}s", pos.Ticker, elapsed);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT TIME CAP {Elapsed:F0}s", symbol, elapsed);
                 return;
             }
 
@@ -260,15 +290,15 @@ public class PositionMonitor : IDisposable
 
             if (scoreWeakening)
             {
-                await _executor.ExitPositionAsync(tickerId, currentPrice,
+                await _executor.ExitPositionAsync(symbol, currentPrice,
                     $"TIME+WEAK {elapsed:F0}s score={currentScore:F3} (entry={pos.EntryScore:F3})", currentScore);
-                _logger.LogWarning("PositionMonitor: {Ticker} EXIT TIME+WEAK {Elapsed:F0}s score={Score:F3}",
-                    pos.Ticker, elapsed, currentScore);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT TIME+WEAK {Elapsed:F0}s score={Score:F3}",
+                    symbol, elapsed, currentScore);
                 return;
             }
 
-            _logger.LogDebug("PositionMonitor: {Ticker} past hold time ({Elapsed:F0}s/{Hold}s) but score strong ({Score:F3}), holding",
-                pos.Ticker, elapsed, pos.HoldSeconds, currentScore);
+            _logger.LogDebug("PositionMonitor: {Symbol} past hold time ({Elapsed:F0}s/{Hold}s) but score strong ({Score:F3}), holding",
+                symbol, elapsed, pos.HoldSeconds, currentScore);
         }
     }
 
