@@ -77,7 +77,7 @@ public class StrategyRuleEvaluator
     public static bool IsRuleTradeworthy(StrategyRule rule)
     {
         if (rule.Confidence < 0.55m) return false;
-        if (rule.ExpectedPnlPer100Shares < 0) return false;
+        if (rule.ExpectedPnlPer100Shares <= 0) return false;
         if (rule.SampleSize < 30) return false;
         return true;
     }

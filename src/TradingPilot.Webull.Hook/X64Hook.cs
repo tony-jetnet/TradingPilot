@@ -141,8 +141,6 @@ internal static unsafe class X64Hook
         // and relative branches (Jcc, JMP, CALL)
 
         int i = 0;
-        bool hasRex = false;
-        byte rex = 0;
 
         // Skip prefixes
         while (i < len)
@@ -156,8 +154,6 @@ internal static unsafe class X64Hook
             }
             if ((b & 0xF0) == 0x40) // REX prefix
             {
-                hasRex = true;
-                rex = b;
                 i++;
                 continue;
             }
@@ -320,18 +316,12 @@ internal static unsafe class X64Hook
         byte* start = ip;
         bool hasRex = false;
         byte rex = 0;
-        bool has66 = false;
-        bool hasF2 = false;
-        bool hasF3 = false;
 
         // Skip prefixes
         while (true)
         {
             byte b = *ip;
-            if (b == 0x66) { has66 = true; ip++; continue; }
-            if (b == 0x67) { ip++; continue; }
-            if (b == 0xF2) { hasF2 = true; ip++; continue; }
-            if (b == 0xF3) { hasF3 = true; ip++; continue; }
+            if (b == 0x66 || b == 0x67 || b == 0xF2 || b == 0xF3) { ip++; continue; }
             if (b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x64 || b == 0x65) { ip++; continue; }
             if ((b & 0xF0) == 0x40) { hasRex = true; rex = b; ip++; continue; } // REX
             break;

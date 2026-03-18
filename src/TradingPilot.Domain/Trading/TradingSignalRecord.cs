@@ -28,6 +28,25 @@ public class TradingSignalRecord : Entity<Guid>
     public int BidLevels { get; set; }
     public int AskLevels { get; set; }
 
+    // Technical indicators (from BarIndicatorCache at signal time)
+    public decimal Ema9 { get; set; }
+    public decimal Ema20 { get; set; }
+    public decimal Rsi14 { get; set; }
+    public decimal Vwap { get; set; }
+    public decimal VolumeRatio { get; set; }
+
+    // Tick metrics (from TickDataCache at signal time)
+    public decimal TickMomentum { get; set; }
+
+    // L2-derived features (from TickDataCache at signal time)
+    public decimal BookDepthRatio { get; set; }
+    public decimal BidWallSize { get; set; }
+    public decimal AskWallSize { get; set; }
+    public decimal BidSweepCost { get; set; }
+    public decimal AskSweepCost { get; set; }
+    public decimal ImbalanceVelocity { get; set; }
+    public decimal SpreadPercentile { get; set; }
+
     // Verification fields (filled in later when we check if signal was correct)
     public decimal? PriceAfter1Min { get; set; }
     public decimal? PriceAfter5Min { get; set; }

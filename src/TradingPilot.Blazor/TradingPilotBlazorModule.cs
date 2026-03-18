@@ -236,6 +236,12 @@ public class TradingPilotBlazorModule : AbpModule
                 TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
             });
 
+        // Signal verification: fill in PriceAfter1Min/5Min for recent signals using L2 snapshots
+        recurringJobs.AddOrUpdate<SignalVerificationJob>(
+            "signal-verification",
+            job => job.VerifyRecentSignalsAsync(),
+            "*/5 * * * *"); // every 5 minutes
+
         // Remove deprecated paper-position-sync job (PositionMonitor handles broker sync now)
         recurringJobs.RemoveIfExists("paper-position-sync");
 

@@ -20,7 +20,7 @@
         <div class="tp-topbar mb-3">
             <div class="row g-2">
                 <div class="col-auto">
-                    <div class="tp-status-chip @(_data.HookStatus == "Connected" ? "tp-chip-live" : "tp-chip-off")">
+                    <div class="tp-status-chip @(_data.HookStatus is "Streaming" or "Pipe Connected" ? "tp-chip-live" : _data.HookStatus is "Injected" or "Auth Only" ? "tp-chip-warn" : "tp-chip-off")">
                         <span class="tp-dot"></span> @_data.HookStatus
                     </div>
                 </div>

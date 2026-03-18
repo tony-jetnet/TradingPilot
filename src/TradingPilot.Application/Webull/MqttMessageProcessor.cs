@@ -41,8 +41,8 @@ public class MqttMessageProcessor
     private readonly ConcurrentDictionary<long, DateTime> _lastBarRefresh = new();
     private static readonly TimeSpan BarRefreshInterval = TimeSpan.FromSeconds(30);
 
-    // Periodic tick snapshot persistence (every 10s per ticker)
-    private readonly ConcurrentDictionary<long, DateTime> _lastTickSnapshotTime = new();
+    // Staleness tracking for dashboard (tracks when last data was processed per ticker)
+    private readonly ConcurrentDictionary<long, DateTime> _lastDataProcessedTime = new();
 
     // Binary capture: track saved samples per size bucket (max 20 unique)
     private readonly ConcurrentDictionary<string, int> _binaryCaptureCountPerBucket = new();
@@ -81,7 +81,7 @@ public class MqttMessageProcessor
 
         // Per-ticker staleness: how long since the last tick snapshot was written
         var tickerStaleness = new Dictionary<long, double>();
-        foreach (var (tickerId, lastTime) in _lastTickSnapshotTime)
+        foreach (var (tickerId, lastTime) in _lastDataProcessedTime)
         {
             tickerStaleness[tickerId] = (now - lastTime).TotalSeconds;
         }
@@ -269,8 +269,8 @@ public class MqttMessageProcessor
         // Periodically refresh bar indicators (every 30s)
         await TryRefreshBarIndicatorsAsync(decoded.TickerId);
 
-        // Periodically store tick snapshot (every 10s)
-        await TryStoreTickSnapshotAsync(decoded.TickerId);
+        // Track last data time for staleness dashboard
+        _lastDataProcessedTime[decoded.TickerId] = DateTime.UtcNow;
     }
 
     private void ProcessDecodedTick(WebullMqttMessage decoded)
@@ -320,64 +320,7 @@ public class MqttMessageProcessor
         }
     }
 
-    private async Task TryStoreTickSnapshotAsync(long tickerId)
-    {
-        var now = DateTime.UtcNow;
-        var lastSnapshot = _lastTickSnapshotTime.GetOrAdd(tickerId, DateTime.MinValue);
-        if ((now - lastSnapshot) < TimeSpan.FromSeconds(10)) return;
-
-        _lastTickSnapshotTime[tickerId] = now;
-
-        var tickData = _tickCache.GetData(tickerId);
-        if (tickData == null || tickData.LastPrice == 0) return;
-
-        var symbol = await GetSymbolByTickerIdAsync(tickerId);
-        if (symbol == null) return;
-
-        var barIndicators = _barCache.GetIndicators(tickerId);
-
-        try
-        {
-            var snapshot = new TickSnapshot
-            {
-                SymbolId = symbol.Id,
-                TickerId = tickerId,
-                Timestamp = now,
-                Price = tickData.LastPrice,
-                Open = tickData.Open,
-                High = tickData.High,
-                Low = tickData.Low,
-                Volume = tickData.Volume,
-                Vwap = barIndicators?.Vwap ?? 0,
-                Ema9 = barIndicators?.Ema9 ?? 0,
-                Ema20 = barIndicators?.Ema20 ?? 0,
-                Rsi14 = barIndicators?.Rsi14 ?? 0,
-                VolumeRatio = barIndicators?.VolumeRatio ?? 0,
-                UptickCount = tickData.UptickCount,
-                DowntickCount = tickData.DowntickCount,
-                TickMomentum = tickData.TickMomentum,
-                // L2-derived features
-                BookDepthRatio = tickData.BookDepthRatio,
-                BidWallSize = tickData.BidWallSize,
-                AskWallSize = tickData.AskWallSize,
-                BidSweepCost = tickData.BidSweepCost,
-                AskSweepCost = tickData.AskSweepCost,
-                ImbalanceVelocity = tickData.ImbalanceVelocity,
-                SpreadPercentile = tickData.SpreadPercentile,
-            };
-
-            using var scope = _scopeFactory.CreateScope();
-            var uowManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
-            var repo = scope.ServiceProvider.GetRequiredService<IRepository<TickSnapshot, Guid>>();
-            using var uow = uowManager.Begin();
-            await repo.InsertAsync(snapshot, autoSave: false);
-            await uow.CompleteAsync();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to store tick snapshot for tickerId={TickerId}", tickerId);
-        }
-    }
+    // TryStoreTickSnapshotAsync removed — indicators now stored directly in TradingSignals at signal time
 
     #endregion
 
@@ -560,6 +503,10 @@ public class MqttMessageProcessor
     {
         try
         {
+            // Grab technical + L2 features from caches at signal time
+            var barInd = _barCache.GetIndicators(signal.TickerId);
+            var tickData = _tickCache.GetData(signal.TickerId);
+
             var record = new TradingSignalRecord
             {
                 SymbolId = symbolId,
@@ -579,6 +526,22 @@ public class MqttMessageProcessor
                 Imbalance = snapshot.Imbalance,
                 BidLevels = snapshot.BidPrices.Length,
                 AskLevels = snapshot.AskPrices.Length,
+                // Technical indicators
+                Ema9 = barInd?.Ema9 ?? 0,
+                Ema20 = barInd?.Ema20 ?? 0,
+                Rsi14 = barInd?.Rsi14 ?? 0,
+                Vwap = barInd?.Vwap ?? 0,
+                VolumeRatio = barInd?.VolumeRatio ?? 0,
+                // Tick metrics
+                TickMomentum = tickData?.TickMomentum ?? 0,
+                // L2-derived features
+                BookDepthRatio = tickData?.BookDepthRatio ?? 0,
+                BidWallSize = tickData?.BidWallSize ?? 0,
+                AskWallSize = tickData?.AskWallSize ?? 0,
+                BidSweepCost = tickData?.BidSweepCost ?? 0,
+                AskSweepCost = tickData?.AskSweepCost ?? 0,
+                ImbalanceVelocity = tickData?.ImbalanceVelocity ?? 0,
+                SpreadPercentile = tickData?.SpreadPercentile ?? 0.5m,
             };
 
             using var scope = _scopeFactory.CreateScope();

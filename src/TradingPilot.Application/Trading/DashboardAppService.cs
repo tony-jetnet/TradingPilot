@@ -199,7 +199,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 Ticker = symbol.Id,
                 L2AgeSec = Math.Round(l2AgeSec, 1),
                 QuoteAgeSec = Math.Round(quoteAgeSec, 1),
-                TickSnapshotAgeSec = Math.Round(tickSnapAgeSec, 1),
+                TickSnapshotAgeSec = 0, // Deprecated — TickSnapshots table removed
                 Status = status,
             });
         }

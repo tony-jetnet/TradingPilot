@@ -84,7 +84,6 @@ public static unsafe class HookEntry
     // ═══════════════════════════════════════════════════════════════════
     // Trampolines for calling original functions
     // ═══════════════════════════════════════════════════════════════════
-    private static nint _orig_messageReceived; // set by native DLL hook (unused here)
     private static nint _nativeHookDll; // handle to hook_native.dll
     private static nint _nativeMessageReceivedTarget; // target addr for cleanup
     private static nint _orig_subscribe;
@@ -97,8 +96,9 @@ public static unsafe class HookEntry
     private static nint _orig_disconnectFromHost;
 
     // gRPC hook trampolines
+#pragma warning disable CS0649 // never assigned (hook stub — assigned when gRPC hooking is enabled)
     private static nint _orig_getHeadMd5Sign;
-    private static nint _orig_grpcRequest;
+#pragma warning restore CS0649
     private static nint _orig_grpcWrite;
 
     // Resolved getter function pointers (not hooked, just called)

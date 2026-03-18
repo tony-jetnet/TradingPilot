@@ -36,7 +36,8 @@
       "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -p 5432 -U jetnet -d TradingPilot -c \"\\\\dt hangfire.*\")",
       "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -p 5432 -U jetnet -d TradingPilot -c \"SELECT tablename FROM pg_tables WHERE schemaname LIKE ''%hang%'' OR tablename LIKE ''%hang%'';\")",
       "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -p 5432 -U jetnet -d TradingPilot -c \"\nSELECT \n  s.\\\\\"Name\\\\\" as ticker,\n  COUNT\\(*\\) as total_signals,\n  COUNT\\(*\\) FILTER \\(WHERE ts.\\\\\"PriceAfter1Min\\\\\" IS NOT NULL\\) as verified,\n  COUNT\\(*\\) FILTER \\(WHERE ts.\\\\\"Reason\\\\\" = '[BACKFILL]'\\) as backfill,\n  COUNT\\(*\\) FILTER \\(WHERE ts.\\\\\"PriceAfter1Min\\\\\" IS NOT NULL AND ts.\\\\\"Reason\\\\\" != '[BACKFILL]'\\) as usable\nFROM \\\\\"TradingSignals\\\\\" ts\nJOIN \\\\\"Symbols\\\\\" s ON s.\\\\\"Id\\\\\" = ts.\\\\\"SymbolId\\\\\"\nWHERE ts.\\\\\"Timestamp\\\\\" > NOW\\(\\) - INTERVAL '20 days'\nGROUP BY s.\\\\\"Name\\\\\"\nORDER BY usable DESC;\n\")",
-      "Bash(python3 -c \":*)"
+      "Bash(python3 -c \":*)",
+      "Bash(dotnet test:*)"
     ]
   }
 }

@@ -187,42 +187,7 @@ public static class TradingPilotDbContextModelCreatingExtensions
                 .HasDatabaseName("IX_TradingSignals_VerifiedAt");
         });
 
-        builder.Entity<TickSnapshot>(b =>
-        {
-            b.ToTable(TradingPilotConsts.DbTablePrefix + "TickSnapshots", TradingPilotConsts.DbSchema);
-            b.HasKey(x => x.Id);
-            b.Property(x => x.SymbolId).IsRequired();
-            b.Property(x => x.TickerId).IsRequired();
-            b.Property(x => x.Timestamp).IsRequired();
-            b.Property(x => x.Price).HasPrecision(12, 4);
-            b.Property(x => x.Open).HasPrecision(12, 4);
-            b.Property(x => x.High).HasPrecision(12, 4);
-            b.Property(x => x.Low).HasPrecision(12, 4);
-            b.Property(x => x.Vwap).HasPrecision(12, 4);
-            b.Property(x => x.Ema9).HasPrecision(12, 4);
-            b.Property(x => x.Ema20).HasPrecision(12, 4);
-            b.Property(x => x.Rsi14).HasPrecision(8, 4);
-            b.Property(x => x.VolumeRatio).HasPrecision(8, 4);
-            b.Property(x => x.TickMomentum).HasPrecision(8, 6);
-
-            // L2-derived features
-            b.Property(x => x.BookDepthRatio).HasPrecision(8, 6);
-            b.Property(x => x.BidWallSize).HasPrecision(10, 4);
-            b.Property(x => x.AskWallSize).HasPrecision(10, 4);
-            b.Property(x => x.BidSweepCost).HasPrecision(12, 2);
-            b.Property(x => x.AskSweepCost).HasPrecision(12, 2);
-            b.Property(x => x.ImbalanceVelocity).HasPrecision(10, 6);
-            b.Property(x => x.SpreadPercentile).HasPrecision(6, 4);
-
-            b.HasOne<Symbol>().WithMany().HasForeignKey(x => x.SymbolId).OnDelete(DeleteBehavior.Restrict);
-
-            b.HasIndex(x => new { x.SymbolId, x.Timestamp })
-                .HasDatabaseName("IX_TickSnapshots_SymbolId_Timestamp");
-            b.HasIndex(x => x.Timestamp)
-                .HasDatabaseName("IX_TickSnapshots_Timestamp");
-            b.HasIndex(x => new { x.TickerId, x.Timestamp })
-                .HasDatabaseName("IX_TickSnapshots_TickerId_Timestamp");
-        });
+        // TickSnapshots table removed — indicators now stored directly in TradingSignals
 
         builder.Entity<PaperTrade>(b =>
         {
