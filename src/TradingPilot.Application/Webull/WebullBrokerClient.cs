@@ -19,7 +19,7 @@ public class WebullBrokerClient : IBrokerClient
     private readonly WebullPaperTradingClient _client;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<WebullBrokerClient> _logger;
-    private readonly long _accountId;
+    private long _accountId;
     private readonly string _authHeaderPath;
 
     // Symbol ↔ TickerId mapping (loaded from DB, cached)
@@ -44,7 +44,7 @@ public class WebullBrokerClient : IBrokerClient
         _client = client;
         _scopeFactory = scopeFactory;
         _logger = logger;
-        _accountId = configuration.GetValue<long>("Broker:AccountId", 58226259);
+        _accountId = configuration.GetValue<long>("Broker:AccountId", 58264537);
         _authHeaderPath = configuration.GetValue<string>("Broker:AuthHeaderPath")
             ?? @"D:\Third-Parties\WebullHook\auth_header.json";
     }
@@ -56,6 +56,17 @@ public class WebullBrokerClient : IBrokerClient
         await EnsureSymbolsLoadedAsync();
 
         var account = await _client.GetAccountAsync(_authHeaderJson, _accountId);
+        if (account == null)
+        {
+            // Account may have been reset — try to discover the new ID
+            var newId = await _client.GetAccountIdAsync(_authHeaderJson);
+            if (newId.HasValue && newId.Value != _accountId)
+            {
+                _logger.LogWarning("Paper account reset detected. Old={OldId}, New={NewId}", _accountId, newId.Value);
+                _accountId = newId.Value;
+                account = await _client.GetAccountAsync(_authHeaderJson, _accountId);
+            }
+        }
         if (account == null) return null;
 
         // Compute day P&L from today's filled orders
@@ -162,6 +173,14 @@ public class WebullBrokerClient : IBrokerClient
     /// </summary>
     public string ResolveSymbol(long tickerId, string? fallback = null)
     {
+        // Webull sometimes returns tickerId=0 in position/order responses — skip the warning
+        if (tickerId <= 0)
+        {
+            if (!string.IsNullOrWhiteSpace(fallback) && !long.TryParse(fallback, out _))
+                return fallback;
+            return string.Empty;
+        }
+
         if (_tickerIdToSymbol.TryGetValue(tickerId, out var symbol))
             return symbol;
 

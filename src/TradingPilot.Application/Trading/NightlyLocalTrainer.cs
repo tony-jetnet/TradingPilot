@@ -16,10 +16,10 @@ namespace TradingPilot.Trading;
 /// </summary>
 [DisableConcurrentExecution(600)]
 [AutomaticRetry(Attempts = 0)]
-public class NightlyModelTrainer
+public class NightlyLocalTrainer
 {
     private readonly IServiceScopeFactory _scopeFactory;
-    private readonly ILogger<NightlyModelTrainer> _logger;
+    private readonly ILogger<NightlyLocalTrainer> _logger;
 
     private const decimal CommissionPerTrade = 2.99m;
     private const int SimulationShares = 500;
@@ -45,9 +45,9 @@ public class NightlyModelTrainer
     private static readonly decimal[] CandidateThresholds =
         [0.15m, 0.20m, 0.25m, 0.30m, 0.35m, 0.40m, 0.45m, 0.50m];
 
-    public NightlyModelTrainer(
+    public NightlyLocalTrainer(
         IServiceScopeFactory scopeFactory,
-        ILogger<NightlyModelTrainer> logger)
+        ILogger<NightlyLocalTrainer> logger)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;

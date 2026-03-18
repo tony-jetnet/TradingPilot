@@ -73,7 +73,12 @@ public class NightlyStrategyOptimizer
                 }
             }
 
-            // 3. For each symbol, prepare analysis and call Bedrock
+            // 3. Verify signal outcomes (PriceAfter1Min/5Min) from L2 snapshots
+            //    Previously ran every 5 min as SignalVerificationJob — now consolidated here
+            //    so all signals have outcomes before Bedrock analysis.
+            await VerifySignalOutcomesAsync(lookbackDays);
+
+            // 4. For each symbol, prepare analysis and call Bedrock
             var config = new StrategyConfig
             {
                 GeneratedAt = DateTime.UtcNow,
@@ -111,7 +116,7 @@ public class NightlyStrategyOptimizer
                 return;
             }
 
-            // 3. Save strategy_rules.json
+            // 5. Save strategy_rules.json
             await SaveStrategyRulesAsync(config);
 
             sw.Stop();
@@ -1161,6 +1166,65 @@ win_1m: 1 if trade was profitable at 1 min, 0 if not
         }
         catch { }
         return results;
+    }
+
+    #endregion
+
+    #region Signal Outcome Verification
+
+    /// <summary>
+    /// Fills in PriceAfter1Min/5Min for unverified TradingSignals by looking up
+    /// the nearest SymbolBookSnapshot at the target time offset.
+    /// Absorbed from the former SignalVerificationJob — now runs once nightly
+    /// before Bedrock analysis instead of every 5 minutes.
+    /// </summary>
+    private async Task VerifySignalOutcomesAsync(int lookbackDays)
+    {
+        using var scope = _scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
+
+        int updated = await dbContext.Database.ExecuteSqlRawAsync(@"
+            UPDATE ""TradingSignals"" ts
+            SET
+                ""PriceAfter1Min"" = COALESCE(ts.""PriceAfter1Min"", (
+                    SELECT bs.""MidPrice"" FROM ""SymbolBookSnapshots"" bs
+                    WHERE bs.""SymbolId"" = ts.""SymbolId""
+                      AND bs.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '55 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '65 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM bs.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '60 seconds')))
+                    LIMIT 1
+                )),
+                ""PriceAfter5Min"" = COALESCE(ts.""PriceAfter5Min"", (
+                    SELECT bs.""MidPrice"" FROM ""SymbolBookSnapshots"" bs
+                    WHERE bs.""SymbolId"" = ts.""SymbolId""
+                      AND bs.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '295 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '305 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM bs.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '300 seconds')))
+                    LIMIT 1
+                )),
+                ""VerifiedAt"" = NOW()
+            WHERE ts.""VerifiedAt"" IS NULL
+              AND ts.""Timestamp"" < NOW() - INTERVAL '6 minutes'
+              AND ts.""Timestamp"" > NOW() - INTERVAL '{0} days'", lookbackDays);
+
+        if (updated > 0)
+        {
+            await dbContext.Database.ExecuteSqlRawAsync(@"
+                UPDATE ""TradingSignals""
+                SET ""WasCorrect1Min"" = CASE
+                    WHEN ""PriceAfter1Min"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter1Min"" > ""Price""
+                    WHEN ""PriceAfter1Min"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter1Min"" < ""Price""
+                    ELSE NULL END,
+                    ""WasCorrect5Min"" = CASE
+                    WHEN ""PriceAfter5Min"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter5Min"" > ""Price""
+                    WHEN ""PriceAfter5Min"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter5Min"" < ""Price""
+                    ELSE NULL END
+                WHERE ""VerifiedAt"" IS NOT NULL
+                  AND ""WasCorrect1Min"" IS NULL
+                  AND ""PriceAfter1Min"" IS NOT NULL");
+
+            _logger.LogWarning("Signal verification: updated {Count} signals with price outcomes", updated);
+        }
     }
 
     #endregion

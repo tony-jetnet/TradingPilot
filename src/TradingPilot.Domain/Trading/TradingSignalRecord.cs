@@ -50,11 +50,7 @@ public class TradingSignalRecord : Entity<Guid>
     // Verification fields (filled in later when we check if signal was correct)
     public decimal? PriceAfter1Min { get; set; }
     public decimal? PriceAfter5Min { get; set; }
-    public decimal? PriceAfter15Min { get; set; }
-    public decimal? PriceAfter30Min { get; set; }
     public bool? WasCorrect1Min { get; set; }
     public bool? WasCorrect5Min { get; set; }
-    public bool? WasCorrect15Min { get; set; }
-    public bool? WasCorrect30Min { get; set; }
     public DateTime? VerifiedAt { get; set; }
 }

@@ -211,9 +211,6 @@ public class TradingPilotBlazorModule : AbpModule
                 TimeSpan.FromSeconds(30 + i * 5)); // stagger by 5s
         }
 
-        // Remove deprecated L2 polling job (MQTT streaming handles this)
-        recurringJobs.RemoveIfExists("poll-l2-depth");
-
         // Recurring bar refresh (every 30 min during market hours to keep data fresh)
         recurringJobs.AddOrUpdate<LoadHistoricalBarsJob>(
             "refresh-bars",
@@ -228,11 +225,11 @@ public class TradingPilotBlazorModule : AbpModule
             job => job.ExecuteAsync(),
             "*/30 * * * *"); // every 30 min
 
-        // Remove deprecated job (replaced by NightlyStrategyOptimizer)
-        recurringJobs.RemoveIfExists("nightly-model-training");
+        // Clean up deprecated jobs from Redis
+        recurringJobs.RemoveIfExists("signal-verification");
 
         // Nightly AI strategy optimization: 9 PM ET weekdays (after market close)
-        // Backfills gaps, then calls Bedrock Sonnet 4.6 per symbol
+        // Backfills gaps + verifies signal outcomes + calls Bedrock Sonnet 4.6 per symbol
         recurringJobs.AddOrUpdate<NightlyStrategyOptimizer>(
             "nightly-strategy-optimization",
             optimizer => optimizer.OptimizeAsync(20),
@@ -242,25 +239,26 @@ public class TradingPilotBlazorModule : AbpModule
                 TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
             });
 
-        // Nightly data cleanup: 9:30 PM ET weekdays (after optimization completes)
-        // Retention: SymbolBookSnapshots=3 days, TickSnapshots=30 days, rest=forever
-        recurringJobs.AddOrUpdate<NightlyStrategyOptimizer>(
-            "nightly-data-cleanup",
-            optimizer => optimizer.CleanupOldDataAsync(),
+        // Nightly local training: 9:30 PM ET weekdays (after Bedrock optimization)
+        // Hill-climbing weight optimization -> model_config.json
+        recurringJobs.AddOrUpdate<NightlyLocalTrainer>(
+            "nightly-local-training",
+            trainer => trainer.TrainAsync(20),
             "30 21 * * 1-5",
             new RecurringJobOptions
             {
                 TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
             });
 
-        // Signal verification: fill in PriceAfter1Min/5Min for recent signals using L2 snapshots
-        recurringJobs.AddOrUpdate<SignalVerificationJob>(
-            "signal-verification",
-            job => job.VerifyRecentSignalsAsync(),
-            "*/5 * * * *"); // every 5 minutes
-
-        // Remove deprecated paper-position-sync job (PositionMonitor handles broker sync now)
-        recurringJobs.RemoveIfExists("paper-position-sync");
+        // Nightly data cleanup: 10 PM ET weekdays (after both trainers complete)
+        recurringJobs.AddOrUpdate<NightlyStrategyOptimizer>(
+            "nightly-data-cleanup",
+            optimizer => optimizer.CleanupOldDataAsync(),
+            "0 22 * * 1-5",
+            new RecurringJobOptions
+            {
+                TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
+            });
 
         // Eagerly resolve PositionMonitor to start its timer
         context.ServiceProvider.GetRequiredService<PositionMonitor>();

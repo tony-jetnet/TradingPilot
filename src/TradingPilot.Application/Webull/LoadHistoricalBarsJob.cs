@@ -139,6 +139,28 @@ public class LoadHistoricalBarsJob
         _logger.LogInformation("Hourly bar refresh complete for {Count} symbols", watched.Count);
     }
 
+    private static int GetBarIntervalMinutes(string tf) => tf switch
+    {
+        "d" => 390,  // 1 trading day = 6.5 hours
+        "h1" => 60,
+        "m30" => 30,
+        "m15" => 15,
+        "m5" => 5,
+        "m1" => 1,
+        _ => 5,
+    };
+
+    private static int GetMaxCount(string tf) => tf switch
+    {
+        "d" => 30,
+        "h1" => 50,
+        "m30" => 50,
+        "m15" => 100,
+        "m5" => 200,
+        "m1" => 400,  // ~1 full trading day (390 min) — needed for nightly AI training
+        _ => 100,
+    };
+
     private async Task LoadBarsForSymbolAsync(string authHeader, Symbol symbol, string[] timeframes)
     {
         foreach (string tf in timeframes)
@@ -155,18 +177,47 @@ public class LoadHistoricalBarsJob
                 _ => throw new ArgumentException($"Unknown timeframe: {tf}")
             };
 
-            // Keep counts minimal — BarIndicatorService only needs last 30 m1 bars
-            int count = tf switch
+            // Query latest bar timestamp from DB to avoid re-fetching existing data
+            DateTime? latestBarTimestamp;
+            using (var uow = _uowManager.Begin())
             {
-                "d" => 30,    // ~30 trading days = 6 weeks
-                "h1" => 50,   // ~7 trading days
-                "m30" => 50,  // ~4 trading days
-                "m15" => 100, // ~4 trading days
-                "m5" => 200,  // ~2.5 trading days
-                "m1" => 50,   // ~50 minutes (covers 30-bar indicator window)
-                _ => 100,
-            };
-            _logger.LogInformation("Fetching {Timeframe} bars for {Ticker} (count={Count})...", tf, symbol.Id, count);
+                var dbContext = uow.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
+                var timeframeInt = (int)timeframe;
+                latestBarTimestamp = await dbContext.Database
+                    .SqlQueryRaw<DateTime?>(
+                        @"SELECT MAX(""Timestamp"") AS ""Value"" FROM ""SymbolBars"" WHERE ""SymbolId"" = {0} AND ""Timeframe"" = {1}",
+                        symbol.Id, timeframeInt)
+                    .FirstOrDefaultAsync();
+                await uow.CompleteAsync();
+            }
+
+            int maxCount = GetMaxCount(tf);
+            int count;
+
+            if (latestBarTimestamp.HasValue)
+            {
+                double minutesGap = (DateTime.UtcNow - latestBarTimestamp.Value).TotalMinutes;
+                int intervalMinutes = GetBarIntervalMinutes(tf);
+
+                // Skip if the gap is less than one bar interval — already up to date
+                if (minutesGap < intervalMinutes)
+                {
+                    _logger.LogDebug("Skipping {Timeframe} for {Ticker} — already up to date (latest: {Latest}, gap: {Gap:F0}m)",
+                        tf, symbol.Id, latestBarTimestamp.Value, minutesGap);
+                    continue;
+                }
+
+                int barsNeeded = (int)Math.Ceiling(minutesGap / intervalMinutes) + 2; // +2 buffer for overlap
+                count = Math.Min(barsNeeded, maxCount);
+            }
+            else
+            {
+                // No data at all — do a full initial load
+                count = maxCount;
+            }
+
+            _logger.LogInformation("Fetching {Timeframe} bars for {Ticker} (count={Count}, latest={Latest})...",
+                tf, symbol.Id, count, latestBarTimestamp?.ToString("o") ?? "none");
 
             var bars = await _api.GetBarsAsync(authHeader, symbol.WebullTickerId, apiType, count);
             await Task.Delay(500); // rate limit
@@ -185,7 +236,7 @@ public class LoadHistoricalBarsJob
                     int rows = await dbContext.Database.ExecuteSqlRawAsync(@"
                         INSERT INTO ""SymbolBars"" (""Id"", ""SymbolId"", ""Timeframe"", ""Timestamp"", ""Open"", ""High"", ""Low"", ""Close"", ""Volume"", ""Vwap"", ""ChangeRatio"")
                         VALUES ({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, {9}, {10})
-                        ON CONFLICT ON CONSTRAINT ""IX_SymbolBars_SymbolId_Timeframe_Timestamp"" DO NOTHING",
+                        ON CONFLICT (""SymbolId"", ""Timeframe"", ""Timestamp"") DO NOTHING",
                         Guid.NewGuid(), symbol.Id, timeframeInt, bar.Timestamp,
                         bar.Open, bar.High, bar.Low, bar.Close, (long)bar.Volume, bar.Vwap ?? 0m, bar.ChangeRatio ?? 0m);
                     inserted += rows;
