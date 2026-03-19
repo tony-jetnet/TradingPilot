@@ -76,6 +76,7 @@ public class BarIndicatorService
             decimal ema20 = ComputeEma(closes, 20);
             decimal rsi14 = ComputeRsi(closes, 14);
             decimal vwap = ComputeVwap(typicalPrices, volumes);
+            decimal atr14 = ComputeAtr(highs, lows, closes, 14);
 
             // Volume stats
             decimal avgVolume20 = volumes.Length >= 20
@@ -98,6 +99,8 @@ public class BarIndicatorService
                 Ema20 = Math.Round(ema20, 4),
                 Vwap = Math.Round(vwap, 4),
                 Rsi14 = Math.Round(rsi14, 2),
+                Atr14 = Math.Round(atr14, 4),
+                Atr14Pct = lastClose > 0 ? Math.Round(atr14 / lastClose, 6) : 0,
                 AvgVolume20 = Math.Round(avgVolume20, 0),
                 CurrentVolume = currentVolume,
                 VolumeRatio = Math.Round(volumeRatio, 2),
@@ -181,6 +184,58 @@ public class BarIndicatorService
         if (avgLoss == 0) return 100;
         decimal rs = avgGain / avgLoss;
         return 100m - 100m / (1m + rs);
+    }
+
+    /// <summary>
+    /// ATR (Average True Range) = SMA of True Range over N periods.
+    /// True Range = Max(High - Low, |High - PrevClose|, |Low - PrevClose|).
+    /// Used for volatility-based position sizing.
+    /// </summary>
+    internal static decimal ComputeAtr(decimal[] highs, decimal[] lows, decimal[] closes, int period)
+    {
+        if (highs.Length < 2 || lows.Length < 2 || closes.Length < 2) return 0;
+
+        int count = Math.Min(Math.Min(highs.Length, lows.Length), closes.Length);
+        int effectivePeriod = Math.Min(period, count - 1);
+        if (effectivePeriod <= 0) return 0;
+
+        decimal sumTr = 0;
+        int trCount = 0;
+
+        for (int i = 1; i < count; i++)
+        {
+            decimal hl = highs[i] - lows[i];
+            decimal hpc = Math.Abs(highs[i] - closes[i - 1]);
+            decimal lpc = Math.Abs(lows[i] - closes[i - 1]);
+            decimal tr = Math.Max(hl, Math.Max(hpc, lpc));
+
+            sumTr += tr;
+            trCount++;
+
+            // Only keep the last N true ranges for the average
+            if (trCount > effectivePeriod)
+            {
+                // Simple approach: recompute from the last N periods
+                // For a streaming ATR we'd use exponential smoothing,
+                // but for 30 bars this is fine
+            }
+        }
+
+        // Use last N true ranges
+        if (trCount <= effectivePeriod)
+            return trCount > 0 ? sumTr / trCount : 0;
+
+        // Recompute using only the last effectivePeriod TRs
+        sumTr = 0;
+        for (int i = count - effectivePeriod; i < count; i++)
+        {
+            decimal hl = highs[i] - lows[i];
+            decimal hpc = Math.Abs(highs[i] - closes[i - 1]);
+            decimal lpc = Math.Abs(lows[i] - closes[i - 1]);
+            sumTr += Math.Max(hl, Math.Max(hpc, lpc));
+        }
+
+        return sumTr / effectivePeriod;
     }
 
     /// <summary>

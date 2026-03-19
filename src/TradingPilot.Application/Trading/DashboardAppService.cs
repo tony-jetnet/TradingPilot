@@ -289,6 +289,71 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
         var wins = pnls.Where(p => p.Pnl > 0).ToList();
         var losses = pnls.Where(p => p.Pnl <= 0).ToList();
 
+        decimal avgWin = wins.Count > 0 ? wins.Average(p => p.Pnl) : 0;
+        decimal avgLoss = losses.Count > 0 ? losses.Average(p => p.Pnl) : 0;
+        decimal winRate = pnls.Count > 0 ? (decimal)wins.Count / pnls.Count : 0;
+
+        // ═══════════════════════════════════════════════════════════
+        // RISK-ADJUSTED PERFORMANCE METRICS
+        // ═══════════════════════════════════════════════════════════
+
+        // Expectancy: average $ you expect to make per trade
+        // Positive = edge exists. Negative = you're donating to the market.
+        decimal expectancy = (winRate * avgWin) + ((1 - winRate) * avgLoss);
+
+        // Profit Factor: gross profits / gross losses. >1.5 to survive real costs.
+        decimal grossProfit = wins.Sum(p => p.Pnl);
+        decimal grossLoss = Math.Abs(losses.Sum(p => p.Pnl));
+        decimal profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 99.9m : 0;
+
+        // Sharpe Ratio (annualized): mean(returns) / stddev(returns) * sqrt(252)
+        // Using per-trade P&L as "returns" since trades are intraday.
+        decimal sharpeRatio = 0;
+        decimal sortinoRatio = 0;
+        if (pnls.Count >= 2)
+        {
+            decimal mean = pnls.Average(p => p.Pnl);
+            double variance = pnls.Sum(p => (double)((p.Pnl - mean) * (p.Pnl - mean))) / (pnls.Count - 1);
+            double stdDev = Math.Sqrt((double)variance);
+            if (stdDev > 0)
+                sharpeRatio = (decimal)((double)mean / stdDev * Math.Sqrt(252));
+
+            // Sortino: only penalize downside deviation (negative returns)
+            var downsideReturns = pnls.Where(p => p.Pnl < 0).ToList();
+            if (downsideReturns.Count > 0)
+            {
+                double downsideVariance = downsideReturns.Sum(p => (double)(p.Pnl * p.Pnl)) / downsideReturns.Count;
+                double downsideDev = Math.Sqrt(downsideVariance);
+                if (downsideDev > 0)
+                    sortinoRatio = (decimal)((double)mean / downsideDev * Math.Sqrt(252));
+            }
+            else if (mean > 0)
+            {
+                sortinoRatio = 99.9m; // All trades profitable, no downside
+            }
+        }
+
+        // Max consecutive losses
+        int maxConsecLosses = 0;
+        int currentStreak = 0;
+        foreach (var p in pnls)
+        {
+            if (p.Pnl <= 0) { currentStreak++; maxConsecLosses = Math.Max(maxConsecLosses, currentStreak); }
+            else currentStreak = 0;
+        }
+
+        // Max drawdown: largest peak-to-trough drop in cumulative P&L
+        decimal maxDrawdown = 0;
+        decimal peak = 0;
+        decimal cumPnl = 0;
+        foreach (var p in pnls)
+        {
+            cumPnl += p.Pnl;
+            if (cumPnl > peak) peak = cumPnl;
+            decimal drawdown = cumPnl - peak;
+            if (drawdown < maxDrawdown) maxDrawdown = drawdown;
+        }
+
         dto.PnlSummary = new PnlSummaryDto
         {
             TotalTrades = pnls.Count,
@@ -297,13 +362,19 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
             TotalPnl = pnls.Sum(p => p.Pnl),
             TotalCommissions = 0,
             NetPnl = pnls.Sum(p => p.Pnl),
-            WinRate = pnls.Count > 0 ? (decimal)wins.Count / pnls.Count * 100 : 0,
-            AvgWin = wins.Count > 0 ? wins.Average(p => p.Pnl) : 0,
-            AvgLoss = losses.Count > 0 ? losses.Average(p => p.Pnl) : 0,
+            WinRate = winRate * 100,
+            AvgWin = avgWin,
+            AvgLoss = avgLoss,
             BestTrade = pnls.Count > 0 ? pnls.Max(p => p.Pnl) : 0,
             WorstTrade = pnls.Count > 0 ? pnls.Min(p => p.Pnl) : 0,
             TodayTrades = pnls.Count,
             TodayPnl = account?.DayPnl ?? pnls.Sum(p => p.Pnl),
+            Expectancy = Math.Round(expectancy, 2),
+            ProfitFactor = Math.Round(profitFactor, 2),
+            SharpeRatio = Math.Round(sharpeRatio, 2),
+            SortinoRatio = Math.Round(sortinoRatio, 2),
+            MaxConsecutiveLosses = maxConsecLosses,
+            MaxDrawdown = Math.Round(maxDrawdown, 2),
             SourceBreakdown = pnls
                 .Where(p => !string.IsNullOrEmpty(p.Source))
                 .GroupBy(p => p.Source)

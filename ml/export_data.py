@@ -86,15 +86,34 @@ def export_snapshots(conn, symbol_id: str | None, days: int):
             writer = csv.writer(f)
             writer.writerow(header)
 
+            valid_count = 0
+            skipped_count = 0
+
             for row in rows:
                 ts, mid, spread, imbalance, depth = row[:5]
                 bid_prices, bid_sizes, ask_prices, ask_sizes = row[5:]
+
+                # ── Data validation ──────────────────────────────────────
+                # Skip rows with obviously bad data to prevent garbage heatmaps
+                if mid is None or float(mid) <= 0:
+                    skipped_count += 1
+                    continue
+                if spread is not None and float(spread) < 0:
+                    skipped_count += 1
+                    continue
 
                 # Parse arrays — could be native arrays or JSON strings
                 bp = _parse_array(bid_prices)
                 bs = _parse_array(bid_sizes)
                 ap = _parse_array(ask_prices)
                 az = _parse_array(ask_sizes)
+
+                # Need at least 3 valid bid and ask levels for a useful heatmap
+                valid_bids = sum(1 for p in bp if p > 0)
+                valid_asks = sum(1 for p in ap if p > 0)
+                if valid_bids < 3 or valid_asks < 3:
+                    skipped_count += 1
+                    continue
 
                 # Pad to 20 levels
                 bp = _pad(bp, 20)
@@ -109,8 +128,9 @@ def export_snapshots(conn, symbol_id: str | None, days: int):
                     csv_row.extend([ap[i], az[i]])
 
                 writer.writerow(csv_row)
+                valid_count += 1
 
-        print(f"  {sym}: {len(rows)} snapshots -> {out_path}")
+        print(f"  {sym}: {valid_count} valid / {len(rows)} total ({skipped_count} skipped) -> {out_path}")
 
     cur.close()
 

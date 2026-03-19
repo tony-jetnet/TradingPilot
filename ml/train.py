@@ -3,7 +3,7 @@ Step 3: Fine-tune Swin-Tiny on L2 order book heatmaps.
 
 Two-phase training:
   Phase 1: Freeze backbone, train classification head only (fast convergence)
-  Phase 2: Unfreeze top layers, lower learning rate (fine-tune features)
+  Phase 2: Unfreeze top layers, lower learning rate with warmup + cosine decay
 
 Usage:
   python train.py                          # full training
@@ -12,13 +12,14 @@ Usage:
 """
 
 import argparse
+import json
 import os
+import random
 import time
 
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
@@ -28,6 +29,33 @@ import config
 
 # Use timm for Swin-Tiny — it has the cleanest implementation
 import timm
+
+
+# ── Reproducibility ──────────────────────────────────────────────────
+def set_seed(seed: int = config.SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_channel_stats() -> tuple[list[float], list[float]]:
+    """
+    Load per-channel normalization stats computed from actual L2 heatmaps.
+    Falls back to ImageNet stats only if channel_stats.json doesn't exist
+    (first-ever training run before render_heatmap.py has been run).
+    """
+    stats_path = config.CHANNEL_STATS_PATH
+    if os.path.exists(stats_path):
+        with open(stats_path, "r") as f:
+            stats = json.load(f)
+        print(f"Using L2 heatmap channel stats (from {stats['num_samples']} samples)")
+        return stats["mean"], stats["std"]
+    else:
+        print("WARNING: channel_stats.json not found, falling back to ImageNet stats.")
+        print("  Run render_heatmap.py first to compute actual L2 channel statistics.")
+        return [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 
 
 class HeatmapDataset(Dataset):
@@ -99,13 +127,9 @@ def unfreeze_top_layers(model: nn.Module, unfreeze_stages: int = 2):
     print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
 
-def get_transforms(train: bool = True):
+def get_transforms(train: bool, mean: list[float], std: list[float]):
     """Data augmentation for training, basic normalization for eval."""
-    # ImageNet normalization (Swin was pretrained on ImageNet)
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    )
+    normalize = transforms.Normalize(mean=mean, std=std)
 
     if train:
         return transforms.Compose([
@@ -138,6 +162,10 @@ def train_epoch(model, loader, criterion, optimizer, device, desc="Train"):
         outputs = model(images)
         loss = criterion(outputs, labels)
         loss.backward()
+
+        # Gradient clipping — prevents exploding gradients during fine-tuning
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         total_loss += loss.item() * images.size(0)
@@ -189,11 +217,23 @@ def eval_epoch(model, loader, criterion, device, desc="Val"):
     return total_loss / total, acc
 
 
+def get_cosine_with_warmup_scheduler(optimizer, warmup_steps: int, total_steps: int):
+    """Linear warmup then cosine decay to eta_min."""
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--head-only", action="store_true", help="Phase 1 only")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     args = parser.parse_args()
+
+    set_seed()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -201,11 +241,20 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name()}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
+    # ── Load channel statistics (from actual heatmaps, not ImageNet) ──
+    channel_mean, channel_std = load_channel_stats()
+
     # ── Load data ─────────────────────────────────────────────────────
     print("Loading data...")
     images = np.load(os.path.join(config.DATA_DIR, "images.npy"))
     labels = np.load(os.path.join(config.DATA_DIR, "labels.npy"))
     print(f"Loaded {len(images)} samples")
+
+    # Print class distribution
+    unique, counts = np.unique(labels, return_counts=True)
+    for u, c in zip(unique, counts):
+        name = ["DOWN", "FLAT", "UP"][u]
+        print(f"  {name}: {c} ({100*c/len(labels):.1f}%)")
 
     # ── Split: train / val / test ─────────────────────────────────────
     idx = np.arange(len(labels))
@@ -225,9 +274,12 @@ def main():
     print(f"Class weights: DOWN={class_weights[0]:.2f} FLAT={class_weights[1]:.2f} UP={class_weights[2]:.2f}")
 
     # ── Datasets & loaders ────────────────────────────────────────────
-    train_ds = HeatmapDataset(images[train_idx], labels[train_idx], transform=get_transforms(train=True))
-    val_ds = HeatmapDataset(images[val_idx], labels[val_idx], transform=get_transforms(train=False))
-    test_ds = HeatmapDataset(images[test_idx], labels[test_idx], transform=get_transforms(train=False))
+    train_ds = HeatmapDataset(images[train_idx], labels[train_idx],
+                              transform=get_transforms(train=True, mean=channel_mean, std=channel_std))
+    val_ds = HeatmapDataset(images[val_idx], labels[val_idx],
+                            transform=get_transforms(train=False, mean=channel_mean, std=channel_std))
+    test_ds = HeatmapDataset(images[test_idx], labels[test_idx],
+                             transform=get_transforms(train=False, mean=channel_mean, std=channel_std))
 
     # Weighted sampler to handle class imbalance
     sample_weights = class_weights[labels[train_idx]].cpu().numpy()
@@ -262,9 +314,10 @@ def main():
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {trainable:,}")
 
+    # Phase 1 LR: 1e-4 (was 1e-3 = way too high for a small head)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=config.LEARNING_RATE * 10,  # Higher LR for head-only phase
+        lr=config.LEARNING_RATE,
         weight_decay=config.WEIGHT_DECAY,
     )
 
@@ -287,9 +340,9 @@ def main():
     if args.head_only:
         print("\n--head-only specified, skipping Phase 2")
     else:
-        # ── Phase 2: Fine-tune top layers ─────────────────────────────
+        # ── Phase 2: Fine-tune top layers with warmup + cosine decay ──
         print("\n" + "=" * 60)
-        print("PHASE 2: Unfreezing top 2 stages — fine-tuning")
+        print("PHASE 2: Unfreezing top 2 stages — fine-tuning with warmup")
         print("=" * 60)
 
         unfreeze_top_layers(model, unfreeze_stages=2)
@@ -300,20 +353,49 @@ def main():
             weight_decay=config.WEIGHT_DECAY,
         )
 
-        # Cosine annealing scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config.EPOCHS_FINETUNE, eta_min=1e-6
-        )
+        # Warmup + cosine decay scheduler
+        steps_per_epoch = len(train_loader)
+        total_steps = config.EPOCHS_FINETUNE * steps_per_epoch
+        warmup_steps = int(total_steps * config.WARMUP_RATIO)
+        scheduler = get_cosine_with_warmup_scheduler(optimizer, warmup_steps, total_steps)
+        print(f"Scheduler: {warmup_steps} warmup steps, {total_steps} total steps")
 
-        patience = 5
+        patience = config.EARLY_STOPPING_PATIENCE
         no_improve = 0
 
         for epoch in range(config.EPOCHS_FINETUNE):
             print(f"\nEpoch {epoch+1}/{config.EPOCHS_FINETUNE} (LR={optimizer.param_groups[0]['lr']:.2e})")
             t0 = time.time()
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+
+            # Train with per-step scheduler updates
+            model.train()
+            total_loss = 0
+            correct = 0
+            total = 0
+            pbar = tqdm(train_loader, desc="Train")
+            for images_batch, labels_batch in pbar:
+                images_batch = images_batch.to(device)
+                labels_batch = labels_batch.to(device)
+
+                optimizer.zero_grad()
+                outputs = model(images_batch)
+                loss = criterion(outputs, labels_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()  # Per-step update for warmup
+
+                total_loss += loss.item() * images_batch.size(0)
+                _, predicted = outputs.max(1)
+                correct += predicted.eq(labels_batch).sum().item()
+                total += labels_batch.size(0)
+                pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{100*correct/total:.1f}%",
+                                 lr=f"{optimizer.param_groups[0]['lr']:.1e}")
+
+            train_loss = total_loss / total
+            train_acc = correct / total
+
             val_loss, val_acc = eval_epoch(model, val_loader, criterion, device)
-            scheduler.step()
 
             elapsed = time.time() - t0
             print(f"  Train loss: {train_loss:.4f}, acc: {100*train_acc:.1f}%")

@@ -170,6 +170,7 @@ public class NightlyStrategyOptimizer
         // ═══════════════════════════════════════════════════════════
         var rawDataSql = @"
             SELECT
+                EXTRACT(DOW FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York')::int AS dow,
                 EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York')::int AS hour_et,
                 CASE ts.""Type"" WHEN 1 THEN 'BUY' ELSE 'SELL' END AS direction,
                 ROUND(ts.""Price""::numeric, 2) AS price,
@@ -180,6 +181,7 @@ public class NightlyStrategyOptimizer
                 ROUND(ts.""SpreadSignal""::numeric, 4) AS spread_signal,
                 ROUND(ts.""LargeOrderSignal""::numeric, 4) AS large_order,
                 ROUND(ts.""Spread""::numeric, 6) AS spread,
+                CASE WHEN ts.""Price"" > 0 THEN ROUND((ts.""Spread"" / ts.""Price"" * 100)::numeric, 4) ELSE 0 END AS spread_pct,
                 ROUND(ts.""Imbalance""::numeric, 4) AS imbalance,
                 ROUND(ts.""Ema9""::numeric, 2) AS ema9,
                 ROUND(ts.""Ema20""::numeric, 2) AS ema20,
@@ -199,14 +201,21 @@ public class NightlyStrategyOptimizer
                 COALESCE(l2.b4, 0) AS b4, COALESCE(l2.b5, 0) AS b5,
                 COALESCE(l2.a1, 0) AS a1, COALESCE(l2.a2, 0) AS a2, COALESCE(l2.a3, 0) AS a3,
                 COALESCE(l2.a4, 0) AS a4, COALESCE(l2.a5, 0) AS a5,
-                -- Outcomes
+                -- Outcomes: price after + P&L (dollar amount per 100 shares)
                 ROUND(ts.""PriceAfter1Min""::numeric, 4) AS price_1m,
                 ROUND(ts.""PriceAfter5Min""::numeric, 4) AS price_5m,
-                CASE WHEN ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"" THEN 1
-                     WHEN ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price"" THEN 1
+                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter1Min"" - ts.""Price"") * 100
+                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter1Min"") * 100
+                           ELSE 0 END::numeric, 2) AS pnl_1m,
+                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter5Min"" - ts.""Price"") * 100
+                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter5Min"") * 100
+                           ELSE 0 END::numeric, 2) AS pnl_5m,
+                -- Spread-adjusted win: only count as win if profit > spread (covers entry+exit cost)
+                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter1Min"" - ts.""Price"") > ts.""Spread"" THEN 1
+                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter1Min"") > ts.""Spread"" THEN 1
                      ELSE 0 END AS win_1m,
-                CASE WHEN ts.""Type"" = 1 AND ts.""PriceAfter5Min"" > ts.""Price"" THEN 1
-                     WHEN ts.""Type"" = 2 AND ts.""PriceAfter5Min"" < ts.""Price"" THEN 1
+                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter5Min"" - ts.""Price"") > ts.""Spread"" THEN 1
+                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter5Min"") > ts.""Spread"" THEN 1
                      ELSE 0 END AS win_5m
             FROM ""TradingSignals"" ts
             LEFT JOIN LATERAL (
@@ -248,50 +257,55 @@ public class NightlyStrategyOptimizer
             while (await reader.ReadAsync())
             {
                 totalRows++;
-                int win1m = reader.IsDBNull(36) ? 0 : reader.GetInt32(36);
-                int win5m = reader.IsDBNull(37) ? 0 : reader.GetInt32(37);
+                // win columns are now at index 40, 41 (after adding dow, spread_pct, pnl_1m, pnl_5m)
+                int win1m = reader.IsDBNull(40) ? 0 : reader.GetInt32(40);
+                int win5m = reader.IsDBNull(41) ? 0 : reader.GetInt32(41);
                 totalWins += win1m;
 
                 // CSV row — compact format to maximize data within token budget
                 rows.Add(string.Join(",",
-                    reader.GetInt32(0),   // hour_et
-                    reader.GetString(1),  // direction
-                    D(reader, 2),         // price
-                    D(reader, 3),         // score
-                    D(reader, 4),         // obi
-                    D(reader, 5),         // wobi
-                    D(reader, 6),         // pressure_roc
-                    D(reader, 7),         // spread_signal
-                    D(reader, 8),         // large_order
-                    D(reader, 9),         // spread
-                    D(reader, 10),        // imbalance
-                    D(reader, 11),        // ema9
-                    D(reader, 12),        // ema20
-                    D(reader, 13),        // rsi14
-                    D(reader, 14),        // vwap
-                    D(reader, 15),        // vol_ratio
-                    D(reader, 16),        // tick_mom
-                    D(reader, 17),        // book_depth
-                    D(reader, 18),        // bid_wall
-                    D(reader, 19),        // ask_wall
-                    D(reader, 20),        // bid_sweep
-                    D(reader, 21),        // ask_sweep
-                    D(reader, 22),        // imb_vel
-                    D(reader, 23),        // spread_pctl
-                    D(reader, 24),        // b1
-                    D(reader, 25),        // b2
-                    D(reader, 26),        // b3
-                    D(reader, 27),        // b4
-                    D(reader, 28),        // b5
-                    D(reader, 29),        // a1
-                    D(reader, 30),        // a2
-                    D(reader, 31),        // a3
-                    D(reader, 32),        // a4
-                    D(reader, 33),        // a5
-                    D(reader, 34),        // price_1m
-                    D(reader, 35),        // price_5m
-                    win1m,                // win_1m
-                    win5m                 // win_5m
+                    reader.GetInt32(0),   // dow (0=Sun, 1=Mon, ..., 5=Fri)
+                    reader.GetInt32(1),   // hour_et
+                    reader.GetString(2),  // direction
+                    D(reader, 3),         // price
+                    D(reader, 4),         // score
+                    D(reader, 5),         // obi
+                    D(reader, 6),         // wobi
+                    D(reader, 7),         // pressure_roc
+                    D(reader, 8),         // spread_signal
+                    D(reader, 9),         // large_order
+                    D(reader, 10),        // spread
+                    D(reader, 11),        // spread_pct
+                    D(reader, 12),        // imbalance
+                    D(reader, 13),        // ema9
+                    D(reader, 14),        // ema20
+                    D(reader, 15),        // rsi14
+                    D(reader, 16),        // vwap
+                    D(reader, 17),        // vol_ratio
+                    D(reader, 18),        // tick_mom
+                    D(reader, 19),        // book_depth
+                    D(reader, 20),        // bid_wall
+                    D(reader, 21),        // ask_wall
+                    D(reader, 22),        // bid_sweep
+                    D(reader, 23),        // ask_sweep
+                    D(reader, 24),        // imb_vel
+                    D(reader, 25),        // spread_pctl
+                    D(reader, 26),        // b1
+                    D(reader, 27),        // b2
+                    D(reader, 28),        // b3
+                    D(reader, 29),        // b4
+                    D(reader, 30),        // b5
+                    D(reader, 31),        // a1
+                    D(reader, 32),        // a2
+                    D(reader, 33),        // a3
+                    D(reader, 34),        // a4
+                    D(reader, 35),        // a5
+                    D(reader, 36),        // price_1m
+                    D(reader, 37),        // price_5m
+                    D(reader, 38),        // pnl_1m
+                    D(reader, 39),        // pnl_5m
+                    win1m,                // win_1m (spread-adjusted)
+                    win5m                 // win_5m (spread-adjusted)
                 ));
             }
         }
@@ -380,7 +394,31 @@ public class NightlyStrategyOptimizer
             ctx.AppendLine($"PriceAction: last=${priceAction.LastClose:F2} 1dChg={priceAction.Change1d:F2}% 5dChg={priceAction.Change5d:F2}% 20dChg={priceAction.Change20d:F2}% avgVol={priceAction.AvgDailyVolume:F0} range20d=${priceAction.Low20d:F2}-${priceAction.High20d:F2}");
         }
 
-        string csvHeader = "hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,win_1m,win_5m";
+        // ═══════════════════════════════════════════════════════════
+        // 3. Previous rules feedback — help Bedrock iterate instead of starting from scratch
+        // ═══════════════════════════════════════════════════════════
+        try
+        {
+            if (File.Exists(StrategyConfigPath))
+            {
+                var prevJson = await File.ReadAllTextAsync(StrategyConfigPath);
+                var prevConfig = System.Text.Json.JsonSerializer.Deserialize<StrategyConfig>(prevJson);
+                if (prevConfig != null && prevConfig.Symbols.TryGetValue(ticker, out var prevSymbol) && prevSymbol.Rules.Count > 0)
+                {
+                    ctx.AppendLine($"PreviousRules (generated {prevConfig.GeneratedAt:yyyy-MM-dd HH:mm} UTC, {prevSymbol.Rules.Count} rules):");
+                    foreach (var rule in prevSymbol.Rules.Take(8))
+                    {
+                        ctx.AppendLine($"  {rule.Id}: {rule.Name} | {rule.Direction} hours=[{string.Join(",", rule.Hours)}] " +
+                                       $"conf={rule.Confidence:F2} samples={rule.SampleSize} hold={rule.HoldSeconds}s stop={rule.StopLoss:F2} " +
+                                       $"expectedPnl=${rule.ExpectedPnlPer100Shares:F2}/100sh");
+                    }
+                    ctx.AppendLine("Use these as a starting point. Keep rules that still show positive P&L in the new data. Drop or modify rules that no longer work. Add new rules for patterns the previous set missed.");
+                }
+            }
+        }
+        catch { /* non-fatal — first run or bad file */ }
+
+        string csvHeader = "dow,hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,spread_pct,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,pnl_1m,pnl_5m,win_1m,win_5m";
 
         return new SymbolData(rows, ctx.ToString(), csvHeader, totalWins);
         }
@@ -720,7 +758,7 @@ public class NightlyStrategyOptimizer
         _logger.LogInformation("Calling Bedrock {Model} for {Ticker} ({RowCount} rows, {Chunks} chunks)...",
             modelId, ticker, rows.Count, (rows.Count + 999) / 1000);
 
-        var systemPrompt = @"You are a quantitative trading strategy optimizer. You receive RAW TRADE DATA — every signal with all indicator values and the actual outcome (price after 1min/5min, win/loss).
+        var systemPrompt = @"You are a quantitative trading strategy optimizer. You receive RAW TRADE DATA — every signal with all indicator values and the actual outcome (P&L in dollars, spread-adjusted win/loss).
 
 Your job: analyze the raw data to discover patterns that predict profitable trades, then output conditional rules as JSON.
 
@@ -729,9 +767,12 @@ Your job: analyze the raw data to discover patterns that predict profitable trad
 - 10 weighted indicators produce a composite score each snapshot
 - YOUR rules are evaluated first — if a rule matches, it fires immediately (bypasses scoring)
 - A PositionMonitor checks exits every 5s (score decay, trailing stops, time gates)
-- Commission: $2.99 per trade ($5.98 round-trip)
+- Positions can be held up to 3x the holdSeconds you specify (e.g., holdSeconds=120 → max 360s)
+- Commission: $0 (both Webull and Questrade have zero-commission US equity trades).
+- The real cost per trade is the SPREAD — you must cross it on entry AND exit. Check the spread_pct column.
 
 ## CSV column definitions
+dow: day of week (1=Mon, 2=Tue, ..., 5=Fri) — Mon open and Fri close trade differently
 hour_et: Eastern Time hour (9=9:30-10 AM, 15=3-4 PM)
 dir: BUY or SELL
 price: entry price
@@ -742,6 +783,7 @@ pressure_roc: rate of change of book pressure
 spread_signal: tight spread=positive, wide=negative
 large_order: large bid orders=positive, large asks=negative
 spread: raw bid-ask spread in dollars
+spread_pct: spread as % of price (0.01 = 1 basis point). THIS IS YOUR COST — trades need to move MORE than this to profit.
 imbalance: raw OBI at snapshot time
 ema9, ema20: exponential moving averages
 rsi14: relative strength index (>70 overbought, <30 oversold)
@@ -753,61 +795,79 @@ bid_wall, ask_wall: max level size / avg level size (wall detection)
 bid_sweep, ask_sweep: total shares on bid/ask side
 imb_vel: imbalance velocity (OBI change per second)
 spread_pctl: spread percentile in last 5 min (0=tightest, 1=widest)
-b1-b5: top 5 bid level sizes (shares) from order book at signal time (b1=best bid, b5=5th level)
-a1-a5: top 5 ask level sizes (shares) from order book at signal time (a1=best ask, a5=5th level)
+b1-b5: top 5 bid level sizes (shares) from order book at signal time
+a1-a5: top 5 ask level sizes (shares) from order book at signal time
   - b1 >> a1 means buyers are front-loading → bullish pressure
   - a1 very large = ask wall (resistance), b1 very large = bid wall (support)
-  - Decreasing sizes (b1>b2>b3) = normal book; b3>>b1 = hidden deep support
   - All zeros means no L2 snapshot was available at signal time
-price_1m: actual price 1 minute after signal
-price_5m: actual price 5 minutes after signal
-win_1m: 1 if trade was profitable at 1 min, 0 if not
-win_5m: 1 if trade was profitable at 5 min, 0 if not
+price_1m: actual midprice 1 minute after signal
+price_5m: actual midprice 5 minutes after signal
+pnl_1m: P&L in $ per 100 shares at 1 min (positive = profitable trade)
+pnl_5m: P&L in $ per 100 shares at 5 min
+win_1m: 1 if profit > spread cost (spread-adjusted), 0 otherwise — NOT just ""price went up""
+win_5m: 1 if profit > spread cost at 5 min, 0 otherwise
 
-## Your task
-1. Study the raw data. Look at winning vs losing trades — what indicator values differ?
-2. Find patterns: time-of-day edges, indicator thresholds, multi-condition combos
-3. Look for interactions the scoring system misses (e.g., OBI matters more when spread is tight)
-4. Output 3-8 high-confidence rules per symbol
-5. Each rule MUST have confidence >= 0.55, sample >= 30, positive expected P&L after $5.98 fee
-6. Set holdSeconds based on whether price_1m or price_5m shows better outcomes for that pattern
-7. Set stopLoss based on the typical adverse move for losing trades in that pattern
-8. Set maxPositionDollars based on price and volatility (default $25K, lower for expensive stocks)";
+## IMPORTANT: Reading the P&L columns
+- pnl_1m/pnl_5m tell you the MAGNITUDE of wins and losses. Use these to set expectedPnlPer100Shares and stopLoss.
+- win_1m/win_5m are SPREAD-ADJUSTED: a tiny price move that doesn't cover the spread counts as a LOSS. Win rates here are realistic.
+- Compare pnl_1m vs pnl_5m to decide holdSeconds: if pnl_5m > pnl_1m for winning patterns, use longer holds.
+
+## Your task — WALK-FORWARD VALIDATION REQUIRED
+The data is sorted most-recent-first. You MUST use walk-forward validation:
+1. Treat the OLDER 75% of rows as your TRAINING set — discover patterns here
+2. Treat the NEWER 25% of rows as your VALIDATION set — verify patterns hold here
+3. A rule is only valid if it is profitable in BOTH the training AND validation sets
+
+Steps:
+1. Study winning vs losing trades in the training set — what indicator values differ? Use pnl columns for magnitude.
+2. Find patterns: day-of-week + time-of-day edges, indicator thresholds, multi-condition combos
+3. CRITICAL: Check spread_pct for each pattern. Rules that trade when spread_pct > 0.05% need MUCH stronger signals.
+4. Look for interactions (e.g., OBI matters more when spread is tight, momentum matters more with high volume)
+5. VALIDATE each candidate rule on the newer 25% — reject rules that don't generalize
+6. Output 3-8 high-confidence rules that pass validation
+7. Each rule MUST have confidence >= 0.55, sample >= 30, positive average pnl_5m IN BOTH train and validation sets
+8. Set holdSeconds (30-600) based on whether pnl_1m or pnl_5m is more favorable for that pattern
+9. Set stopLoss based on the typical adverse pnl for losing trades in that pattern
+10. Set maxPositionDollars based on price and spread_pct (lower for wide-spread stocks)
+
+CRITICAL: Rules that only work on historical data but fail on recent data are WORSE than no rules — they waste commission. Be conservative. A 55% spread-adjusted win rate that holds out-of-sample beats a 70% win rate that only works in-sample.";
 
         var jsonTemplate = $@"{{
   ""tickerId"": {tickerId},
-  ""overallWinRate"": <decimal>,
+  ""overallWinRate"": 0.52,
   ""rules"": [
     {{
       ""id"": ""{ticker}-001"",
-      ""name"": ""<descriptive name>"",
-      ""hours"": [<ET hours>],
-      ""direction"": ""BUY"" or ""SELL"",
+      ""name"": ""descriptive name of the pattern"",
+      ""hours"": [10, 11, 14],
+      ""direction"": ""BUY"",
       ""conditions"": {{
-        ""minObi"": <number or null>, ""maxObi"": <number or null>,
-        ""minImbalanceVelocity"": <number or null>, ""maxImbalanceVelocity"": <number or null>,
-        ""minBidWallSize"": <number or null>, ""minAskWallSize"": <number or null>,
-        ""minBookDepthRatio"": <number or null>, ""maxBookDepthRatio"": <number or null>,
-        ""minBidSweepCost"": <number or null>, ""minAskSweepCost"": <number or null>,
-        ""minSpreadPercentile"": <number or null>, ""maxSpreadPercentile"": <number or null>,
-        ""trendDirection"": <1, -1, or null>,
-        ""minTickMomentum"": <number or null>, ""maxTickMomentum"": <number or null>,
-        ""rsiRange"": [<min>, <max>] or null,
-        ""minVolumeRatio"": <number or null>,
-        ""aboveVwap"": <true, false, or null>
+        ""minObi"": 0.2, ""maxObi"": null,
+        ""minImbalanceVelocity"": null, ""maxImbalanceVelocity"": null,
+        ""minBidWallSize"": null, ""minAskWallSize"": null,
+        ""minBookDepthRatio"": null, ""maxBookDepthRatio"": null,
+        ""minBidSweepCost"": null, ""minAskSweepCost"": null,
+        ""minSpreadPercentile"": null, ""maxSpreadPercentile"": 0.7,
+        ""trendDirection"": 1,
+        ""minTickMomentum"": 0.1, ""maxTickMomentum"": null,
+        ""rsiRange"": [30, 70],
+        ""minVolumeRatio"": 1.0,
+        ""aboveVwap"": true
       }},
-      ""confidence"": <0.55-1.0>,
-      ""expectedPnlPer100Shares"": <positive after $5.98 commission>,
-      ""sampleSize"": <int, >= 30>,
-      ""holdSeconds"": <30-300>,
-      ""stopLoss"": <0.10-2.00>
+      ""confidence"": 0.60,
+      ""expectedPnlPer100Shares"": 8.50,
+      ""sampleSize"": 45,
+      ""holdSeconds"": 120,
+      ""stopLoss"": 0.25
     }}
   ],
-  ""disabledHours"": [<hours with win rate < 48%>],
-  ""maxDailyTrades"": <5-30>,
+  ""disabledHours"": [12, 13],
+  ""maxDailyTrades"": 15,
   ""maxPositionShares"": 500,
-  ""maxPositionDollars"": <default 25000, lower for expensive/volatile>
-}}";
+  ""maxPositionDollars"": 25000
+}}
+
+IMPORTANT: The example above is just a template showing the schema. Replace ALL values with your actual analysis results. Use null for conditions you don't want to constrain. direction must be exactly ""BUY"" or ""SELL"". holdSeconds range: 30-600. stopLoss range: 0.05-2.00.";
 
         try
         {
@@ -822,6 +882,10 @@ win_5m: 1 if trade was profitable at 5 min, 0 if not
             int maxDailyTrades = 20;
             decimal maxPositionDollars = 25000m;
 
+            // Walk-forward split info for Bedrock: data is sorted DESC (most recent first)
+            // First 25% of rows = VALIDATION set (newest), remaining 75% = TRAINING set (older)
+            int valSplitRow = (int)(rows.Count * 0.25);
+
             for (int chunk = 0; chunk < chunkCount; chunk++)
             {
                 var chunkRows = rows.Skip(chunk * chunkSize).Take(chunkSize).ToList();
@@ -834,12 +898,15 @@ win_5m: 1 if trade was profitable at 5 min, 0 if not
                 chunkPrompt.AppendLine(contextSection); // Fundamentals, flows, news (same for all chunks)
                 chunkPrompt.AppendLine();
                 chunkPrompt.AppendLine($"## Raw Trade Data for {ticker} — {chunkLabel}");
+                chunkPrompt.AppendLine($"## Walk-forward split: rows 1-{valSplitRow} are VALIDATION (newest 25%), rows {valSplitRow + 1}-{rows.Count} are TRAINING (oldest 75%)");
                 chunkPrompt.AppendLine(csvHeader);
                 foreach (var row in chunkRows)
                     chunkPrompt.AppendLine(row);
                 chunkPrompt.AppendLine();
                 chunkPrompt.AppendLine($"## Instructions");
-                chunkPrompt.AppendLine($"Analyze this batch of {ticker} trades. Output a JSON object with trading rules you discover.");
+                chunkPrompt.AppendLine($"Analyze this batch of {ticker} trades. The data is sorted newest-first.");
+                chunkPrompt.AppendLine($"Use pnl_1m and pnl_5m columns to understand move magnitudes, not just win/loss.");
+                chunkPrompt.AppendLine($"Discover patterns in TRAINING rows (older 75%), verify they hold in VALIDATION rows (newest 25%).");
                 chunkPrompt.AppendLine($"Output ONLY the JSON object in this format:");
                 chunkPrompt.AppendLine(jsonTemplate);
 

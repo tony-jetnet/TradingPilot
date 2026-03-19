@@ -155,5 +155,5 @@ public class GlobalRules
     public int MinSampleSize { get; set; } = 20;
 
     [JsonPropertyName("commissionPerTrade")]
-    public decimal CommissionPerTrade { get; set; } = 2.99m;
+    public decimal CommissionPerTrade { get; set; } = 0m;
 }

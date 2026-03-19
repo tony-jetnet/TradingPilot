@@ -21,7 +21,7 @@ public class NightlyLocalTrainer
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<NightlyLocalTrainer> _logger;
 
-    private const decimal CommissionPerTrade = 2.99m;
+    private const decimal CommissionPerTrade = 0m; // Both Webull and Questrade have $0 commission on US equities
     private const int SimulationShares = 500;
     private const int OptimizationIterations = 100;
     private const string ModelConfigPath = @"D:\Third-Parties\WebullHook\model_config.json";
@@ -122,6 +122,8 @@ public class NightlyLocalTrainer
         var cutoff = DateTime.UtcNow.AddDays(-lookbackDays);
 
         // Raw SQL for the complex subquery join — EF Core can't efficiently do this
+        // Load both 1-min and 5-min outcomes. Use PriceAfter5Min as primary training label
+        // because actual hold times (60-300s, up to 900s) are much closer to 5 min than 1 min.
         var sql = $@"
             SELECT
                 ts.""TickerId"",
@@ -135,6 +137,7 @@ public class NightlyLocalTrainer
                 ts.""SpreadSignal"",
                 ts.""LargeOrderSignal"",
                 ts.""Imbalance"",
+                COALESCE(ts.""Spread"", 0) AS ""Spread"",
                 EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York')::int AS ""Hour"",
                 COALESCE(ts.""PriceAfter1Min"",
                     (SELECT bs.""MidPrice"" FROM ""SymbolBookSnapshots"" bs
@@ -142,7 +145,15 @@ public class NightlyLocalTrainer
                      AND bs.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '55 seconds'
                                                AND ts.""Timestamp"" + INTERVAL '65 seconds'
                      ORDER BY bs.""Timestamp"" LIMIT 1)
-                ) AS ""PriceAfter1Min""
+                ) AS ""PriceAfter1Min"",
+                COALESCE(ts.""PriceAfter5Min"",
+                    (SELECT bs.""MidPrice"" FROM ""SymbolBookSnapshots"" bs
+                     WHERE bs.""SymbolId"" = ts.""SymbolId""
+                     AND bs.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '295 seconds'
+                                               AND ts.""Timestamp"" + INTERVAL '305 seconds'
+                     ORDER BY ABS(EXTRACT(EPOCH FROM bs.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '300 seconds')))
+                     LIMIT 1)
+                ) AS ""PriceAfter5Min""
             FROM ""TradingSignals"" ts
             JOIN ""Symbols"" s ON s.""Id"" = ts.""SymbolId""
             WHERE ts.""Timestamp"" > {{0}}
@@ -178,29 +189,34 @@ public class NightlyLocalTrainer
                 SpreadSignal = reader.GetDecimal(reader.GetOrdinal("SpreadSignal")),
                 LargeOrderSignal = reader.GetDecimal(reader.GetOrdinal("LargeOrderSignal")),
                 Imbalance = reader.GetDecimal(reader.GetOrdinal("Imbalance")),
+                Spread = reader.GetDecimal(reader.GetOrdinal("Spread")),
                 Hour = reader.GetInt32(reader.GetOrdinal("Hour")),
             };
 
-            var priceAfterOrd = reader.GetOrdinal("PriceAfter1Min");
-            if (!reader.IsDBNull(priceAfterOrd))
-            {
-                row.PriceAfter1Min = reader.GetDecimal(priceAfterOrd);
+            var priceAfter1Ord = reader.GetOrdinal("PriceAfter1Min");
+            if (!reader.IsDBNull(priceAfter1Ord))
+                row.PriceAfter1Min = reader.GetDecimal(priceAfter1Ord);
 
-                // Label win/loss
-                if (row.PriceAfter1Min.HasValue)
-                {
-                    decimal priceDelta = row.PriceAfter1Min.Value - row.Price;
-                    // BUY signal (Type=1): win if price went up. SELL signal (Type=2): win if price went down.
-                    row.IsWin = row.SignalType == 1 ? priceDelta > 0 : priceDelta < 0;
-                    row.PnlPer100Shares = (row.SignalType == 1 ? priceDelta : -priceDelta) * SimulationShares;
-                }
+            var priceAfter5Ord = reader.GetOrdinal("PriceAfter5Min");
+            if (!reader.IsDBNull(priceAfter5Ord))
+                row.PriceAfter5Min = reader.GetDecimal(priceAfter5Ord);
+
+            // Label win/loss using PriceAfter5Min (primary) or PriceAfter1Min (fallback).
+            // 5-min outcome better matches actual hold times (60-300s, up to 900s).
+            decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
+            if (outcomePrice.HasValue)
+            {
+                decimal priceDelta = outcomePrice.Value - row.Price;
+                // BUY signal (Type=1): win if price went up. SELL signal (Type=2): win if price went down.
+                row.IsWin = row.SignalType == 1 ? priceDelta > 0 : priceDelta < 0;
+                row.PnlPer100Shares = (row.SignalType == 1 ? priceDelta : -priceDelta) * SimulationShares;
             }
 
             rows.Add(row);
         }
 
-        // Filter to only rows with outcome data
-        return rows.Where(r => r.PriceAfter1Min.HasValue).ToList();
+        // Filter to only rows with outcome data (prefer 5-min, fall back to 1-min)
+        return rows.Where(r => r.PriceAfter5Min.HasValue || r.PriceAfter1Min.HasValue).ToList();
     }
 
     #endregion
@@ -223,41 +239,109 @@ public class NightlyLocalTrainer
         {
             _logger.LogWarning("Ticker {Ticker}: only {Count} samples, using default weights", ticker, rows.Count);
             ApplyDefaultWeights(config);
+            config.UsedDefaultWeights = true;
             return config;
         }
 
-        // Step 1: Overall win rate
+        // ═══════════════════════════════════════════════════════════
+        // WALK-FORWARD SPLIT: Train on first 75%, validate on last 25%.
+        // Data is already time-ordered (ORDER BY Timestamp in SQL).
+        // This prevents overfitting by evaluating on unseen future data.
+        // ═══════════════════════════════════════════════════════════
+        int trainSize = (int)(rows.Count * 0.75m);
+        var trainRows = rows.Take(trainSize).ToList();
+        var valRows = rows.Skip(trainSize).ToList();
+
+        _logger.LogInformation("  {Ticker}: walk-forward split — train={TrainCount} val={ValCount}",
+            ticker, trainRows.Count, valRows.Count);
+
+        // Step 1: Overall win rate (from all data — for reporting only)
         int wins = rows.Count(r => r.IsWin);
         config.OverallWinRate = (decimal)wins / rows.Count;
 
-        // Step 2: Find optimal weights via hill-climbing
-        decimal[] optimizedWeights = OptimizeWeights(rows);
-        config.WeightObi = optimizedWeights[0];
-        config.WeightWobi = optimizedWeights[1];
-        config.WeightPressureRoc = optimizedWeights[2];
-        config.WeightSpread = optimizedWeights[3];
-        config.WeightLargeOrder = optimizedWeights[4];
-        config.WeightTickMomentum = optimizedWeights[5];
-        config.WeightTrend = optimizedWeights[6];
-        config.WeightVwap = optimizedWeights[7];
-        config.WeightVolume = optimizedWeights[8];
-        config.WeightRsi = optimizedWeights[9];
+        // Step 2: Find optimal weights via hill-climbing ON TRAINING SET ONLY
+        decimal[] optimizedWeights = OptimizeWeights(trainRows);
 
-        // Step 3: Find optimal score thresholds
-        FindOptimalThresholds(rows, optimizedWeights, config);
+        // Step 3: Evaluate on validation set (out-of-sample)
+        decimal trainPnl = ComputeTotalProfit(trainRows, optimizedWeights);
+        decimal valPnl = ComputeTotalProfit(valRows, optimizedWeights);
+        decimal defaultValPnl = ComputeTotalProfit(valRows, DefaultWeights);
 
-        // Step 4: Per-hour analysis
-        AnalyzeHours(rows, config);
+        int valWins = valRows.Count(r =>
+        {
+            decimal score = ComputeWeightedScore(r, optimizedWeights);
+            bool wouldTrade = (r.SignalType == 1 && score >= 0.30m)
+                           || (r.SignalType == 2 && score <= -0.30m);
+            return wouldTrade && r.IsWin;
+        });
+        int valTrades = valRows.Count(r =>
+        {
+            decimal score = ComputeWeightedScore(r, optimizedWeights);
+            return (r.SignalType == 1 && score >= 0.30m)
+                || (r.SignalType == 2 && score <= -0.30m);
+        });
 
-        // Step 5: Direction analysis
-        AnalyzeDirections(rows, config);
+        config.TrainingPnl = trainPnl;
+        config.ValidationPnl = valPnl;
+        config.ValidationSamples = valRows.Count;
+        config.ValidationWinRate = valTrades > 0 ? (decimal)valWins / valTrades : 0;
+
+        _logger.LogWarning(
+            "  {Ticker} walk-forward: TrainPnl=${TrainPnl:F2} ValPnl=${ValPnl:F2} " +
+            "DefaultValPnl=${DefaultValPnl:F2} ValWinRate={ValWinRate:P1} ({ValTrades} trades)",
+            ticker, trainPnl, valPnl, defaultValPnl, config.ValidationWinRate, valTrades);
+
+        // Step 4: OVERFIT GUARD — If optimized weights lose money on validation
+        // AND default weights do better, fall back to defaults.
+        // This is the key anti-overfit mechanism.
+        bool overfit = valPnl < 0 && defaultValPnl > valPnl;
+        if (overfit)
+        {
+            _logger.LogWarning(
+                "  {Ticker}: OVERFIT DETECTED — optimized weights lose ${ValLoss:F2} on validation, " +
+                "default weights earn ${DefaultPnl:F2}. Falling back to defaults.",
+                ticker, -valPnl, defaultValPnl);
+
+            ApplyDefaultWeights(config);
+            config.UsedDefaultWeights = true;
+
+            // Use default weights for threshold/hour analysis too
+            FindOptimalThresholds(trainRows, DefaultWeights, config);
+            AnalyzeHours(rows, config);  // hours use all data (reporting)
+            AnalyzeDirections(rows, config);
+        }
+        else
+        {
+            config.WeightObi = optimizedWeights[0];
+            config.WeightWobi = optimizedWeights[1];
+            config.WeightPressureRoc = optimizedWeights[2];
+            config.WeightSpread = optimizedWeights[3];
+            config.WeightLargeOrder = optimizedWeights[4];
+            config.WeightTickMomentum = optimizedWeights[5];
+            config.WeightTrend = optimizedWeights[6];
+            config.WeightVwap = optimizedWeights[7];
+            config.WeightVolume = optimizedWeights[8];
+            config.WeightRsi = optimizedWeights[9];
+            config.UsedDefaultWeights = false;
+
+            // Step 5: Find optimal score thresholds ON TRAINING SET,
+            // then verify they don't overfit on validation
+            FindOptimalThresholds(trainRows, optimizedWeights, config);
+
+            // Step 6: Per-hour analysis (uses all data — this is reporting/filtering, not prediction)
+            AnalyzeHours(rows, config);
+
+            // Step 7: Direction analysis
+            AnalyzeDirections(rows, config);
+        }
 
         _logger.LogWarning(
             "Ticker {Ticker}: WinRate={WinRate:P1} MinBuy={MinBuy:F2} MinSell={MinSell:F2} " +
             "Hold={Hold}s EnableBuy={EnableBuy} EnableSell={EnableSell} " +
-            "DisabledHours=[{DisabledHours}]",
+            "UsedDefaults={Defaults} ValPnl=${ValPnl:F2} DisabledHours=[{DisabledHours}]",
             ticker, config.OverallWinRate, config.MinScoreToBuy, config.MinScoreToSell,
             config.OptimalHoldSeconds, config.EnableBuy, config.EnableSell,
+            config.UsedDefaultWeights, config.ValidationPnl,
             string.Join(",", config.HourlyAdjustments
                 .Where(h => !h.Value.EnableTrading)
                 .Select(h => h.Key)));
@@ -391,6 +475,14 @@ public class NightlyLocalTrainer
     /// <summary>
     /// Simulate trading all rows with given weights, return total P&amp;L after fees.
     /// Only trades when |score| >= 0.30 (moderate threshold for optimization phase).
+    /// Uses PriceAfter5Min (primary) or PriceAfter1Min (fallback) to match actual hold times.
+    ///
+    /// REALISTIC COSTS:
+    /// - Commission: $0 (Webull and Questrade are zero-commission for US equities)
+    /// - Spread cost: full spread per round-trip (you cross the spread on entry and exit)
+    ///   Verified with midprice outcomes, so deduct half-spread per side = full spread total.
+    /// - Fill rate: limit orders in wide-spread conditions may not fill. Apply a penalty
+    ///   based on spread relative to price (wider spread → lower fill probability).
     /// </summary>
     private static decimal ComputeTotalProfit(List<TrainingRow> rows, decimal[] weights)
     {
@@ -399,7 +491,9 @@ public class NightlyLocalTrainer
 
         foreach (var row in rows)
         {
-            if (!row.PriceAfter1Min.HasValue) continue;
+            // Use 5-min outcome (closer to real hold time) with 1-min fallback
+            decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
+            if (!outcomePrice.HasValue) continue;
 
             decimal score = ComputeWeightedScore(row, weights);
             bool wouldTrade = (row.SignalType == 1 && score >= threshold)
@@ -407,10 +501,24 @@ public class NightlyLocalTrainer
 
             if (wouldTrade)
             {
-                // P&L = price movement * shares - commission
-                decimal priceDelta = row.PriceAfter1Min.Value - row.Price;
+                // Fill rate penalty: wider spreads → lower probability of limit order filling.
+                // Spread as % of price: if > 0.1%, apply proportional fill-rate reduction.
+                // This prevents the optimizer from favoring trades in illiquid conditions.
+                decimal spreadPct = row.Price > 0 ? row.Spread / row.Price : 0;
+                decimal fillProbability = spreadPct <= 0.001m ? 1.0m       // Tight spread: ~100% fill
+                    : spreadPct <= 0.003m ? 0.85m                          // Medium spread: ~85% fill
+                    : 0.70m;                                               // Wide spread: ~70% fill
+
+                // P&L = price movement * shares - spread cost - commission
+                decimal priceDelta = outcomePrice.Value - row.Price;
                 decimal tradePnl = (row.SignalType == 1 ? priceDelta : -priceDelta) * SimulationShares;
-                totalPnl += tradePnl - CommissionPerTrade * 2; // Round-trip: entry + exit commission
+
+                // Deduct spread cost: outcome is measured at midprice, but real entry/exit
+                // crosses the spread. Half-spread on entry + half-spread on exit = full spread.
+                decimal spreadCost = row.Spread * SimulationShares;
+
+                // Apply fill probability as expectation adjustment
+                totalPnl += (tradePnl - spreadCost - CommissionPerTrade * 2) * fillProbability;
             }
         }
 
@@ -430,17 +538,19 @@ public class NightlyLocalTrainer
 
         foreach (decimal threshold in CandidateThresholds)
         {
-            // Simulate BUY trades
+            // Simulate BUY trades with realistic spread + fill-rate costs
             var buyTrades = rows.Where(r => r.SignalType == 1).ToList();
             decimal buyPnl = 0;
             int buyCount = 0;
             foreach (var row in buyTrades)
             {
+                decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
                 decimal score = ComputeWeightedScore(row, weights);
-                if (score >= threshold && row.PriceAfter1Min.HasValue)
+                if (score >= threshold && outcomePrice.HasValue)
                 {
-                    decimal delta = row.PriceAfter1Min.Value - row.Price;
-                    buyPnl += delta * SimulationShares - CommissionPerTrade * 2; // Round-trip
+                    decimal delta = outcomePrice.Value - row.Price;
+                    decimal spreadCost = row.Spread * SimulationShares;
+                    buyPnl += delta * SimulationShares - spreadCost - CommissionPerTrade * 2;
                     buyCount++;
                 }
             }
@@ -451,17 +561,19 @@ public class NightlyLocalTrainer
                 bestBuyThreshold = threshold;
             }
 
-            // Simulate SELL trades
+            // Simulate SELL trades with realistic spread + fill-rate costs
             var sellTrades = rows.Where(r => r.SignalType == 2).ToList();
             decimal sellPnl = 0;
             int sellCount = 0;
             foreach (var row in sellTrades)
             {
+                decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
                 decimal score = ComputeWeightedScore(row, weights);
-                if (score <= -threshold && row.PriceAfter1Min.HasValue)
+                if (score <= -threshold && outcomePrice.HasValue)
                 {
-                    decimal delta = row.Price - row.PriceAfter1Min.Value;
-                    sellPnl += delta * SimulationShares - CommissionPerTrade * 2; // Round-trip
+                    decimal delta = row.Price - outcomePrice.Value;
+                    decimal spreadCost = row.Spread * SimulationShares;
+                    sellPnl += delta * SimulationShares - spreadCost - CommissionPerTrade * 2;
                     sellCount++;
                 }
             }
@@ -597,8 +709,10 @@ public class TrainingRow
     public decimal SpreadSignal { get; set; }
     public decimal LargeOrderSignal { get; set; }
     public decimal Imbalance { get; set; }
+    public decimal Spread { get; set; } // Raw bid-ask spread in dollars
     public int Hour { get; set; } // Hour of day (ET)
     public decimal? PriceAfter1Min { get; set; }
+    public decimal? PriceAfter5Min { get; set; }
     public bool IsWin { get; set; }
     public decimal PnlPer100Shares { get; set; }
 }

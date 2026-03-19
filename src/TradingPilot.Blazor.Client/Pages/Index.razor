@@ -226,12 +226,28 @@
                             <div class="tp-stat-val">@_data.PnlSummary.LosingTrades</div>
                         </div>
                         <div class="tp-stat">
-                            <div class="tp-stat-label">Commissions</div>
-                            <div class="tp-stat-val tp-muted">-@FormatPnl(_data.PnlSummary.TotalCommissions)</div>
+                            <div class="tp-stat-label">Expectancy</div>
+                            <div class="tp-stat-val @PnlClass(_data.PnlSummary.Expectancy)" title="Avg $ per trade. Positive = edge exists.">@FormatPnl(_data.PnlSummary.Expectancy)</div>
                         </div>
                         <div class="tp-stat">
-                            <div class="tp-stat-label">Today Trades</div>
-                            <div class="tp-stat-val">@_data.PnlSummary.TodayTrades</div>
+                            <div class="tp-stat-label">Profit Factor</div>
+                            <div class="tp-stat-val @(_data.PnlSummary.ProfitFactor >= 1.5m ? "tp-up" : _data.PnlSummary.ProfitFactor >= 1.0m ? "tp-muted" : "tp-down")" title="Gross profit / gross loss. Need > 1.5 to survive real costs.">@_data.PnlSummary.ProfitFactor.ToString("F2")</div>
+                        </div>
+                        <div class="tp-stat">
+                            <div class="tp-stat-label">Sharpe</div>
+                            <div class="tp-stat-val @(_data.PnlSummary.SharpeRatio >= 2.0m ? "tp-up" : _data.PnlSummary.SharpeRatio >= 1.0m ? "tp-muted" : "tp-down")" title="Risk-adjusted return (annualized). > 1 decent, > 2 strong.">@_data.PnlSummary.SharpeRatio.ToString("F2")</div>
+                        </div>
+                        <div class="tp-stat">
+                            <div class="tp-stat-label">Sortino</div>
+                            <div class="tp-stat-val @(_data.PnlSummary.SortinoRatio >= 2.0m ? "tp-up" : _data.PnlSummary.SortinoRatio >= 1.0m ? "tp-muted" : "tp-down")" title="Like Sharpe but only penalizes downside. Better for asymmetric strategies.">@_data.PnlSummary.SortinoRatio.ToString("F2")</div>
+                        </div>
+                        <div class="tp-stat">
+                            <div class="tp-stat-label">Max DD</div>
+                            <div class="tp-stat-val tp-down" title="Largest peak-to-trough equity drawdown today.">@FormatPnl(_data.PnlSummary.MaxDrawdown)</div>
+                        </div>
+                        <div class="tp-stat">
+                            <div class="tp-stat-label">Max Consec Loss</div>
+                            <div class="tp-stat-val @(_data.PnlSummary.MaxConsecutiveLosses >= 5 ? "tp-down" : "tp-muted")" title="Longest consecutive losing streak.">@_data.PnlSummary.MaxConsecutiveLosses</div>
                         </div>
                     </div>
                 </div>

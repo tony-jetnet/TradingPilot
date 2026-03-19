@@ -283,6 +283,29 @@ def render_all(symbol_filter: str | None = None, preview: int = 0):
         print(f"Saved to {config.DATA_DIR}/images.npy and labels.npy")
         print(f"Images shape: {images_arr.shape}, Labels shape: {labels_arr.shape}")
 
+        # ── Compute actual per-channel statistics for normalization ────
+        # These replace the wrong ImageNet stats (natural photos ≠ L2 heatmaps).
+        # Stored in channel_stats.json and used by train.py and export_onnx.py.
+        import json
+        imgs_float = images_arr.astype(np.float32) / 255.0
+        mean_per_channel = imgs_float.mean(axis=(0, 1, 2)).tolist()  # [R, G, B]
+        std_per_channel = imgs_float.std(axis=(0, 1, 2)).tolist()
+        # Avoid division by zero in normalization
+        std_per_channel = [max(s, 1e-6) for s in std_per_channel]
+
+        stats = {
+            "mean": mean_per_channel,
+            "std": std_per_channel,
+            "num_samples": len(images_arr),
+            "computed_at": datetime.utcnow().isoformat(),
+        }
+        stats_path = config.CHANNEL_STATS_PATH
+        with open(stats_path, "w") as f:
+            json.dump(stats, f, indent=2)
+        print(f"Channel statistics saved to {stats_path}")
+        print(f"  Mean (R,G,B): [{mean_per_channel[0]:.4f}, {mean_per_channel[1]:.4f}, {mean_per_channel[2]:.4f}]")
+        print(f"  Std  (R,G,B): [{std_per_channel[0]:.4f}, {std_per_channel[1]:.4f}, {std_per_channel[2]:.4f}]")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Render L2 heatmaps")

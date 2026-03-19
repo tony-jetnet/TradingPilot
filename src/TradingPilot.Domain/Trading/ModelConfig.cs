@@ -43,6 +43,13 @@ public class TickerModelConfig
     public int OptimalHoldSeconds { get; set; } = 60;
     public decimal StopLossAmount { get; set; } = 0.30m;
 
+    // Walk-forward validation metrics (out-of-sample)
+    public int ValidationSamples { get; set; }
+    public decimal ValidationWinRate { get; set; }
+    public decimal ValidationPnl { get; set; }
+    public decimal TrainingPnl { get; set; }
+    public bool UsedDefaultWeights { get; set; }
+
     // Per time-of-day adjustments (hour 9-16 ET)
     public Dictionary<int, HourlyAdjustment> HourlyAdjustments { get; set; } = new();
 }

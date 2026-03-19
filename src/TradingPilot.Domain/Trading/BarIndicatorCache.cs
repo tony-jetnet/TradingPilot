@@ -39,6 +39,12 @@ public class BarIndicators
     /// <summary>CurrentVolume / AvgVolume20 ratio.</summary>
     public decimal VolumeRatio { get; set; }
 
+    // Volatility
+    /// <summary>14-period Average True Range (from 1-min bars). Used for position sizing.</summary>
+    public decimal Atr14 { get; set; }
+    /// <summary>ATR14 as a percentage of the last close price. Used for volatility-normalized sizing.</summary>
+    public decimal Atr14Pct { get; set; }
+
     // Trend signals
     /// <summary>+1 = bullish (EMA9 > EMA20), -1 = bearish, 0 = neutral.</summary>
     public int TrendDirection { get; set; }

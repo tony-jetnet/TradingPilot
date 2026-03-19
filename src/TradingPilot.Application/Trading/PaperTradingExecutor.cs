@@ -27,6 +27,7 @@ public class PaperTradingExecutor
     private readonly IBrokerClient _broker;
     private readonly SignalStore _signalStore;
     private readonly L2BookCache _l2Cache;
+    private readonly BarIndicatorCache _barCache;
     private readonly MarketMicrostructureAnalyzer _analyzer;
     private readonly ILogger<PaperTradingExecutor> _logger;
 
@@ -48,6 +49,7 @@ public class PaperTradingExecutor
         IBrokerClient broker,
         SignalStore signalStore,
         L2BookCache l2Cache,
+        BarIndicatorCache barCache,
         MarketMicrostructureAnalyzer analyzer,
         IConfiguration configuration,
         ILogger<PaperTradingExecutor> logger)
@@ -55,6 +57,7 @@ public class PaperTradingExecutor
         _broker = broker;
         _signalStore = signalStore;
         _l2Cache = l2Cache;
+        _barCache = barCache;
         _analyzer = analyzer;
         _logger = logger;
 
@@ -214,6 +217,18 @@ public class PaperTradingExecutor
         }
 
         // ═══════════════════════════════════════════════════════════
+        // MARKET REGIME FILTER: Skip entry when microstructure is unfavorable.
+        // Wide spreads = low liquidity / high uncertainty = poor fill quality.
+        // ═══════════════════════════════════════════════════════════
+        decimal spreadPctile = signal.Indicators.GetValueOrDefault("SpreadPercentile", 0.5m);
+        if (spreadPctile >= 0.90m)
+        {
+            _logger.LogDebug("Skipping entry for {Ticker}: spread at {Pctile:P0} — unfavorable regime",
+                signal.Ticker, spreadPctile);
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════════
         // CHECK MOMENTUM: get price 30s ago from L2BookCache
         // Block entry if no valid momentum reading (cold ticker protection)
         // ═══════════════════════════════════════════════════════════
@@ -253,7 +268,11 @@ public class PaperTradingExecutor
         {
             string action = isBuyEntry ? "BUY" : "SELL";
 
-            // Dollar-based position sizing
+            // ═══════════════════════════════════════════════════════════
+            // ATR-BASED POSITION SIZING: Normalize risk across symbols.
+            // Higher ATR% → smaller position. Target: each position risks
+            // roughly the same dollar amount of adverse move per ATR unit.
+            // ═══════════════════════════════════════════════════════════
             decimal maxDollars = _maxPositionDollars;
             var strategyConfig = _analyzer.RuleEvaluator.CurrentConfig;
             if (strategyConfig != null &&
@@ -268,6 +287,24 @@ public class PaperTradingExecutor
                 _logger.LogWarning("[PaperTrader] Rejecting entry for {Ticker}: invalid price {Price}", signal.Ticker, signal.Price);
                 return;
             }
+
+            // ATR-based scaling: reduce position for volatile stocks
+            var barIndicators = _barCache.GetIndicators(signal.TickerId);
+            if (barIndicators != null && barIndicators.Atr14Pct > 0)
+            {
+                // Target ATR% baseline: 0.15% (typical for large-cap intraday 1-min bars).
+                // If a stock's ATR% is 2x the baseline, halve the position.
+                const decimal baselineAtrPct = 0.0015m;
+                decimal atrScaleFactor = baselineAtrPct / barIndicators.Atr14Pct;
+                // Clamp between 0.25x and 2.0x to avoid extreme sizing
+                atrScaleFactor = Math.Clamp(atrScaleFactor, 0.25m, 2.0m);
+                maxDollars *= atrScaleFactor;
+
+                _logger.LogDebug(
+                    "[PaperTrader] {Ticker}: ATR14={Atr:F4} ({AtrPct:P3}) scaleFactor={Scale:F2} maxDollars=${MaxDollars:F0}",
+                    signal.Ticker, barIndicators.Atr14, barIndicators.Atr14Pct, atrScaleFactor, maxDollars);
+            }
+
             int qty = Math.Max(1, (int)(maxDollars / signal.Price));
 
             // Use limit order at current price (market orders don't work in extended hours)

@@ -64,6 +64,20 @@ def export_onnx(checkpoint_path: str, output_path: str):
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"Model size: {size_mb:.1f} MB")
 
+    # ── Load actual channel statistics (not ImageNet defaults) ─────────
+    channel_mean = [0.485, 0.456, 0.406]  # fallback
+    channel_std = [0.229, 0.224, 0.225]
+    stats_path = config.CHANNEL_STATS_PATH
+    if os.path.exists(stats_path):
+        with open(stats_path, "r") as f:
+            stats = json.load(f)
+        channel_mean = stats["mean"]
+        channel_std = stats["std"]
+        print(f"Using L2 channel stats from {stats['num_samples']} samples")
+    else:
+        print("WARNING: channel_stats.json not found, using ImageNet defaults in metadata.")
+        print("  Run render_heatmap.py first to compute actual L2 channel statistics.")
+
     # Save metadata alongside the ONNX model
     meta_path = output_path.replace(".onnx", "_meta.json")
     meta = {
@@ -74,9 +88,12 @@ def export_onnx(checkpoint_path: str, output_path: str):
         "window_snapshots": config.WINDOW_SNAPSHOTS,
         "horizon_seconds": config.HORIZON_SECONDS,
         "normalization": {
-            "mean": [0.485, 0.456, 0.406],
-            "std": [0.229, 0.224, 0.225],
+            "mean": channel_mean,
+            "std": channel_std,
         },
+        "up_threshold": config.UP_THRESHOLD,
+        "down_threshold": config.DOWN_THRESHOLD,
+        "stride_snapshots": config.STRIDE_SNAPSHOTS,
         "exported_at": str(np.datetime64("now")),
         "checkpoint": os.path.basename(checkpoint_path),
         "total_params": total_params,

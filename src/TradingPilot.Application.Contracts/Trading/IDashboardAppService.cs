@@ -113,6 +113,20 @@ public class PnlSummaryDto
     public int TodayTrades { get; set; }
     public decimal TodayPnl { get; set; }
     public List<SourcePnlDto> SourceBreakdown { get; set; } = new();
+
+    // Risk-adjusted performance metrics — tells you if your edge is real
+    /// <summary>Expectancy per trade: (WinRate * AvgWin) + (LossRate * AvgLoss). Positive = edge exists.</summary>
+    public decimal Expectancy { get; set; }
+    /// <summary>Gross profits / Gross losses. Must be > 1.0 to be profitable, > 1.5 to survive fees/slippage.</summary>
+    public decimal ProfitFactor { get; set; }
+    /// <summary>Annualized Sharpe ratio: mean(returns) / stddev(returns) * sqrt(252). > 1.0 = decent, > 2.0 = strong.</summary>
+    public decimal SharpeRatio { get; set; }
+    /// <summary>Like Sharpe but only penalizes downside volatility. Better for asymmetric return profiles.</summary>
+    public decimal SortinoRatio { get; set; }
+    /// <summary>Longest consecutive losing streak today.</summary>
+    public int MaxConsecutiveLosses { get; set; }
+    /// <summary>Largest peak-to-trough equity drawdown today (always negative or zero).</summary>
+    public decimal MaxDrawdown { get; set; }
 }
 
 public class StrategyStatusDto

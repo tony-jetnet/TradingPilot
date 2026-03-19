@@ -20,9 +20,10 @@ public class SwinPredictor : IDisposable
     private const int ImageSize = 224;
     private const int WindowSnapshots = 300;
 
-    // ImageNet normalization (must match training)
-    private static readonly float[] Mean = [0.485f, 0.456f, 0.406f];
-    private static readonly float[] Std = [0.229f, 0.224f, 0.225f];
+    // Normalization stats — loaded from _meta.json (actual L2 heatmap statistics).
+    // Falls back to ImageNet if meta not found (first run before training).
+    private float[] _mean = [0.485f, 0.456f, 0.406f];
+    private float[] _std = [0.229f, 0.224f, 0.225f];
 
     private readonly ILogger<SwinPredictor> _logger;
     private InferenceSession? _session;
@@ -187,9 +188,10 @@ public class SwinPredictor : IDisposable
     }
 
     /// <summary>
-    /// Convert HWC uint8 image to CHW float32 tensor with ImageNet normalization.
+    /// Convert HWC uint8 image to CHW float32 tensor with channel normalization.
+    /// Uses stats from _meta.json (actual L2 heatmap data), not ImageNet defaults.
     /// </summary>
-    private static float[] PreprocessImage(byte[,,] pixels)
+    private float[] PreprocessImage(byte[,,] pixels)
     {
         var tensor = new float[3 * ImageSize * ImageSize];
         for (int c = 0; c < 3; c++)
@@ -199,7 +201,7 @@ public class SwinPredictor : IDisposable
                 for (int x = 0; x < ImageSize; x++)
                 {
                     float val = pixels[y, x, c] / 255f;
-                    val = (val - Mean[c]) / Std[c];
+                    val = (val - _mean[c]) / _std[c];
                     tensor[c * ImageSize * ImageSize + y * ImageSize + x] = val;
                 }
             }
@@ -242,12 +244,46 @@ public class SwinPredictor : IDisposable
             _session = new InferenceSession(OnnxPath, options);
             _modelLoadedAt = DateTime.UtcNow;
 
+            // Load normalization stats from _meta.json (computed from actual L2 heatmaps)
+            LoadNormalizationStats();
+
             _logger.LogWarning("Swin ONNX model loaded from {Path}", OnnxPath);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to load Swin ONNX model");
             _session = null;
+        }
+    }
+
+    private void LoadNormalizationStats()
+    {
+        try
+        {
+            if (!File.Exists(MetaPath)) return;
+
+            var json = File.ReadAllText(MetaPath);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("normalization", out var norm))
+            {
+                if (norm.TryGetProperty("mean", out var meanArr) && meanArr.GetArrayLength() == 3)
+                {
+                    _mean = [meanArr[0].GetSingle(), meanArr[1].GetSingle(), meanArr[2].GetSingle()];
+                }
+                if (norm.TryGetProperty("std", out var stdArr) && stdArr.GetArrayLength() == 3)
+                {
+                    _std = [stdArr[0].GetSingle(), stdArr[1].GetSingle(), stdArr[2].GetSingle()];
+                }
+            }
+
+            _logger.LogInformation("Swin normalization: mean=[{M0:F4},{M1:F4},{M2:F4}] std=[{S0:F4},{S1:F4},{S2:F4}]",
+                _mean[0], _mean[1], _mean[2], _std[0], _std[1], _std[2]);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load Swin meta, using default normalization");
         }
     }
 
