@@ -46,6 +46,7 @@ public class BrokerPosition
     public string Symbol { get; set; } = "";
     public int Quantity { get; set; }
     public decimal AvgPrice { get; set; }
+    public decimal LastPrice { get; set; }
     public decimal MarketValue { get; set; }
     public decimal UnrealizedPnl { get; set; }
 }
@@ -68,6 +69,7 @@ public class BrokerOrder
     public string Action { get; set; } = "";
     public string Status { get; set; } = "";
     public int Quantity { get; set; }
+    public int FilledQuantity { get; set; }
     public decimal? LimitPrice { get; set; }
     public decimal? FilledPrice { get; set; }
     public DateTime? FilledTime { get; set; }

@@ -45,7 +45,7 @@ def export_onnx(checkpoint_path: str, output_path: str):
         dummy_input,
         output_path,
         export_params=True,
-        opset_version=17,
+        opset_version=18,
         do_constant_folding=True,
         input_names=["image"],
         output_names=["logits"],

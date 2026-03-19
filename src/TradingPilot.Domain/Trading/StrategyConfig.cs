@@ -135,7 +135,7 @@ public class RuleConditions
 
     // RSI range
     [JsonPropertyName("rsiRange")]
-    public decimal[]? RsiRange { get; set; } // [min, max]
+    public decimal?[]? RsiRange { get; set; } // [min, max], elements can be null
 
     // Volume
     [JsonPropertyName("minVolumeRatio")]

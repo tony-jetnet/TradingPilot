@@ -21,7 +21,8 @@ public class PaperTradingExecutor
     private readonly int _rateLimitSeconds;
     private readonly int _orderTimeoutMinutes;
 
-    private const decimal MomentumThreshold = 0.02m;
+    // Momentum as % of mid price — adaptive to any price level
+    private const decimal MomentumThresholdPct = 0.0001m; // 0.01% of mid price
 
     private readonly IBrokerClient _broker;
     private readonly SignalStore _signalStore;
@@ -34,10 +35,14 @@ public class PaperTradingExecutor
     private readonly ConcurrentDictionary<string, PositionState> _positions = new();
     private readonly ConcurrentDictionary<string, PendingOrder> _pendingExits = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastTradeTime = new();
+    // Daily trade counter per symbol (reset on date change)
+    private readonly ConcurrentDictionary<string, int> _dailyTradeCount = new();
+    private DateOnly _dailyTradeDate = DateOnly.FromDateTime(DateTime.UtcNow);
 
-    // Cached broker account (5s TTL)
+    // Cached broker account (5s TTL) — guarded by SemaphoreSlim for thread safety
     private BrokerAccount? _cachedAccount;
     private DateTime _accountCacheTime;
+    private readonly SemaphoreSlim _accountLock = new(1, 1);
 
     public PaperTradingExecutor(
         IBrokerClient broker,
@@ -82,18 +87,30 @@ public class PaperTradingExecutor
     /// <summary>
     /// Get cached broker account (5s TTL).
     /// </summary>
-    private async Task<BrokerAccount?> GetCachedAccountAsync()
+    public async Task<BrokerAccount?> GetCachedAccountAsync()
     {
         if (_cachedAccount != null && (DateTime.UtcNow - _accountCacheTime).TotalSeconds < 5)
             return _cachedAccount;
 
-        var account = await _broker.GetAccountAsync();
-        if (account != null)
+        await _accountLock.WaitAsync();
+        try
         {
-            _cachedAccount = account;
-            _accountCacheTime = DateTime.UtcNow;
+            // Double-check after acquiring lock
+            if (_cachedAccount != null && (DateTime.UtcNow - _accountCacheTime).TotalSeconds < 5)
+                return _cachedAccount;
+
+            var account = await _broker.GetAccountAsync();
+            if (account != null)
+            {
+                _cachedAccount = account;
+                _accountCacheTime = DateTime.UtcNow;
+            }
+            return account;
         }
-        return account;
+        finally
+        {
+            _accountLock.Release();
+        }
     }
 
     /// <summary>
@@ -139,6 +156,27 @@ public class PaperTradingExecutor
         if (_lastTradeTime.TryGetValue(signal.Ticker, out var lastTime)
             && (DateTime.UtcNow - lastTime).TotalSeconds < _rateLimitSeconds)
             return;
+
+        // Daily trade count limit per symbol (from strategy config)
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        if (today != _dailyTradeDate)
+        {
+            _dailyTradeCount.Clear();
+            _dailyTradeDate = today;
+        }
+        {
+            var stratCfg = _analyzer.RuleEvaluator.CurrentConfig;
+            if (stratCfg != null && stratCfg.Symbols.TryGetValue(signal.Ticker, out var symCfg))
+            {
+                int count = _dailyTradeCount.GetValueOrDefault(signal.Ticker, 0);
+                if (count >= symCfg.MaxDailyTrades)
+                {
+                    _logger.LogDebug("Skipping entry for {Ticker}: daily trade limit ({Max}) reached",
+                        signal.Ticker, symCfg.MaxDailyTrades);
+                    return;
+                }
+            }
+        }
 
         decimal score = signal.Indicators.GetValueOrDefault("CompositeScore");
 
@@ -200,12 +238,16 @@ public class PaperTradingExecutor
         }
 
         decimal momentum = latestSnapshot.MidPrice - olderSnapshot.MidPrice;
+        // Price-relative momentum threshold: scales with stock price
+        decimal momentumThreshold = latestSnapshot.MidPrice > 0
+            ? latestSnapshot.MidPrice * MomentumThresholdPct
+            : 0.01m;
 
         // ═══════════════════════════════════════════════════════════
         // ENTRY: Strong signal + aligned with meaningful momentum
         // ═══════════════════════════════════════════════════════════
-        bool isBuyEntry = signal.Type == SignalType.Buy && score >= minScoreEntry && momentum >= MomentumThreshold;
-        bool isSellEntry = signal.Type == SignalType.Sell && score <= -minScoreEntry && momentum <= -MomentumThreshold;
+        bool isBuyEntry = signal.Type == SignalType.Buy && score >= minScoreEntry && momentum >= momentumThreshold;
+        bool isSellEntry = signal.Type == SignalType.Sell && score <= -minScoreEntry && momentum <= -momentumThreshold;
 
         if (isBuyEntry || isSellEntry)
         {
@@ -247,6 +289,7 @@ public class PaperTradingExecutor
             if (result.Success && result.OrderId != null)
             {
                 _lastTradeTime[signal.Ticker] = DateTime.UtcNow;
+                _dailyTradeCount.AddOrUpdate(signal.Ticker, 1, (_, count) => count + 1);
                 // Invalidate cached account so next signal sees fresh state
                 _cachedAccount = null;
 
@@ -379,23 +422,40 @@ public class PaperTradingExecutor
                 var order = await _broker.GetOrderAsync(pending.OrderId);
                 if (order == null) continue;
 
-                if (order.Status == "Filled")
+                if (order.Status is "Filled" or "PartiallyFilled")
                 {
+                    int filledQty = order.FilledQuantity > 0 ? order.FilledQuantity : pending.Quantity;
+                    decimal filledPrice = order.FilledPrice ?? pending.LimitPrice;
+
+                    if (order.Status == "PartiallyFilled")
+                    {
+                        // Partial fill: create position for filled shares, cancel remainder
+                        if (filledQty <= 0) continue; // No shares actually filled yet
+                        await _broker.CancelOrderAsync(pending.OrderId);
+                        _logger.LogWarning("ENTRY PARTIAL FILL: {Action} {Filled}/{Total} {Symbol} @ {Price}, cancelled remainder | OrderId={OrderId}",
+                            pending.Action, filledQty, pending.Quantity, symbol, filledPrice, pending.OrderId);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("ENTRY CONFIRMED: {Action} {Qty} {Symbol} @ {FilledPrice} | OrderId={OrderId}",
+                            pending.Action, filledQty, symbol, filledPrice, pending.OrderId);
+                    }
+
                     var pos = new PositionState
                     {
                         Symbol = pending.Symbol,
                         TickerId = pending.TickerId,
-                        Shares = pending.Action == "BUY" ? pending.Quantity : -pending.Quantity,
-                        EntryPrice = order.FilledPrice ?? pending.LimitPrice,
+                        Shares = pending.Action == "BUY" ? filledQty : -filledQty,
+                        EntryPrice = filledPrice,
                         EntryTime = order.FilledTime ?? DateTime.UtcNow,
                         EntryScore = pending.EntryScore,
                         PeakFavorableScore = pending.EntryScore,
-                        PeakFavorablePrice = order.FilledPrice ?? pending.LimitPrice,
+                        PeakFavorablePrice = filledPrice,
                         EntryImbalance = pending.EntryImbalance,
                         EntrySpread = pending.EntrySpread,
                         EntrySpreadPercentile = pending.EntrySpreadPercentile,
                         EntryTrendDirection = pending.EntryTrendDirection,
-                        NotionalValue = (order.FilledPrice ?? pending.LimitPrice) * pending.Quantity,
+                        NotionalValue = filledPrice * filledQty,
                         EntryRuleId = pending.EntryRuleId,
                         RuleConfidence = pending.RuleConfidence,
                         HoldSeconds = pending.HoldSeconds,
@@ -404,8 +464,6 @@ public class PaperTradingExecutor
                     _positions[symbol] = pos;
                     _pendingEntries.TryRemove(symbol, out _);
                     _cachedAccount = null; // Invalidate so next signal check sees fresh state
-                    _logger.LogWarning("ENTRY CONFIRMED: {Action} {Qty} {Symbol} @ {FilledPrice} | OrderId={OrderId}",
-                        pending.Action, pending.Quantity, symbol, order.FilledPrice, pending.OrderId);
                 }
                 else if (order.Status is "Cancelled" or "Rejected" or "Expired")
                 {
@@ -439,18 +497,50 @@ public class PaperTradingExecutor
                 var order = await _broker.GetOrderAsync(pending.OrderId);
                 if (order == null) continue;
 
-                if (order.Status == "Filled")
+                if (order.Status is "Filled" or "PartiallyFilled")
                 {
-                    // Compute P&L from actual fill prices for logging
+                    int filledQty = order.FilledQuantity > 0 ? order.FilledQuantity : pending.Quantity;
+                    decimal filledPrice = order.FilledPrice ?? pending.LimitPrice;
+
                     if (_positions.TryGetValue(symbol, out var pos))
                     {
-                        decimal filledPrice = order.FilledPrice ?? pending.LimitPrice;
-                        decimal pnl = (pos.IsLong ? filledPrice - pos.EntryPrice : pos.EntryPrice - filledPrice) * Math.Abs(pos.Shares);
-                        _logger.LogWarning("EXIT CONFIRMED: {Action} {Qty} {Symbol} @ {FilledPrice} | P&L=${Pnl:F2} | OrderId={OrderId}",
-                            pending.Action, pending.Quantity, symbol, order.FilledPrice, pnl, pending.OrderId);
+                        decimal pnl = (pos.IsLong ? filledPrice - pos.EntryPrice : pos.EntryPrice - filledPrice) * filledQty;
+
+                        if (order.Status == "PartiallyFilled")
+                        {
+                            // Partial exit: adjust position shares, cancel remainder, monitor will re-exit
+                            if (filledQty <= 0) continue;
+                            await _broker.CancelOrderAsync(pending.OrderId);
+                            int remaining = Math.Abs(pos.Shares) - filledQty;
+                            pos.Shares = pos.IsLong ? remaining : -remaining;
+                            pos.PendingExitOrderId = null;
+                            _pendingExits.TryRemove(symbol, out _);
+
+                            if (remaining <= 0)
+                            {
+                                _positions.TryRemove(symbol, out _);
+                                _logger.LogWarning("EXIT PARTIAL→FULL: {Action} {Qty} {Symbol} @ {Price} | P&L=${Pnl:F2} | OrderId={OrderId}",
+                                    pending.Action, filledQty, symbol, filledPrice, pnl, pending.OrderId);
+                            }
+                            else
+                            {
+                                _logger.LogWarning("EXIT PARTIAL FILL: {Action} {Filled}/{Total} {Symbol} @ {Price} | P&L=${Pnl:F2} remaining={Remaining} — monitor will re-exit | OrderId={OrderId}",
+                                    pending.Action, filledQty, pending.Quantity, symbol, filledPrice, pnl, remaining, pending.OrderId);
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogWarning("EXIT CONFIRMED: {Action} {Qty} {Symbol} @ {FilledPrice} | P&L=${Pnl:F2} | OrderId={OrderId}",
+                                pending.Action, filledQty, symbol, filledPrice, pnl, pending.OrderId);
+                            _positions.TryRemove(symbol, out _);
+                            _pendingExits.TryRemove(symbol, out _);
+                        }
                     }
-                    _positions.TryRemove(symbol, out _);
-                    _pendingExits.TryRemove(symbol, out _);
+                    else
+                    {
+                        // Position already removed (e.g. by broker sync), just clean up pending
+                        _pendingExits.TryRemove(symbol, out _);
+                    }
                     _cachedAccount = null; // Invalidate cache
                 }
                 else if (order.Status is "Cancelled" or "Rejected" or "Expired")
@@ -500,29 +590,65 @@ public class PaperTradingExecutor
             foreach (var (symbol, brokerPos) in brokerSymbols)
             {
                 // If we have a pending entry for this symbol and broker already has it, the entry filled
-                if (_pendingEntries.ContainsKey(symbol))
-                    _pendingEntries.TryRemove(symbol, out _);
+                PendingOrder? pendingEntry = null;
+                if (_pendingEntries.TryRemove(symbol, out var removed))
+                    pendingEntry = removed;
 
                 if (!_positions.ContainsKey(symbol))
                 {
-                    long tickerId = _broker.ResolveInternalId(symbol);
-                    _positions[symbol] = new PositionState
+                    long tickerId = pendingEntry?.TickerId ?? _broker.ResolveInternalId(symbol);
+                    var tickerConfig = _analyzer.CurrentModelConfig?.Tickers.GetValueOrDefault(tickerId);
+
+                    // Preserve pending entry metadata if available (avoids losing hold/stop/score settings)
+                    if (pendingEntry != null)
                     {
-                        Symbol = symbol,
-                        TickerId = tickerId,
-                        Shares = brokerPos.Quantity,
-                        EntryPrice = brokerPos.AvgPrice,
-                        EntryTime = DateTime.UtcNow,
-                        EntryScore = 0,
-                        PeakFavorableScore = 0,
-                        PeakFavorablePrice = brokerPos.AvgPrice,
-                        NotionalValue = brokerPos.MarketValue,
-                        EntryRuleId = "RECOVERED",
-                        HoldSeconds = 120, // Conservative default
-                        StopLoss = 0.50m,
-                    };
-                    _logger.LogWarning("ADOPTED broker position: {Symbol} {Qty} shares @ {AvgPrice} (tickerId={TickerId})",
-                        symbol, brokerPos.Quantity, brokerPos.AvgPrice, tickerId);
+                        _positions[symbol] = new PositionState
+                        {
+                            Symbol = symbol,
+                            TickerId = tickerId,
+                            Shares = brokerPos.Quantity,
+                            EntryPrice = brokerPos.AvgPrice,
+                            EntryTime = DateTime.UtcNow,
+                            EntryScore = pendingEntry.EntryScore,
+                            PeakFavorableScore = pendingEntry.EntryScore,
+                            PeakFavorablePrice = brokerPos.AvgPrice,
+                            EntryImbalance = pendingEntry.EntryImbalance,
+                            EntrySpread = pendingEntry.EntrySpread,
+                            EntrySpreadPercentile = pendingEntry.EntrySpreadPercentile,
+                            EntryTrendDirection = pendingEntry.EntryTrendDirection,
+                            NotionalValue = brokerPos.MarketValue,
+                            EntryRuleId = pendingEntry.EntryRuleId,
+                            RuleConfidence = pendingEntry.RuleConfidence,
+                            HoldSeconds = pendingEntry.HoldSeconds,
+                            StopLoss = pendingEntry.StopLoss,
+                        };
+                        _logger.LogWarning("ADOPTED broker position (from pending entry): {Symbol} {Qty} shares @ {AvgPrice} | hold={Hold}s stop={Stop} ruleId={RuleId}",
+                            symbol, brokerPos.Quantity, brokerPos.AvgPrice,
+                            pendingEntry.HoldSeconds, pendingEntry.StopLoss, pendingEntry.EntryRuleId);
+                    }
+                    else
+                    {
+                        // Compute initial score so recovered positions have meaningful exit thresholds
+                        decimal initialScore = _analyzer.ComputeCurrentScore(tickerId);
+                        _positions[symbol] = new PositionState
+                        {
+                            Symbol = symbol,
+                            TickerId = tickerId,
+                            Shares = brokerPos.Quantity,
+                            EntryPrice = brokerPos.AvgPrice,
+                            EntryTime = DateTime.UtcNow,
+                            EntryScore = initialScore,
+                            PeakFavorableScore = initialScore,
+                            PeakFavorablePrice = brokerPos.AvgPrice,
+                            NotionalValue = brokerPos.MarketValue,
+                            EntryRuleId = "RECOVERED",
+                            HoldSeconds = tickerConfig?.OptimalHoldSeconds ?? 120,
+                            StopLoss = tickerConfig?.StopLossAmount ?? 0.50m,
+                        };
+                        _logger.LogWarning("ADOPTED broker position: {Symbol} {Qty} shares @ {AvgPrice} (hold={Hold}s stop={Stop} score={Score:F3})",
+                            symbol, brokerPos.Quantity, brokerPos.AvgPrice,
+                            tickerConfig?.OptimalHoldSeconds ?? 120, tickerConfig?.StopLossAmount ?? 0.50m, initialScore);
+                    }
                 }
             }
 
@@ -577,6 +703,9 @@ public class PaperTradingExecutor
             foreach (var brokerPos in account.Positions.Where(p => p.Quantity != 0))
             {
                 long tickerId = _broker.ResolveInternalId(brokerPos.Symbol);
+                var tickerConfig = _analyzer.CurrentModelConfig?.Tickers.GetValueOrDefault(tickerId);
+                // Compute current score so recovered positions have meaningful exit thresholds
+                decimal initialScore = _analyzer.ComputeCurrentScore(tickerId);
                 _positions[brokerPos.Symbol] = new PositionState
                 {
                     Symbol = brokerPos.Symbol,
@@ -584,13 +713,13 @@ public class PaperTradingExecutor
                     Shares = brokerPos.Quantity,
                     EntryPrice = brokerPos.AvgPrice,
                     EntryTime = DateTime.UtcNow,
-                    EntryScore = 0,
-                    PeakFavorableScore = 0,
+                    EntryScore = initialScore,
+                    PeakFavorableScore = initialScore,
                     PeakFavorablePrice = brokerPos.AvgPrice,
                     NotionalValue = brokerPos.MarketValue,
                     EntryRuleId = "STARTUP",
-                    HoldSeconds = 120,
-                    StopLoss = 0.50m,
+                    HoldSeconds = tickerConfig?.OptimalHoldSeconds ?? 120,
+                    StopLoss = tickerConfig?.StopLossAmount ?? 0.50m,
                 };
                 adopted++;
             }

@@ -109,7 +109,8 @@ public class StrategyRuleEvaluator
 
         if (c.RsiRange is { Length: 2 })
         {
-            if (ind.Rsi14 < c.RsiRange[0] || ind.Rsi14 > c.RsiRange[1]) return false;
+            if (c.RsiRange[0].HasValue && ind.Rsi14 < c.RsiRange[0].Value) return false;
+            if (c.RsiRange[1].HasValue && ind.Rsi14 > c.RsiRange[1].Value) return false;
         }
 
         if (c.MinVolumeRatio.HasValue && ind.VolumeRatio < c.MinVolumeRatio.Value) return false;

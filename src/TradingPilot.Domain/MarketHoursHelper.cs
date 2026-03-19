@@ -5,8 +5,8 @@ public static class MarketHoursHelper
     private static readonly TimeZoneInfo Eastern =
         TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
-    private static readonly TimeOnly MarketOpen = new(9, 30);
-    private static readonly TimeOnly MarketClose = new(16, 0);
+    private static readonly TimeOnly MarketOpen = new(7, 30);
+    private static readonly TimeOnly MarketClose = new(18, 0);
 
     public static bool IsMarketOpen(DateTime utcNow)
     {

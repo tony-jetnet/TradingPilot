@@ -136,11 +136,26 @@ public class PositionMonitor : IDisposable
 
     private async Task EvaluatePositionAsync(string symbol, PositionState pos)
     {
-        // Get current price from latest L2 snapshot (uses tickerId for cache lookup)
+        // Get current price — try L2 cache first, fall back to tick/quote cache
+        decimal currentPrice = 0;
         var snapshots = _l2Cache.GetSnapshots(pos.TickerId, 1);
-        if (snapshots.Count == 0) return;
-
-        decimal currentPrice = snapshots[^1].MidPrice;
+        if (snapshots.Count > 0)
+        {
+            currentPrice = snapshots[^1].MidPrice;
+        }
+        else
+        {
+            var fallbackTick = _tickCache.GetData(pos.TickerId);
+            if (fallbackTick?.LastPrice > 0)
+                currentPrice = fallbackTick.LastPrice;
+            else
+            {
+                var barInd = _barCache.GetIndicators(pos.TickerId);
+                if (barInd != null && barInd.Ema9 > 0)
+                    currentPrice = barInd.Ema9; // Last known price proxy
+            }
+        }
+        if (currentPrice <= 0) return; // No price source at all
         decimal currentScore = _analyzer.ComputeCurrentScore(pos.TickerId);
 
         // Update peak favorable score

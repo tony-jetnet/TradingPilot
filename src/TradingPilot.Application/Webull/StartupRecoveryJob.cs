@@ -8,14 +8,15 @@ using Volo.Abp.Uow;
 namespace TradingPilot.Webull;
 
 /// <summary>
-/// Lightweight startup job: backfills news for watched symbols.
-/// L2 and tick data come from MQTT streaming — no need to fetch here.
-/// Heavy backfill (TickSnapshots + TradingSignals) runs nightly.
+/// Startup job: backfills news and schedules historical bar loads for watched symbols.
+/// Bar loads are staggered via Hangfire to avoid Webull 403 rate limits.
+/// Heavy backfill (TradingSignals from bars) runs nightly.
 /// </summary>
 [AutomaticRetry(Attempts = 3)]
 public class StartupRecoveryJob
 {
     private readonly IWebullApiClient _api;
+    private readonly IBackgroundJobClient _jobClient;
     private readonly IRepository<Symbol, string> _symbolRepo;
     private readonly IRepository<SymbolNews, Guid> _newsRepo;
     private readonly IAsyncQueryableExecuter _asyncExecuter;
@@ -27,6 +28,7 @@ public class StartupRecoveryJob
 
     public StartupRecoveryJob(
         IWebullApiClient api,
+        IBackgroundJobClient jobClient,
         IRepository<Symbol, string> symbolRepo,
         IRepository<SymbolNews, Guid> newsRepo,
         IAsyncQueryableExecuter asyncExecuter,
@@ -34,6 +36,7 @@ public class StartupRecoveryJob
         ILogger<StartupRecoveryJob> logger)
     {
         _api = api;
+        _jobClient = jobClient;
         _symbolRepo = symbolRepo;
         _newsRepo = newsRepo;
         _asyncExecuter = asyncExecuter;
@@ -61,11 +64,28 @@ public class StartupRecoveryJob
             return;
         }
 
+        // Schedule historical bar loads, staggered by 30s to avoid 403 rate limits
+        if (MarketHoursHelper.IsMarketOpen(DateTime.UtcNow))
+        {
+            string[] timeframes = ["m1"];
+            for (int i = 0; i < watched.Count; i++)
+            {
+                var ticker = watched[i].Id;
+                var tf = timeframes;
+                _jobClient.Schedule<LoadHistoricalBarsJob>(
+                    job => job.ExecuteAsync(ticker, tf),
+                    TimeSpan.FromSeconds(30 + i * 30));
+            }
+            _logger.LogInformation("Scheduled bar backfill for {Count} symbols (staggered 30s apart)", watched.Count);
+        }
+
+        // Backfill news
         foreach (var symbol in watched)
         {
             try
             {
                 var items = await _api.GetTickerNewsAsync(authHeader, symbol.WebullTickerId);
+                await Task.Delay(1_000); // rate limit news API calls
                 if (items.Count > 0)
                 {
                     int inserted = 0;

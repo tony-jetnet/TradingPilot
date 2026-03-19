@@ -10,6 +10,7 @@ public interface IDashboardAppService : IApplicationService
 public class DashboardDto
 {
     public List<SymbolLiveDto> Symbols { get; set; } = new();
+    public List<PositionDto> OpenPositions { get; set; } = new();
     public List<TradeDto> RecentTrades { get; set; } = new();
     public List<SignalDto> RecentSignals { get; set; } = new();
     public PnlSummaryDto PnlSummary { get; set; } = new();
@@ -17,6 +18,21 @@ public class DashboardDto
     public string HookStatus { get; set; } = "Unknown";
     public StreamingHealthDto StreamingHealth { get; set; } = new();
     public List<SymbolHealthDto> SymbolHealth { get; set; } = new();
+}
+
+public class PositionDto
+{
+    public string Ticker { get; set; } = "";
+    public string Side { get; set; } = ""; // Long / Short
+    public int Quantity { get; set; }
+    public decimal AvgPrice { get; set; }
+    public decimal CurrentPrice { get; set; }
+    public decimal MarketValue { get; set; }
+    public decimal UnrealizedPnl { get; set; }
+    public decimal UnrealizedPnlPercent { get; set; }
+    public decimal EntryScore { get; set; }
+    public int HoldSeconds { get; set; }
+    public string? EntryRuleId { get; set; }
 }
 
 public class SymbolLiveDto
@@ -55,7 +71,19 @@ public class TradeDto
     public decimal Price { get; set; }
     public decimal Score { get; set; }
     public string Reason { get; set; } = "";
+    public string Source { get; set; } = ""; // RULE, SWIN, WEIGHTED
     public string? Status { get; set; }
+}
+
+public class SourcePnlDto
+{
+    public string Source { get; set; } = ""; // RULE, SWIN, WEIGHTED
+    public int Trades { get; set; }
+    public int Wins { get; set; }
+    public int Losses { get; set; }
+    public decimal WinRate { get; set; }
+    public decimal TotalPnl { get; set; }
+    public decimal AvgPnl { get; set; }
 }
 
 public class SignalDto
@@ -84,6 +112,7 @@ public class PnlSummaryDto
     public decimal WorstTrade { get; set; }
     public int TodayTrades { get; set; }
     public decimal TodayPnl { get; set; }
+    public List<SourcePnlDto> SourceBreakdown { get; set; } = new();
 }
 
 public class StrategyStatusDto

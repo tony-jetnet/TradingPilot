@@ -17,7 +17,7 @@ namespace TradingPilot.Trading;
 /// Replaces NightlyModelTrainer's hill-climbing approach with LLM pattern discovery.
 ///
 /// Two-stage architecture:
-///   Stage 1: Pre-compute rich features (L2-derived) stored in TickSnapshots (done in real-time)
+///   Stage 1: Real-time signals with all indicators stored directly in TradingSignals
 ///   Stage 2: Query DB for per-symbol stats, call Bedrock once per symbol, output strategy_rules.json
 /// </summary>
 [DisableConcurrentExecution(600)]
@@ -47,6 +47,18 @@ public class NightlyStrategyOptimizer
 
         try
         {
+            // 0. Skip if rules were already generated today (non-empty file)
+            if (File.Exists(StrategyConfigPath))
+            {
+                var fileInfo = new FileInfo(StrategyConfigPath);
+                if (fileInfo.LastWriteTimeUtc.Date == DateTime.UtcNow.Date && fileInfo.Length > 100)
+                {
+                    _logger.LogWarning("Strategy rules already generated today ({LastWrite:HH:mm} UTC, {Size}B). Skipping Bedrock calls.",
+                        fileInfo.LastWriteTimeUtc, fileInfo.Length);
+                    return;
+                }
+            }
+
             // 1. Get all active symbols
             var symbols = await GetActiveSymbolsAsync();
             if (symbols.Count == 0)
@@ -154,10 +166,8 @@ public class NightlyStrategyOptimizer
         try
         {
         // ═══════════════════════════════════════════════════════════
-        // 1. Raw trade data: TradingSignals JOIN TickSnapshots
-        //    Every signal with all indicator values + outcome
+        // 1. Raw trade data from TradingSignals + L2 book shape from SymbolBookSnapshots
         // ═══════════════════════════════════════════════════════════
-        // Raw trade data + L2 order book shape (top 5 bid/ask sizes from nearest snapshot)
         var rawDataSql = @"
             SELECT
                 EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York')::int AS hour_et,
@@ -194,7 +204,10 @@ public class NightlyStrategyOptimizer
                 ROUND(ts.""PriceAfter5Min""::numeric, 4) AS price_5m,
                 CASE WHEN ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"" THEN 1
                      WHEN ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price"" THEN 1
-                     ELSE 0 END AS win_1m
+                     ELSE 0 END AS win_1m,
+                CASE WHEN ts.""Type"" = 1 AND ts.""PriceAfter5Min"" > ts.""Price"" THEN 1
+                     WHEN ts.""Type"" = 2 AND ts.""PriceAfter5Min"" < ts.""Price"" THEN 1
+                     ELSE 0 END AS win_5m
             FROM ""TradingSignals"" ts
             LEFT JOIN LATERAL (
                 SELECT
@@ -235,8 +248,9 @@ public class NightlyStrategyOptimizer
             while (await reader.ReadAsync())
             {
                 totalRows++;
-                int win = reader.IsDBNull(36) ? 0 : reader.GetInt32(36);
-                totalWins += win;
+                int win1m = reader.IsDBNull(36) ? 0 : reader.GetInt32(36);
+                int win5m = reader.IsDBNull(37) ? 0 : reader.GetInt32(37);
+                totalWins += win1m;
 
                 // CSV row — compact format to maximize data within token budget
                 rows.Add(string.Join(",",
@@ -276,7 +290,8 @@ public class NightlyStrategyOptimizer
                     D(reader, 33),        // a5
                     D(reader, 34),        // price_1m
                     D(reader, 35),        // price_5m
-                    win                   // win_1m
+                    win1m,                // win_1m
+                    win5m                 // win_5m
                 ));
             }
         }
@@ -291,11 +306,16 @@ public class NightlyStrategyOptimizer
             ticker, totalRows, totalRows > 0 ? (decimal)totalWins / totalRows : 0);
 
         // ═══════════════════════════════════════════════════════════
-        // 2. Context section (fundamentals, capital flows, news — shared across all chunks)
+        // 2. Context section (stats, fundamentals, capital flows, news)
         // ═══════════════════════════════════════════════════════════
         var fundamentals = await GetLatestFinancialsAsync(connection, symbolId);
         var capitalFlows = await GetRecentCapitalFlowsAsync(connection, symbolId, lookbackDays);
         var recentNews = await GetRecentNewsAsync(connection, symbolId, lookbackDays);
+        var hourlyStats = await GetHourlyStatsAsync(connection, symbolId, cutoff);
+        var indicatorStats = await GetIndicatorEffectivenessAsync(connection, symbolId, cutoff);
+        var comboStats = await GetIndicatorCombinationsAsync(connection, symbolId, cutoff);
+        var recentVsHist = await GetRecentVsHistoricalAsync(connection, symbolId, cutoff);
+        var priceAction = await GetRecentPriceActionAsync(connection, symbolId);
 
         var ctx = new StringBuilder();
         ctx.AppendLine($"## {ticker} (tickerId={tickerId}) — {totalRows} total trades, last {lookbackDays} days, win rate {(totalRows > 0 ? (decimal)totalWins / totalRows * 100 : 0):F1}%");
@@ -325,7 +345,42 @@ public class NightlyStrategyOptimizer
                 ctx.AppendLine($"  [{news.PublishedAt:MMM dd}] {news.Title}");
         }
 
-        string csvHeader = "hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,win_1m";
+        if (hourlyStats.Count > 0)
+        {
+            ctx.AppendLine("HourlyPerformance (ET hour | total | buyWin% | sellWin% | buyAvgPnl | sellAvgPnl):");
+            foreach (var h in hourlyStats)
+            {
+                decimal buyWr = h.BuySignals > 0 ? (decimal)h.BuyWins / h.BuySignals * 100 : 0;
+                decimal sellWr = h.SellSignals > 0 ? (decimal)h.SellWins / h.SellSignals * 100 : 0;
+                ctx.AppendLine($"  {h.Hour}:00 | {h.TotalSignals} | {buyWr:F0}% | {sellWr:F0}% | ${h.BuyAvgPnl:F2} | ${h.SellAvgPnl:F2}");
+            }
+        }
+
+        if (indicatorStats.Count > 0)
+        {
+            ctx.AppendLine("IndicatorEffectiveness (name | highWin% | lowWin% | neutralWin%):");
+            foreach (var ind in indicatorStats)
+                ctx.AppendLine($"  {ind.Name} | {ind.HighWinRate:F1}% | {ind.LowWinRate:F1}% | {ind.NeutralWinRate:F1}%");
+        }
+
+        if (comboStats.Count > 0)
+        {
+            ctx.AppendLine("IndicatorCombos (name | bothHighWin% | bothLowWin% | samples):");
+            foreach (var c in comboStats)
+                ctx.AppendLine($"  {c.Name} | {c.BothHighWinRate:F1}% | {c.BothLowWinRate:F1}% | {c.Samples}");
+        }
+
+        if (recentVsHist != null)
+        {
+            ctx.AppendLine($"Recent5d vs Full: buyWin={recentVsHist.Recent5dBuyWinRate:F1}% sellWin={recentVsHist.Recent5dSellWinRate:F1}% spread={recentVsHist.Recent5dAvgSpread:F4} (full avg={recentVsHist.FullAvgSpread:F4})");
+        }
+
+        if (priceAction != null)
+        {
+            ctx.AppendLine($"PriceAction: last=${priceAction.LastClose:F2} 1dChg={priceAction.Change1d:F2}% 5dChg={priceAction.Change5d:F2}% 20dChg={priceAction.Change20d:F2}% avgVol={priceAction.AvgDailyVolume:F0} range20d=${priceAction.Low20d:F2}-${priceAction.High20d:F2}");
+        }
+
+        string csvHeader = "hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,win_1m,win_5m";
 
         return new SymbolData(rows, ctx.ToString(), csvHeader, totalWins);
         }
@@ -346,7 +401,7 @@ public class NightlyStrategyOptimizer
     }
 
     private async Task<List<HourlyStat>> GetHourlyStatsAsync(
-        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, DateTime cutoff)
     {
         var sql = @"
             SELECT
@@ -393,30 +448,43 @@ public class NightlyStrategyOptimizer
     }
 
     private async Task<List<IndicatorStat>> GetIndicatorEffectivenessAsync(
-        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, DateTime cutoff)
     {
-        // Query indicator effectiveness from TickSnapshots joined with TradingSignals
-        var indicators = new[] { "ObiSmoothed", "Wobi", "PressureRoc", "LargeOrderSignal", "SpreadSignal" };
+        // All indicators are now stored directly on TradingSignals — no TickSnapshots JOIN needed
         var results = new List<IndicatorStat>();
 
-        // connection is already open (passed from PrepareSymbolAnalysisAsync)
+        // Core L2 indicators (range -1 to +1)
+        var coreIndicators = new (string Column, decimal HighThresh, decimal LowThresh)[] {
+            ("ObiSmoothed", 0.3m, -0.3m),
+            ("Wobi", 0.3m, -0.3m),
+            ("PressureRoc", 0.3m, -0.3m),
+            ("LargeOrderSignal", 0.3m, -0.3m),
+            ("SpreadSignal", 0.3m, -0.3m),
+            ("BookDepthRatio", 0.8m, 0.2m),
+            ("BidWallSize", 3.0m, 1.0m),
+            ("AskWallSize", 3.0m, 1.0m),
+            ("ImbalanceVelocity", 0.1m, -0.05m),
+            ("SpreadPercentile", 0.8m, 0.2m),
+            ("TickMomentum", 0.3m, -0.3m),
+            ("VolumeRatio", 1.5m, 0.5m),
+        };
 
-        foreach (var indName in indicators)
+        foreach (var (col, highThresh, lowThresh) in coreIndicators)
         {
             var sql = $@"
                 SELECT
-                    COUNT(*) FILTER (WHERE ts.""{indName}"" > 0.3 AND ts.""PriceAfter1Min"" IS NOT NULL
+                    COUNT(*) FILTER (WHERE ts.""{col}"" > @p2 AND ts.""PriceAfter1Min"" IS NOT NULL
                         AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
                           OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""HighWins"",
-                    COUNT(*) FILTER (WHERE ts.""{indName}"" > 0.3 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""HighTotal"",
-                    COUNT(*) FILTER (WHERE ts.""{indName}"" < -0.3 AND ts.""PriceAfter1Min"" IS NOT NULL
+                    COUNT(*) FILTER (WHERE ts.""{col}"" > @p2 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""HighTotal"",
+                    COUNT(*) FILTER (WHERE ts.""{col}"" < @p3 AND ts.""PriceAfter1Min"" IS NOT NULL
                         AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
                           OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""LowWins"",
-                    COUNT(*) FILTER (WHERE ts.""{indName}"" < -0.3 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""LowTotal"",
-                    COUNT(*) FILTER (WHERE ts.""{indName}"" BETWEEN -0.3 AND 0.3 AND ts.""PriceAfter1Min"" IS NOT NULL
+                    COUNT(*) FILTER (WHERE ts.""{col}"" < @p3 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""LowTotal"",
+                    COUNT(*) FILTER (WHERE ts.""{col}"" BETWEEN @p3 AND @p2 AND ts.""PriceAfter1Min"" IS NOT NULL
                         AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
                           OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""NeutralWins"",
-                    COUNT(*) FILTER (WHERE ts.""{indName}"" BETWEEN -0.3 AND 0.3 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""NeutralTotal""
+                    COUNT(*) FILTER (WHERE ts.""{col}"" BETWEEN @p3 AND @p2 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""NeutralTotal""
                 FROM ""TradingSignals"" ts
                 WHERE ts.""SymbolId"" = @p0 AND ts.""Timestamp"" > @p1";
 
@@ -424,6 +492,8 @@ public class NightlyStrategyOptimizer
             cmd.CommandText = sql;
             AddParameter(cmd, "@p0", symbolId);
             AddParameter(cmd, "@p1", cutoff);
+            AddParameter(cmd, "@p2", highThresh);
+            AddParameter(cmd, "@p3", lowThresh);
             cmd.CommandTimeout = 60;
 
             using var reader = await cmd.ExecuteReaderAsync();
@@ -433,174 +503,103 @@ public class NightlyStrategyOptimizer
                 int lowWins = reader.GetInt32(2), lowTotal = reader.GetInt32(3);
                 int neutralWins = reader.GetInt32(4), neutralTotal = reader.GetInt32(5);
 
+                if (highTotal + lowTotal >= 10)
+                {
+                    results.Add(new IndicatorStat
+                    {
+                        Name = col,
+                        HighWinRate = highTotal > 0 ? (decimal)highWins / highTotal * 100 : 50,
+                        LowWinRate = lowTotal > 0 ? (decimal)lowWins / lowTotal * 100 : 50,
+                        NeutralWinRate = neutralTotal > 0 ? (decimal)neutralWins / neutralTotal * 100 : 50,
+                    });
+                }
+            }
+        }
+
+        // RSI zones + EMA trend + VWAP position — all from TradingSignals directly
+        var rsiSql = @"
+            SELECT
+                COUNT(*) FILTER (WHERE ts.""Rsi14"" > 70
+                    AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
+                      OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""OverboughtWins"",
+                COUNT(*) FILTER (WHERE ts.""Rsi14"" > 70 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""OverboughtTotal"",
+                COUNT(*) FILTER (WHERE ts.""Rsi14"" < 30
+                    AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
+                      OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""OversoldWins"",
+                COUNT(*) FILTER (WHERE ts.""Rsi14"" < 30 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""OversoldTotal"",
+                COUNT(*) FILTER (WHERE ts.""Ema9"" > ts.""Ema20"" AND ts.""Ema9"" > 0
+                    AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
+                      OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""UptrendWins"",
+                COUNT(*) FILTER (WHERE ts.""Ema9"" > ts.""Ema20"" AND ts.""Ema9"" > 0 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""UptrendTotal"",
+                COUNT(*) FILTER (WHERE ts.""Ema9"" < ts.""Ema20"" AND ts.""Ema9"" > 0
+                    AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
+                      OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""DowntrendWins"",
+                COUNT(*) FILTER (WHERE ts.""Ema9"" < ts.""Ema20"" AND ts.""Ema9"" > 0 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""DowntrendTotal"",
+                COUNT(*) FILTER (WHERE ts.""Vwap"" > 0 AND ts.""Price"" > ts.""Vwap""
+                    AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
+                      OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""AboveVwapWins"",
+                COUNT(*) FILTER (WHERE ts.""Vwap"" > 0 AND ts.""Price"" > ts.""Vwap"" AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""AboveVwapTotal"",
+                COUNT(*) FILTER (WHERE ts.""Vwap"" > 0 AND ts.""Price"" <= ts.""Vwap""
+                    AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
+                      OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""BelowVwapWins"",
+                COUNT(*) FILTER (WHERE ts.""Vwap"" > 0 AND ts.""Price"" <= ts.""Vwap"" AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""BelowVwapTotal""
+            FROM ""TradingSignals"" ts
+            WHERE ts.""SymbolId"" = @p0 AND ts.""Timestamp"" > @p1 AND ts.""PriceAfter1Min"" IS NOT NULL";
+
+        using var rsiCmd = connection.CreateCommand();
+        rsiCmd.CommandText = rsiSql;
+        AddParameter(rsiCmd, "@p0", symbolId);
+        AddParameter(rsiCmd, "@p1", cutoff);
+        rsiCmd.CommandTimeout = 60;
+
+        using var rsiReader = await rsiCmd.ExecuteReaderAsync();
+        if (await rsiReader.ReadAsync())
+        {
+            int obWins = rsiReader.GetInt32(0), obTotal = rsiReader.GetInt32(1);
+            int osWins = rsiReader.GetInt32(2), osTotal = rsiReader.GetInt32(3);
+            if (obTotal > 10 || osTotal > 10)
+            {
                 results.Add(new IndicatorStat
                 {
-                    Name = indName,
-                    HighWinRate = highTotal > 0 ? (decimal)highWins / highTotal * 100 : 50,
-                    LowWinRate = lowTotal > 0 ? (decimal)lowWins / lowTotal * 100 : 50,
-                    NeutralWinRate = neutralTotal > 0 ? (decimal)neutralWins / neutralTotal * 100 : 50,
+                    Name = "RSI14 (overbought>70 / oversold<30)",
+                    HighWinRate = obTotal > 0 ? (decimal)obWins / obTotal * 100 : 50,
+                    LowWinRate = osTotal > 0 ? (decimal)osWins / osTotal * 100 : 50,
+                    NeutralWinRate = 50,
                 });
             }
-        }
 
-        // Also add L2 + tick + technical features from TickSnapshots
-        // (name, unused, highThreshold, lowThreshold)
-        var l2Indicators = new[] {
-            ("BookDepthRatio", 0.5m, 0.8m, 0.2m),
-            ("BidWallSize", 2.0m, 3.0m, 1.0m),
-            ("AskWallSize", 2.0m, 3.0m, 1.0m),
-            ("ImbalanceVelocity", 0.05m, 0.1m, -0.05m),
-            ("BidSweepCost", 0m, 5000m, 500m),        // High liquidity vs thin
-            ("AskSweepCost", 0m, 5000m, 500m),
-            ("SpreadPercentile", 0.5m, 0.8m, 0.2m),   // Wide vs tight spread
-            ("TickMomentum", 0m, 0.3m, -0.3m),         // Uptick vs downtick bias
-            ("VolumeRatio", 1m, 1.5m, 0.5m),           // High vs low volume
-        };
-
-        foreach (var (name, _, highThresh, lowThresh) in l2Indicators)
-        {
-            try
+            int upWins = rsiReader.GetInt32(4), upTotal = rsiReader.GetInt32(5);
+            int dnWins = rsiReader.GetInt32(6), dnTotal = rsiReader.GetInt32(7);
+            if (upTotal > 10 || dnTotal > 10)
             {
-                var sql = $@"
-                    SELECT
-                        COUNT(*) FILTER (WHERE tk.""{name}"" > @p2
-                            AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                              OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""HighWins"",
-                        COUNT(*) FILTER (WHERE tk.""{name}"" > @p2 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""HighTotal"",
-                        COUNT(*) FILTER (WHERE tk.""{name}"" < @p3
-                            AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                              OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""LowWins"",
-                        COUNT(*) FILTER (WHERE tk.""{name}"" < @p3 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""LowTotal""
-                    FROM ""TradingSignals"" ts
-                    JOIN ""TickSnapshots"" tk ON tk.""TickerId"" = ts.""TickerId""
-                        AND tk.""Timestamp"" BETWEEN ts.""Timestamp"" - INTERVAL '5 seconds' AND ts.""Timestamp"" + INTERVAL '5 seconds'
-                    WHERE ts.""SymbolId"" = @p0 AND ts.""Timestamp"" > @p1 AND ts.""PriceAfter1Min"" IS NOT NULL";
-
-                using var cmd = connection.CreateCommand();
-                cmd.CommandText = sql;
-                AddParameter(cmd, "@p0", symbolId);
-                AddParameter(cmd, "@p1", cutoff);
-                AddParameter(cmd, "@p2", highThresh);
-                AddParameter(cmd, "@p3", lowThresh);
-                cmd.CommandTimeout = 60;
-
-                using var reader = await cmd.ExecuteReaderAsync();
-                if (await reader.ReadAsync())
+                results.Add(new IndicatorStat
                 {
-                    int highWins = reader.GetInt32(0), highTotal = reader.GetInt32(1);
-                    int lowWins = reader.GetInt32(2), lowTotal = reader.GetInt32(3);
-
-                    if (highTotal > 10 || lowTotal > 10)
-                    {
-                        results.Add(new IndicatorStat
-                        {
-                            Name = name,
-                            HighWinRate = highTotal > 0 ? (decimal)highWins / highTotal * 100 : 50,
-                            LowWinRate = lowTotal > 0 ? (decimal)lowWins / lowTotal * 100 : 50,
-                            NeutralWinRate = 50,
-                        });
-                    }
-                }
+                    Name = "EMA Trend (EMA9>EMA20=uptrend / EMA9<EMA20=downtrend)",
+                    HighWinRate = upTotal > 0 ? (decimal)upWins / upTotal * 100 : 50,
+                    LowWinRate = dnTotal > 0 ? (decimal)dnWins / dnTotal * 100 : 50,
+                    NeutralWinRate = 50,
+                });
             }
-            catch
+
+            int aboveWins = rsiReader.GetInt32(8), aboveTotal = rsiReader.GetInt32(9);
+            int belowWins = rsiReader.GetInt32(10), belowTotal = rsiReader.GetInt32(11);
+            if (aboveTotal > 10 || belowTotal > 10)
             {
-                // L2 columns may not exist yet (migration pending) — skip silently
+                results.Add(new IndicatorStat
+                {
+                    Name = "VWAP Position (above=bullish / below=bearish)",
+                    HighWinRate = aboveTotal > 0 ? (decimal)aboveWins / aboveTotal * 100 : 50,
+                    LowWinRate = belowTotal > 0 ? (decimal)belowWins / belowTotal * 100 : 50,
+                    NeutralWinRate = 50,
+                });
             }
-        }
-
-        // Technical indicators: RSI zones and EMA trend from TickSnapshots
-        try
-        {
-            var rsiSql = @"
-                SELECT
-                    COUNT(*) FILTER (WHERE tk.""Rsi14"" > 70
-                        AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                          OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""OverboughtWins"",
-                    COUNT(*) FILTER (WHERE tk.""Rsi14"" > 70 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""OverboughtTotal"",
-                    COUNT(*) FILTER (WHERE tk.""Rsi14"" < 30
-                        AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                          OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""OversoldWins"",
-                    COUNT(*) FILTER (WHERE tk.""Rsi14"" < 30 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""OversoldTotal"",
-                    COUNT(*) FILTER (WHERE tk.""Ema9"" > tk.""Ema20"" AND tk.""Ema9"" > 0
-                        AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                          OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""UptrendWins"",
-                    COUNT(*) FILTER (WHERE tk.""Ema9"" > tk.""Ema20"" AND tk.""Ema9"" > 0 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""UptrendTotal"",
-                    COUNT(*) FILTER (WHERE tk.""Ema9"" < tk.""Ema20"" AND tk.""Ema9"" > 0
-                        AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                          OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""DowntrendWins"",
-                    COUNT(*) FILTER (WHERE tk.""Ema9"" < tk.""Ema20"" AND tk.""Ema9"" > 0 AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""DowntrendTotal"",
-                    COUNT(*) FILTER (WHERE tk.""Vwap"" > 0 AND tk.""Price"" > tk.""Vwap""
-                        AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                          OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""AboveVwapWins"",
-                    COUNT(*) FILTER (WHERE tk.""Vwap"" > 0 AND tk.""Price"" > tk.""Vwap"" AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""AboveVwapTotal"",
-                    COUNT(*) FILTER (WHERE tk.""Vwap"" > 0 AND tk.""Price"" <= tk.""Vwap""
-                        AND ((ts.""Type"" = 1 AND ts.""PriceAfter1Min"" > ts.""Price"")
-                          OR (ts.""Type"" = 2 AND ts.""PriceAfter1Min"" < ts.""Price""))) AS ""BelowVwapWins"",
-                    COUNT(*) FILTER (WHERE tk.""Vwap"" > 0 AND tk.""Price"" <= tk.""Vwap"" AND ts.""PriceAfter1Min"" IS NOT NULL) AS ""BelowVwapTotal""
-                FROM ""TradingSignals"" ts
-                JOIN ""TickSnapshots"" tk ON tk.""TickerId"" = ts.""TickerId""
-                    AND tk.""Timestamp"" BETWEEN ts.""Timestamp"" - INTERVAL '5 seconds' AND ts.""Timestamp"" + INTERVAL '5 seconds'
-                WHERE ts.""SymbolId"" = @p0 AND ts.""Timestamp"" > @p1 AND ts.""PriceAfter1Min"" IS NOT NULL";
-
-            using var rsiCmd = connection.CreateCommand();
-            rsiCmd.CommandText = rsiSql;
-            AddParameter(rsiCmd, "@p0", symbolId);
-            AddParameter(rsiCmd, "@p1", cutoff);
-            rsiCmd.CommandTimeout = 60;
-
-            using var rsiReader = await rsiCmd.ExecuteReaderAsync();
-            if (await rsiReader.ReadAsync())
-            {
-                int obWins = rsiReader.GetInt32(0), obTotal = rsiReader.GetInt32(1);
-                int osWins = rsiReader.GetInt32(2), osTotal = rsiReader.GetInt32(3);
-                if (obTotal > 10 || osTotal > 10)
-                {
-                    results.Add(new IndicatorStat
-                    {
-                        Name = "RSI14 (overbought>70 / oversold<30)",
-                        HighWinRate = obTotal > 0 ? (decimal)obWins / obTotal * 100 : 50,
-                        LowWinRate = osTotal > 0 ? (decimal)osWins / osTotal * 100 : 50,
-                        NeutralWinRate = 50,
-                    });
-                }
-
-                int upWins = rsiReader.GetInt32(4), upTotal = rsiReader.GetInt32(5);
-                int dnWins = rsiReader.GetInt32(6), dnTotal = rsiReader.GetInt32(7);
-                if (upTotal > 10 || dnTotal > 10)
-                {
-                    results.Add(new IndicatorStat
-                    {
-                        Name = "EMA Trend (EMA9>EMA20=uptrend / EMA9<EMA20=downtrend)",
-                        HighWinRate = upTotal > 0 ? (decimal)upWins / upTotal * 100 : 50,
-                        LowWinRate = dnTotal > 0 ? (decimal)dnWins / dnTotal * 100 : 50,
-                        NeutralWinRate = 50,
-                    });
-                }
-
-                int aboveWins = rsiReader.GetInt32(8), aboveTotal = rsiReader.GetInt32(9);
-                int belowWins = rsiReader.GetInt32(10), belowTotal = rsiReader.GetInt32(11);
-                if (aboveTotal > 10 || belowTotal > 10)
-                {
-                    results.Add(new IndicatorStat
-                    {
-                        Name = "VWAP Position (above=bullish / below=bearish)",
-                        HighWinRate = aboveTotal > 0 ? (decimal)aboveWins / aboveTotal * 100 : 50,
-                        LowWinRate = belowTotal > 0 ? (decimal)belowWins / belowTotal * 100 : 50,
-                        NeutralWinRate = 50,
-                    });
-                }
-            }
-        }
-        catch
-        {
-            // Technical indicator columns may not exist yet — skip silently
         }
 
         return results;
     }
 
     private async Task<List<ComboStat>> GetIndicatorCombinationsAsync(
-        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, DateTime cutoff)
     {
         var results = new List<ComboStat>();
         var combos = new[]
@@ -660,7 +659,7 @@ public class NightlyStrategyOptimizer
     }
 
     private async Task<RecentVsHistorical?> GetRecentVsHistoricalAsync(
-        System.Data.Common.DbConnection connection, string symbolId, long tickerId, DateTime cutoff)
+        System.Data.Common.DbConnection connection, string symbolId, DateTime cutoff)
     {
         try
         {
@@ -763,6 +762,7 @@ a1-a5: top 5 ask level sizes (shares) from order book at signal time (a1=best as
 price_1m: actual price 1 minute after signal
 price_5m: actual price 5 minutes after signal
 win_1m: 1 if trade was profitable at 1 min, 0 if not
+win_5m: 1 if trade was profitable at 5 min, 0 if not
 
 ## Your task
 1. Study the raw data. Look at winning vs losing trades — what indicator values differ?
@@ -1168,6 +1168,56 @@ win_1m: 1 if trade was profitable at 1 min, 0 if not
         return results;
     }
 
+    private async Task<PriceActionData?> GetRecentPriceActionAsync(
+        System.Data.Common.DbConnection connection, string symbolId)
+    {
+        try
+        {
+            var sql = @"
+                WITH daily AS (
+                    SELECT ""Close"", ""Volume"", ""Timestamp"",
+                           ROW_NUMBER() OVER (ORDER BY ""Timestamp"" DESC) AS rn
+                    FROM ""SymbolBars""
+                    WHERE ""SymbolId"" = @p0 AND ""Timeframe"" = 0
+                    ORDER BY ""Timestamp"" DESC LIMIT 20
+                )
+                SELECT
+                    (SELECT ""Close"" FROM daily WHERE rn = 1) AS last_close,
+                    (SELECT ""Close"" FROM daily WHERE rn = 2) AS prev_close,
+                    (SELECT ""Close"" FROM daily WHERE rn = 5) AS close_5d,
+                    (SELECT ""Close"" FROM daily WHERE rn = 20) AS close_20d,
+                    (SELECT AVG(""Volume"") FROM daily) AS avg_vol,
+                    (SELECT MIN(""Close"") FROM daily) AS low_20d,
+                    (SELECT MAX(""Close"") FROM daily) AS high_20d";
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = sql;
+            AddParameter(cmd, "@p0", symbolId);
+            cmd.CommandTimeout = 30;
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (await reader.ReadAsync() && !reader.IsDBNull(0))
+            {
+                decimal last = reader.GetDecimal(0);
+                decimal prev = reader.IsDBNull(1) ? last : reader.GetDecimal(1);
+                decimal close5d = reader.IsDBNull(2) ? last : reader.GetDecimal(2);
+                decimal close20d = reader.IsDBNull(3) ? last : reader.GetDecimal(3);
+                return new PriceActionData
+                {
+                    LastClose = last,
+                    Change1d = prev > 0 ? (last - prev) / prev * 100 : 0,
+                    Change5d = close5d > 0 ? (last - close5d) / close5d * 100 : 0,
+                    Change20d = close20d > 0 ? (last - close20d) / close20d * 100 : 0,
+                    AvgDailyVolume = reader.IsDBNull(4) ? 0 : reader.GetDecimal(4),
+                    Low20d = reader.IsDBNull(5) ? 0 : reader.GetDecimal(5),
+                    High20d = reader.IsDBNull(6) ? 0 : reader.GetDecimal(6),
+                };
+            }
+        }
+        catch { }
+        return null;
+    }
+
     #endregion
 
     #region Signal Outcome Verification
@@ -1183,6 +1233,7 @@ win_1m: 1 if trade was profitable at 1 min, 0 if not
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
 
+        var lookbackCutoff = DateTime.UtcNow.AddDays(-lookbackDays);
         int updated = await dbContext.Database.ExecuteSqlRawAsync(@"
             UPDATE ""TradingSignals"" ts
             SET
@@ -1205,7 +1256,7 @@ win_1m: 1 if trade was profitable at 1 min, 0 if not
                 ""VerifiedAt"" = NOW()
             WHERE ts.""VerifiedAt"" IS NULL
               AND ts.""Timestamp"" < NOW() - INTERVAL '6 minutes'
-              AND ts.""Timestamp"" > NOW() - INTERVAL '{0} days'", lookbackDays);
+              AND ts.""Timestamp"" > {0}", lookbackCutoff);
 
         if (updated > 0)
         {
@@ -1473,6 +1524,17 @@ internal class RecentVsHistorical
     public decimal Recent5dAvgVolume { get; set; }
     public decimal FullAvgSpread { get; set; }
     public decimal FullAvgVolume { get; set; }
+}
+
+internal class PriceActionData
+{
+    public decimal LastClose { get; set; }
+    public decimal Change1d { get; set; }
+    public decimal Change5d { get; set; }
+    public decimal Change20d { get; set; }
+    public decimal AvgDailyVolume { get; set; }
+    public decimal Low20d { get; set; }
+    public decimal High20d { get; set; }
 }
 
 internal class FinancialData

@@ -90,24 +90,30 @@
         <div class="row g-2 mb-3">
             @foreach (var s in _data.Symbols)
             {
-                <div class="col-xl-3 col-lg-4 col-md-6">
+                <div class="tp-col-5">
                     <div class="tp-symbol-card @(s.CurrentPosition != 0 ? "tp-has-position" : "")">
-                        <div class="d-flex justify-content-between align-items-start mb-2">
-                            <div>
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <div class="d-flex align-items-center gap-2">
                                 <span class="tp-ticker">@s.Ticker</span>
                                 @if (s.CurrentPosition != 0)
                                 {
                                     <span class="tp-pos-badge @(s.CurrentPosition > 0 ? "tp-long" : "tp-short")">
-                                        @(s.CurrentPosition > 0 ? "LONG" : "SHORT") @Math.Abs(s.CurrentPosition)
+                                        @(s.CurrentPosition > 0 ? "L" : "S")@Math.Abs(s.CurrentPosition)
                                     </span>
+                                }
+                                @if (s.LastSignalType != null)
+                                {
+                                    <span class="tp-signal-badge tp-signal-inline @(s.LastSignalType == "Buy" ? "tp-buy" : "tp-sell")">
+                                        @s.LastSignalType
+                                    </span>
+                                    <span class="tp-signal-score-inline @PnlClass(s.LastSignalScore)">@s.LastSignalScore.ToString("F3")</span>
                                 }
                             </div>
                             <div class="text-end">
-                                <div class="tp-price">@FormatPrice(s.Price)</div>
-                                <div class="@PnlClass(s.Change) tp-change">
-                                    @(s.Change >= 0 ? "+" : "")@s.Change.ToString("F2")
-                                    (@(s.ChangePercent >= 0 ? "+" : "")@s.ChangePercent.ToString("F2")%)
-                                </div>
+                                <span class="tp-price">@FormatPrice(s.Price)</span>
+                                <span class="@PnlClass(s.Change) tp-change-inline">
+                                    @(s.ChangePercent >= 0 ? "+" : "")@s.ChangePercent.ToString("F2")%
+                                </span>
                             </div>
                         </div>
                         <div class="tp-indicator-row">
@@ -127,21 +133,67 @@
                                 <span class="tp-ind-label">Vol</span>
                                 <span class="tp-ind-val">@FormatVolume(s.Volume)</span>
                             </div>
+                            @if (s.SignalCount > 0)
+                            {
+                                <div class="tp-ind">
+                                    <span class="tp-ind-label">Sig</span>
+                                    <span class="tp-ind-val">@s.SignalCount</span>
+                                </div>
+                            }
                         </div>
-                        @if (s.LastSignalType != null)
-                        {
-                            <div class="tp-signal-bar mt-2">
-                                <span class="tp-signal-badge @(s.LastSignalType == "Buy" ? "tp-buy" : "tp-sell")">
-                                    @s.LastSignalType
-                                </span>
-                                <span class="tp-signal-score">Score: @s.LastSignalScore.ToString("F3")</span>
-                                <span class="tp-signal-count">@s.SignalCount signals</span>
-                            </div>
-                        }
                     </div>
                 </div>
             }
         </div>
+
+        @* ─── OPEN POSITIONS ─── *@
+        @if (_data.OpenPositions.Count > 0)
+        {
+            <div class="tp-card mb-3">
+                <div class="tp-card-title">Open Positions</div>
+                <div class="table-responsive">
+                    <table class="tp-table tp-positions-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Side</th>
+                                <th class="text-end">Qty</th>
+                                <th class="text-end">Avg Price</th>
+                                <th class="text-end">Current</th>
+                                <th class="text-end">Mkt Value</th>
+                                <th class="text-end">P&L</th>
+                                <th class="text-end">P&L %</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var p in _data.OpenPositions)
+                            {
+                                <tr>
+                                    <td class="tp-ticker-sm">@p.Ticker</td>
+                                    <td><span class="tp-pos-badge @(p.Side == "Long" ? "tp-long" : "tp-short")">@p.Side</span></td>
+                                    <td class="text-end">@p.Quantity</td>
+                                    <td class="text-end">@p.AvgPrice.ToString("F2")</td>
+                                    <td class="text-end tp-live-price">@p.CurrentPrice.ToString("F2")</td>
+                                    <td class="text-end">@FormatPnl(p.MarketValue)</td>
+                                    <td class="text-end @PnlClass(p.UnrealizedPnl)">@FormatPnl(p.UnrealizedPnl)</td>
+                                    <td class="text-end @PnlClass(p.UnrealizedPnlPercent)">@p.UnrealizedPnlPercent.ToString("F2")%</td>
+                                </tr>
+                            }
+                        </tbody>
+                        <tfoot>
+                            <tr class="tp-positions-total">
+                                <td colspan="5"></td>
+                                <td class="text-end">@FormatPnl(_data.OpenPositions.Sum(p => p.MarketValue))</td>
+                                <td class="text-end @PnlClass(_data.OpenPositions.Sum(p => p.UnrealizedPnl))">
+                                    @FormatPnl(_data.OpenPositions.Sum(p => p.UnrealizedPnl))
+                                </td>
+                                <td></td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+        }
 
         @* ─── P&L STATS + STRATEGY RULES ─── *@
         <div class="row g-2 mb-3">
@@ -309,7 +361,7 @@
         value >= 0 ? $"${value:N2}" : $"-${Math.Abs(value):N2}";
 
     private static string FormatPrice(decimal value) =>
-        value > 0 ? $"${value:N2}" : "—";
+        $"${value:N2}";
 
     private static string FormatVolume(long vol) =>
         vol >= 1_000_000 ? $"{vol / 1_000_000.0:F1}M" :

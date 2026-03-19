@@ -69,7 +69,8 @@ public class WebullBrokerClient : IBrokerClient
         }
         if (account == null) return null;
 
-        // Compute day P&L from today's filled orders
+        // Use broker's totalProfitLoss directly — matches what Webull UI shows as "Overall P&L"
+        // Compute realized day P&L from filled orders for the "Day's P&L" metric
         decimal dayPnl = await ComputeDayPnlAsync();
 
         return new BrokerAccount
@@ -83,10 +84,11 @@ public class WebullBrokerClient : IBrokerClient
                     Symbol = ResolveSymbol(p.TickerId, p.Ticker),
                     Quantity = p.Quantity,
                     AvgPrice = p.CostPrice,
+                    LastPrice = p.LastPrice,
                     MarketValue = p.MarketValue,
                     UnrealizedPnl = p.UnrealizedPnl,
                 })
-                .Where(p => !p.Symbol.StartsWith("UNKNOWN_"))
+                .Where(p => !string.IsNullOrEmpty(p.Symbol) && !p.Symbol.StartsWith("UNKNOWN_"))
                 .ToList(),
         };
     }
@@ -142,14 +144,15 @@ public class WebullBrokerClient : IBrokerClient
         return orders.Select(o => new BrokerOrder
         {
             OrderId = o.OrderId.ToString(),
-            Symbol = ResolveSymbol(o.TickerId),
+            Symbol = ResolveSymbol(o.TickerId, o.TickerName),
             Action = o.Action,
             Status = NormalizeStatus(o.Status),
             Quantity = o.Quantity,
+            FilledQuantity = o.FilledQuantity,
             LimitPrice = o.LimitPrice,
             FilledPrice = o.FilledPrice,
             FilledTime = o.FilledTime,
-        }).ToList();
+        }).Where(o => !string.IsNullOrEmpty(o.Symbol) && !o.Symbol.StartsWith("UNKNOWN_")).ToList();
     }
 
     public async Task<BrokerOrder?> GetOrderAsync(string orderId)

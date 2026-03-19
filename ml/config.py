@@ -13,8 +13,8 @@ WINDOW_SNAPSHOTS = 300          # ~5 min of L2 data per sample
 STRIDE_SNAPSHOTS = 30           # slide window by 30 snapshots (~30s) for more samples
 PRICE_LEVELS = 200              # Y-axis resolution (number of price rows)
 HORIZON_SECONDS = 300           # 5-min forward look for labeling (matches WasCorrect5Min)
-UP_THRESHOLD = 0.0002          # min % move to count as UP (2 bps / 2 cents per $100)
-DOWN_THRESHOLD = -0.0002       # min % move to count as DOWN
+UP_THRESHOLD = 0.001           # min % move to count as UP (10 bps)
+DOWN_THRESHOLD = -0.001        # min % move to count as DOWN
 
 # ── Labels ────────────────────────────────────────────────────────────
 # 0 = DOWN, 1 = FLAT, 2 = UP

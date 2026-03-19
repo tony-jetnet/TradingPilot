@@ -226,7 +226,7 @@ public class SwinPredictor : IDisposable
             }
 
             var options = new SessionOptions();
-            // Try GPU first, fall back to CPU
+            // Try CUDA GPU first, fall back to CPU
             try
             {
                 options.AppendExecutionProvider_CUDA(0);
@@ -234,7 +234,7 @@ public class SwinPredictor : IDisposable
             }
             catch
             {
-                _logger.LogInformation("Swin falling back to CPU provider");
+                _logger.LogInformation("Swin falling back to CPU provider (install CUDA 12 toolkit for GPU)");
             }
             options.GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL;
 

@@ -42,21 +42,50 @@ public class WebullPaperTradingClient
 
             if (json.TryGetProperty("netLiquidation", out var nl))
                 info.NetLiquidation = ParseDecimal(nl);
-            if (json.TryGetProperty("usableCash", out var uc))
-                info.UsableCash = ParseDecimal(uc);
+            // usableCash is in accountMembers array
+            if (json.TryGetProperty("accountMembers", out var members) && members.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var m in members.EnumerateArray())
+                {
+                    var key = m.TryGetProperty("key", out var k) ? k.GetString() : "";
+                    var val = m.TryGetProperty("value", out var v) ? ParseDecimal(v) : 0;
+                    if (key == "usableCash") info.UsableCash = val;
+                }
+            }
+            if (json.TryGetProperty("totalProfitLoss", out var tpl))
+                info.TotalProfitLoss = ParseDecimal(tpl);
 
             if (json.TryGetProperty("positions", out var positions) && positions.ValueKind == JsonValueKind.Array)
             {
                 foreach (var pos in positions.EnumerateArray())
                 {
+                    // Extract ticker symbol — can be string or object with "symbol" field
+                    string tickerName = "";
+                    long tickerId = 0;
+                    if (pos.TryGetProperty("ticker", out var t))
+                    {
+                        if (t.ValueKind == JsonValueKind.String)
+                            tickerName = t.GetString() ?? "";
+                        else if (t.ValueKind == JsonValueKind.Object)
+                        {
+                            if (t.TryGetProperty("symbol", out var sym))
+                                tickerName = sym.GetString() ?? "";
+                            else if (t.TryGetProperty("tickerName", out var tn))
+                                tickerName = tn.GetString() ?? "";
+                            if (t.TryGetProperty("tickerId", out var ttid))
+                                tickerId = ttid.GetInt64();
+                        }
+                    }
+                    if (tickerId == 0 && pos.TryGetProperty("tickerId", out var tid2))
+                        tickerId = tid2.GetInt64();
+
                     info.Positions.Add(new PaperPosition
                     {
-                        TickerId = pos.TryGetProperty("tickerId", out var tid) ? tid.GetInt64() : 0,
-                        Ticker = pos.TryGetProperty("ticker", out var t)
-                            ? (t.ValueKind == JsonValueKind.String ? t.GetString() ?? "" : t.TryGetProperty("tickerName", out var tn) ? tn.GetString() ?? "" : t.ToString())
-                            : "",
+                        TickerId = tickerId,
+                        Ticker = tickerName,
                         Quantity = pos.TryGetProperty("position", out var q) ? (int)ParseDecimal(q) : 0,
                         CostPrice = pos.TryGetProperty("costPrice", out var cp) ? ParseDecimal(cp) : 0,
+                        LastPrice = pos.TryGetProperty("lastPrice", out var lp2) ? ParseDecimal(lp2) : 0,
                         MarketValue = pos.TryGetProperty("marketValue", out var mv) ? ParseDecimal(mv) : 0,
                         UnrealizedPnl = pos.TryGetProperty("unrealizedProfitLoss", out var pnl) ? ParseDecimal(pnl) : 0,
                     });
@@ -252,6 +281,56 @@ public class WebullPaperTradingClient
         var order = new PaperOrder();
         if (ord.TryGetProperty("orderId", out var oid))
             order.OrderId = oid.GetInt64();
+
+        // Extract ticker name from the top-level ticker object
+        if (ord.TryGetProperty("ticker", out var ticker))
+        {
+            if (ticker.ValueKind == JsonValueKind.Object)
+            {
+                if (ticker.TryGetProperty("tickerId", out var ttid))
+                    order.TickerId = ttid.GetInt64();
+                if (ticker.TryGetProperty("symbol", out var sym))
+                    order.TickerName = sym.GetString() ?? "";
+                else if (ticker.TryGetProperty("tickerName", out var tn))
+                    order.TickerName = tn.GetString() ?? "";
+            }
+            else if (ticker.ValueKind == JsonValueKind.String)
+            {
+                order.TickerName = ticker.GetString() ?? "";
+            }
+        }
+
+        // Parse top-level fields (flat format from /order endpoint)
+        if (ord.TryGetProperty("action", out var act))
+            order.Action = act.GetString() ?? "";
+        if (ord.TryGetProperty("orderType", out var ot))
+            order.OrderType = ot.GetString() ?? "";
+        if (ord.TryGetProperty("totalQuantity", out var tq))
+            order.Quantity = (int)ParseDecimal(tq);
+        if (ord.TryGetProperty("filledQuantity", out var fq))
+            order.FilledQuantity = (int)ParseDecimal(fq);
+        if (ord.TryGetProperty("lmtPrice", out var lp))
+            order.LimitPrice = ParseDecimal(lp);
+        if (ord.TryGetProperty("statusStr", out var ss))
+            order.Status = ss.GetString() ?? "";
+        if (ord.TryGetProperty("avgFilledPrice", out var afp))
+            order.FilledPrice = ParseDecimal(afp);
+        // Try filledTime0 (epoch ms) first — always reliable
+        if (ord.TryGetProperty("filledTime0", out var ft0) && ft0.ValueKind == JsonValueKind.Number)
+            order.FilledTime = DateTimeOffset.FromUnixTimeMilliseconds(ft0.GetInt64()).UtcDateTime;
+        else if (ord.TryGetProperty("filledTime", out var ft2) && ft2.GetString() is { } ftStr2)
+        {
+            // Strip timezone abbreviation (EDT/EST) that DateTime.TryParse can't handle
+            var cleaned = System.Text.RegularExpressions.Regex.Replace(ftStr2, @"\s+(EDT|EST|CDT|CST|PDT|PST)$", "");
+            if (DateTime.TryParse(cleaned, out var parsedFt))
+            {
+                // Webull times are ET — convert to UTC
+                var eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+                order.FilledTime = TimeZoneInfo.ConvertTimeToUtc(parsedFt, eastern);
+            }
+        }
+
+        // Also support nested "orders" array format (from account endpoint)
         if (ord.TryGetProperty("orders", out var innerOrders) && innerOrders.ValueKind == JsonValueKind.Array)
         {
             foreach (var inner in innerOrders.EnumerateArray())
@@ -260,45 +339,25 @@ public class WebullPaperTradingClient
                     order.OrderId = ioid.GetInt64();
                 if (inner.TryGetProperty("tickerId", out var itid))
                     order.TickerId = itid.GetInt64();
-                if (inner.TryGetProperty("action", out var ia))
+                if (string.IsNullOrEmpty(order.Action) && inner.TryGetProperty("action", out var ia))
                     order.Action = ia.GetString() ?? "";
-                if (inner.TryGetProperty("orderType", out var iot))
+                if (string.IsNullOrEmpty(order.OrderType) && inner.TryGetProperty("orderType", out var iot))
                     order.OrderType = iot.GetString() ?? "";
-                if (inner.TryGetProperty("totalQuantity", out var iq))
+                if (order.Quantity == 0 && inner.TryGetProperty("totalQuantity", out var iq))
                     order.Quantity = (int)ParseDecimal(iq);
-                if (inner.TryGetProperty("lmtPrice", out var ilp))
+                if (!order.LimitPrice.HasValue && inner.TryGetProperty("lmtPrice", out var ilp))
                     order.LimitPrice = ParseDecimal(ilp);
-                if (inner.TryGetProperty("statusStr", out var ist))
+                if (string.IsNullOrEmpty(order.Status) && inner.TryGetProperty("statusStr", out var ist))
                     order.Status = ist.GetString() ?? "";
-                if (inner.TryGetProperty("filledPrice", out var ifp))
+                if (!order.FilledPrice.HasValue && inner.TryGetProperty("filledPrice", out var ifp))
                     order.FilledPrice = ParseDecimal(ifp);
-                if (inner.TryGetProperty("filledTime", out var ift) && ift.GetString() is { } ftStr
+                if (!order.FilledTime.HasValue && inner.TryGetProperty("filledTime", out var ift) && ift.GetString() is { } ftStr
                     && DateTime.TryParse(ftStr, out var ft))
                     order.FilledTime = ft.ToUniversalTime();
+                if (string.IsNullOrEmpty(order.TickerName) && inner.TryGetProperty("symbol", out var isym))
+                    order.TickerName = isym.GetString() ?? "";
                 break; // just parse first inner order
             }
-        }
-        else
-        {
-            if (ord.TryGetProperty("tickerId", out var tid))
-                order.TickerId = tid.GetInt64();
-            if (ord.TryGetProperty("action", out var a))
-                order.Action = a.GetString() ?? "";
-            if (ord.TryGetProperty("orderType", out var ot))
-                order.OrderType = ot.GetString() ?? "";
-            if (ord.TryGetProperty("totalQuantity", out var q))
-                order.Quantity = (int)ParseDecimal(q);
-            if (ord.TryGetProperty("lmtPrice", out var lp))
-                order.LimitPrice = ParseDecimal(lp);
-            if (ord.TryGetProperty("statusStr", out var st))
-                order.Status = st.GetString() ?? "";
-            if (ord.TryGetProperty("status", out var st2) && order.Status == "")
-                order.Status = st2.GetString() ?? "";
-            if (ord.TryGetProperty("filledPrice", out var fp))
-                order.FilledPrice = ParseDecimal(fp);
-            if (ord.TryGetProperty("filledTime", out var ftProp) && ftProp.GetString() is { } ftString
-                && DateTime.TryParse(ftString, out var filledTime))
-                order.FilledTime = filledTime.ToUniversalTime();
         }
 
         return order;
@@ -342,6 +401,7 @@ public class PaperAccountInfo
     public long AccountId { get; set; }
     public decimal NetLiquidation { get; set; }
     public decimal UsableCash { get; set; }
+    public decimal TotalProfitLoss { get; set; }
     public List<PaperPosition> Positions { get; set; } = [];
     public List<PaperOrder> OpenOrders { get; set; } = [];
 }
@@ -352,6 +412,7 @@ public class PaperPosition
     public string Ticker { get; set; } = "";
     public int Quantity { get; set; }
     public decimal CostPrice { get; set; }
+    public decimal LastPrice { get; set; }
     public decimal MarketValue { get; set; }
     public decimal UnrealizedPnl { get; set; }
 }
@@ -360,9 +421,11 @@ public class PaperOrder
 {
     public long OrderId { get; set; }
     public long TickerId { get; set; }
+    public string TickerName { get; set; } = "";
     public string Action { get; set; } = "";
     public string OrderType { get; set; } = "";
     public int Quantity { get; set; }
+    public int FilledQuantity { get; set; }
     public decimal? LimitPrice { get; set; }
     public string Status { get; set; } = "";
     public DateTime? FilledTime { get; set; }

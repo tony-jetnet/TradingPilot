@@ -124,12 +124,12 @@ def main():
     print(f"{'='*60}\n")
     archive_heatmaps()
 
-    # Use --head-only for nightly retrain (fast, preserves learned features)
-    # Full fine-tune only needed for initial training
+    # Full fine-tune (Phase 1 head + Phase 2 top layers) — ImageNet features
+    # don't transfer well to L2 heatmaps, so backbone needs adaptation.
     best_model = os.path.join("models", "best.pt")
     if os.path.exists(best_model):
-        run([py, "train.py", "--head-only", "--resume", best_model],
-            "Step 3: Retrain (head-only, resume from best)")
+        run([py, "train.py", "--resume", best_model],
+            "Step 3: Retrain (full fine-tune, resume from best)")
     else:
         run([py, "train.py"],
             "Step 3: Initial full training (no existing model)")

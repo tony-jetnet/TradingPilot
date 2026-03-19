@@ -199,17 +199,7 @@ public class TradingPilotBlazorModule : AbpModule
         var jobClient = context.ServiceProvider.GetRequiredService<IBackgroundJobClient>();
         var recurringJobs = context.ServiceProvider.GetRequiredService<IRecurringJobManager>();
 
-        // Schedule startup bar load — only m1 (used by BarIndicatorService for EMA/RSI/VWAP)
-        string[] tickers = ["AMD", "RKLB", "NVDA", "TSLA", "PLTR", "SOFI", "SMCI", "RIVN", "SMR", "LLY"];
-        string[] startupTimeframes = ["m1"];
-        for (int i = 0; i < tickers.Length; i++)
-        {
-            var ticker = tickers[i];
-            var tf = startupTimeframes;
-            jobClient.Schedule<LoadHistoricalBarsJob>(
-                job => job.ExecuteAsync(ticker, tf),
-                TimeSpan.FromSeconds(30 + i * 5)); // stagger by 5s
-        }
+        // Startup bar load is now handled by StartupRecoveryJob (staggered, throttled)
 
         // Recurring bar refresh (every 30 min during market hours to keep data fresh)
         recurringJobs.AddOrUpdate<LoadHistoricalBarsJob>(

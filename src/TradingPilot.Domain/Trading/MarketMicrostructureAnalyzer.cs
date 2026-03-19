@@ -27,6 +27,10 @@ public class MarketMicrostructureAnalyzer
 
     private readonly ConcurrentDictionary<long, TickerAnalysisState> _state = new();
 
+    // Swin score cache: avoid running ONNX inference on every 5s monitor tick
+    private readonly ConcurrentDictionary<long, (decimal Score, DateTime CachedAt)> _swinScoreCache = new();
+    private const int SwinScoreCacheTtlSeconds = 10;
+
     // Model config from nightly training (null = use defaults)
     private volatile ModelConfig? _modelConfig;
     private DateTime _modelConfigLoadedAt;
@@ -119,7 +123,13 @@ public class MarketMicrostructureAnalyzer
                 return;
             }
 
-            string json = File.ReadAllText(ModelConfigPath);
+            // Use FileShare.ReadWrite to avoid locking conflicts with the nightly trainer writing
+            string json;
+            using (var fs = new FileStream(ModelConfigPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(fs))
+            {
+                json = reader.ReadToEnd();
+            }
             var config = JsonSerializer.Deserialize<ModelConfig>(json);
             if (config == null || config.Tickers.Count == 0)
             {
@@ -187,7 +197,12 @@ public class MarketMicrostructureAnalyzer
             if (_strategyConfigLoadedAt >= fileModified)
                 return;
 
-            string json = File.ReadAllText(StrategyConfigPath);
+            string json;
+            using (var fs = new FileStream(StrategyConfigPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(fs))
+            {
+                json = reader.ReadToEnd();
+            }
             var config = JsonSerializer.Deserialize<StrategyConfig>(json);
             if (config == null || config.Symbols.Count == 0)
             {
@@ -279,7 +294,7 @@ public class MarketMicrostructureAnalyzer
         UpdateState(state, snapshot);
 
         // Need minimum history to produce meaningful signals
-        if (state.RecentImbalances.Count < ShortWindow)
+        if (state.ImbalanceCount < ShortWindow)
             return null;
 
         // Periodically check if strategy rules file has been updated
@@ -390,6 +405,8 @@ public class MarketMicrostructureAnalyzer
             // Use Swin model output as composite score
             compositeScore = (decimal)swinPrediction.Score; // [-1, +1]
             usedSwin = true;
+            // Cache for ComputeCurrentScore to reuse (avoids duplicate ONNX inference)
+            _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
 
             _logger.LogDebug(
                 "Swin prediction for {Ticker}: {Class} score={Score:F3} " +
@@ -531,7 +548,12 @@ public class MarketMicrostructureAnalyzer
             indicators["TrendDir"] = barIndicators.TrendDirection;
         }
 
-        string reason = BuildReason(signalType, strength, indicators);
+        // Require a trained model — don't trade on hardcoded defaults
+        if (!usedSwin && tickerConfig == null)
+            return null;
+
+        string source = usedSwin ? "SWIN" : "WEIGHTED";
+        string reason = $"[{source}] " + BuildReason(signalType, strength, indicators);
 
         var signal = new TradingSignal
         {
@@ -594,7 +616,7 @@ public class MarketMicrostructureAnalyzer
         if (!_state.TryGetValue(tickerId, out var state))
             return 0;
 
-        if (state.RecentImbalances.Count < ShortWindow)
+        if (state.ImbalanceCount < ShortWindow)
             return 0;
 
         // Get latest L2 snapshot from cache
@@ -607,19 +629,32 @@ public class MarketMicrostructureAnalyzer
         var tickerConfig = _modelConfig?.Tickers.GetValueOrDefault(tickerId);
         int etHour = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, EasternTimeZone).Hour;
 
-        decimal compositeScore;
+        decimal compositeScore = 0;
         var barIndicators = _barCache.GetIndicators(tickerId);
 
-        // Try Swin model first — must match AnalyzeSnapshot entry logic
-        var swinSnapshots = _l2Cache.GetSnapshots(tickerId, 300);
-        var swinPrediction = _swinPredictor.Predict(swinSnapshots);
-
-        if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
+        // Try Swin model first — use cached score to avoid expensive ONNX inference every 5s
+        bool usedSwin = false;
+        if (_swinScoreCache.TryGetValue(tickerId, out var cached)
+            && (DateTime.UtcNow - cached.CachedAt).TotalSeconds < SwinScoreCacheTtlSeconds)
         {
-            // Use Swin model output directly (no contextual filters — model learned them)
-            compositeScore = (decimal)swinPrediction.Score;
+            compositeScore = cached.Score;
+            usedSwin = true;
         }
-        else
+
+        if (!usedSwin)
+        {
+            var swinSnapshots = _l2Cache.GetSnapshots(tickerId, 300);
+            var swinPrediction = _swinPredictor.Predict(swinSnapshots);
+
+            if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
+            {
+                compositeScore = (decimal)swinPrediction.Score;
+                _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
+                usedSwin = true;
+            }
+        }
+
+        if (!usedSwin)
         {
             // Fallback to weighted scoring
             decimal obiScore = ComputeSmoothedObi(state);
@@ -708,15 +743,13 @@ public class MarketMicrostructureAnalyzer
 
     private static void UpdateState(TickerAnalysisState state, SymbolBookSnapshot snapshot)
     {
-        EnqueueCapped(state.RecentImbalances, snapshot.Imbalance, HistorySize);
-        EnqueueCapped(state.RecentSpreads, snapshot.Spread, HistorySize);
-        EnqueueCapped(state.RecentMidPrices, snapshot.MidPrice, HistorySize);
-
         // Track average bid/ask sizes for large order detection
         decimal avgBidSize = snapshot.BidSizes.Length > 0 ? snapshot.BidSizes.Average() : 0;
         decimal avgAskSize = snapshot.AskSizes.Length > 0 ? snapshot.AskSizes.Average() : 0;
         decimal avgLevelSize = (avgBidSize + avgAskSize) / 2;
-        EnqueueCapped(state.RecentAvgLevelSizes, avgLevelSize, HistorySize);
+
+        // Thread-safe: single lock covers all queue updates
+        state.Enqueue(snapshot.Imbalance, snapshot.Spread, snapshot.MidPrice, avgLevelSize, HistorySize);
     }
 
     /// <summary>
@@ -724,8 +757,8 @@ public class MarketMicrostructureAnalyzer
     /// </summary>
     private static decimal ComputeSmoothedObi(TickerAnalysisState state)
     {
-        var recent = state.RecentImbalances.TakeLast(LongWindow);
-        return recent.Any() ? recent.Average() : 0;
+        var recent = state.GetImbalancesSnapshot(LongWindow);
+        return recent.Length > 0 ? recent.Average() : 0;
     }
 
     /// <summary>
@@ -771,9 +804,9 @@ public class MarketMicrostructureAnalyzer
     /// </summary>
     private static decimal ComputePressureRoc(TickerAnalysisState state)
     {
-        if (state.RecentImbalances.Count < LongWindow) return 0;
+        if (state.ImbalanceCount < LongWindow) return 0;
 
-        var items = state.RecentImbalances.ToArray();
+        var items = state.GetImbalancesSnapshot();
         decimal shortAvg = items.TakeLast(ShortWindow).Average();
         decimal longAvg = items.TakeLast(LongWindow).Average();
 
@@ -789,9 +822,9 @@ public class MarketMicrostructureAnalyzer
     /// </summary>
     private static decimal ComputeSpreadSignal(TickerAnalysisState state, SymbolBookSnapshot snapshot)
     {
-        if (state.RecentSpreads.Count < ShortWindow) return 0;
+        if (state.SpreadCount < ShortWindow) return 0;
 
-        var spreads = state.RecentSpreads.ToArray();
+        var spreads = state.GetSpreadsSnapshot();
         decimal currentSpread = snapshot.Spread;
         int countBelow = spreads.Count(s => s < currentSpread);
         decimal percentile = (decimal)countBelow / spreads.Length;
@@ -808,9 +841,9 @@ public class MarketMicrostructureAnalyzer
     /// </summary>
     private static decimal ComputeLargeOrderSignal(SymbolBookSnapshot snapshot, TickerAnalysisState state)
     {
-        if (state.RecentAvgLevelSizes.Count < ShortWindow) return 0;
+        if (state.AvgLevelSizeCount < ShortWindow) return 0;
 
-        decimal rollingAvg = state.RecentAvgLevelSizes.Average();
+        decimal rollingAvg = state.GetAvgLevelSizeAverage();
         if (rollingAvg <= 0) return 0;
 
         decimal threshold = rollingAvg * LargeOrderMultiplier;
@@ -925,6 +958,53 @@ public class MarketMicrostructureAnalyzer
 
         return sb.ToString();
     }
+}
+
+internal class TickerAnalysisState
+{
+    private readonly object _lock = new();
+
+    private readonly Queue<decimal> _recentImbalances = new();
+    private readonly Queue<decimal> _recentSpreads = new();
+    private readonly Queue<decimal> _recentMidPrices = new();
+    private readonly Queue<decimal> _recentAvgLevelSizes = new();
+
+    public TradingSignal? LastSignal { get; set; }
+    public DateTime LastSignalTime { get; set; }
+
+    public int ImbalanceCount { get { lock (_lock) return _recentImbalances.Count; } }
+    public int SpreadCount { get { lock (_lock) return _recentSpreads.Count; } }
+    public int AvgLevelSizeCount { get { lock (_lock) return _recentAvgLevelSizes.Count; } }
+
+    public void Enqueue(decimal imbalance, decimal spread, decimal midPrice, decimal avgLevelSize, int maxSize)
+    {
+        lock (_lock)
+        {
+            EnqueueCapped(_recentImbalances, imbalance, maxSize);
+            EnqueueCapped(_recentSpreads, spread, maxSize);
+            EnqueueCapped(_recentMidPrices, midPrice, maxSize);
+            EnqueueCapped(_recentAvgLevelSizes, avgLevelSize, maxSize);
+        }
+    }
+
+    public decimal[] GetImbalancesSnapshot(int? takeLast = null)
+    {
+        lock (_lock)
+        {
+            var items = _recentImbalances.ToArray();
+            return takeLast.HasValue ? items.TakeLast(takeLast.Value).ToArray() : items;
+        }
+    }
+
+    public decimal[] GetSpreadsSnapshot()
+    {
+        lock (_lock) return _recentSpreads.ToArray();
+    }
+
+    public decimal GetAvgLevelSizeAverage()
+    {
+        lock (_lock) return _recentAvgLevelSizes.Count > 0 ? _recentAvgLevelSizes.Average() : 0;
+    }
 
     private static void EnqueueCapped(Queue<decimal> queue, decimal value, int maxSize)
     {
@@ -932,14 +1012,4 @@ public class MarketMicrostructureAnalyzer
         while (queue.Count > maxSize)
             queue.Dequeue();
     }
-}
-
-internal class TickerAnalysisState
-{
-    public Queue<decimal> RecentImbalances { get; } = new();
-    public Queue<decimal> RecentSpreads { get; } = new();
-    public Queue<decimal> RecentMidPrices { get; } = new();
-    public Queue<decimal> RecentAvgLevelSizes { get; } = new();
-    public TradingSignal? LastSignal { get; set; }
-    public DateTime LastSignalTime { get; set; }
 }

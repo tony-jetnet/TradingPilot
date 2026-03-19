@@ -104,25 +104,41 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
             .Take(50)
             .ToList();
 
-        dto.RecentTrades = todayFilled.Select(o => new TradeDto
+        // Match trades to signals to get source (RULE/SWIN/WEIGHTED)
+        var allSignals = _signalStore.GetActiveTickerIds()
+            .SelectMany(tid => _signalStore.GetRecent(tid, 200))
+            .ToList();
+        dto.RecentTrades = todayFilled.Select(o =>
         {
-            Ticker = o.Symbol,
-            Timestamp = o.FilledTime ?? DateTime.UtcNow,
-            Action = o.Action,
-            Quantity = o.Quantity,
-            Price = o.FilledPrice ?? o.LimitPrice ?? 0,
-            Score = 0,
-            Reason = o.Status,
-            Status = o.Status,
+            // Find the closest signal within 10s of the fill for this ticker
+            var matchedSignal = allSignals
+                .Where(s => s.Ticker == o.Symbol && o.FilledTime.HasValue)
+                .OrderBy(s => Math.Abs((s.Timestamp - o.FilledTime!.Value).TotalSeconds))
+                .FirstOrDefault(s => Math.Abs((s.Timestamp - o.FilledTime!.Value).TotalSeconds) < 10);
+
+            string source = ExtractSource(matchedSignal?.Reason ?? "");
+
+            return new TradeDto
+            {
+                Ticker = o.Symbol,
+                Timestamp = o.FilledTime ?? DateTime.UtcNow,
+                Action = o.Action,
+                Quantity = o.FilledQuantity > 0 ? o.FilledQuantity : o.Quantity,
+                Price = o.FilledPrice ?? o.LimitPrice ?? 0,
+                Score = matchedSignal?.Indicators.GetValueOrDefault("CompositeScore") ?? 0,
+                Reason = matchedSignal?.Reason ?? o.Status ?? "",
+                Source = source,
+                Status = o.Status,
+            };
         }).ToList();
 
         // Recent signals from all tickers (from in-memory store)
-        var allSignals = new List<TradingSignal>();
+        var feedSignals = new List<TradingSignal>();
         foreach (var symbol in symbols)
         {
-            allSignals.AddRange(_signalStore.GetRecent(symbol.WebullTickerId, 20));
+            feedSignals.AddRange(_signalStore.GetRecent(symbol.WebullTickerId, 20));
         }
-        dto.RecentSignals = allSignals
+        dto.RecentSignals = feedSignals
             .OrderByDescending(s => s.Timestamp)
             .Take(30)
             .Select(s => new SignalDto
@@ -223,14 +239,33 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 var symbolDto = dto.Symbols.FirstOrDefault(s => s.Ticker == pos.Symbol);
                 if (symbolDto != null)
                     symbolDto.CurrentPosition = pos.Quantity;
+
+                // Use Webull's exact numbers — broker is source of truth
+                int absQty = Math.Abs(pos.Quantity);
+                decimal costBasis = pos.AvgPrice * absQty;
+
+                dto.OpenPositions.Add(new PositionDto
+                {
+                    Ticker = pos.Symbol,
+                    Side = pos.Quantity > 0 ? "Long" : "Short",
+                    Quantity = absQty,
+                    AvgPrice = pos.AvgPrice,
+                    CurrentPrice = pos.LastPrice,
+                    MarketValue = Math.Abs(pos.MarketValue),
+                    UnrealizedPnl = pos.UnrealizedPnl,
+                    UnrealizedPnlPercent = costBasis > 0 ? pos.UnrealizedPnl / costBasis * 100 : 0,
+                });
             }
         }
 
         // Pair filled orders: first per symbol = entry, next = exit
-        var pnls = new List<decimal>();
-        var openPositions = new Dictionary<string, (string Action, decimal Price, int Qty)>();
+        // Track source from the entry trade in dto.RecentTrades
+        var pnls = new List<(decimal Pnl, string Source)>();
+        var openPositions = new Dictionary<string, (string Action, decimal Price, int Qty, string Source)>();
 
         var orderedFilled = todayFilled.OrderBy(o => o.FilledTime).ToList();
+        var tradesByOrderId = dto.RecentTrades.ToDictionary(t => $"{t.Ticker}_{t.Timestamp.Ticks}", t => t.Source);
+
         foreach (var order in orderedFilled)
         {
             if (openPositions.TryGetValue(order.Symbol, out var entry))
@@ -238,33 +273,60 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 decimal pnl = entry.Action == "BUY"
                     ? (order.FilledPrice!.Value - entry.Price) * entry.Qty
                     : (entry.Price - order.FilledPrice!.Value) * entry.Qty;
-                pnls.Add(pnl);
+                pnls.Add((pnl, entry.Source));
                 openPositions.Remove(order.Symbol);
             }
             else
             {
-                openPositions[order.Symbol] = (order.Action, order.FilledPrice ?? 0, order.Quantity);
+                // Find source from matched trade DTO
+                var tradeDto = dto.RecentTrades
+                    .FirstOrDefault(t => t.Ticker == order.Symbol && t.Timestamp == order.FilledTime);
+                string source = tradeDto?.Source ?? "";
+                openPositions[order.Symbol] = (order.Action, order.FilledPrice ?? 0, order.Quantity, source);
             }
         }
 
-        var wins = pnls.Where(p => p > 0).ToList();
-        var losses = pnls.Where(p => p <= 0).ToList();
+        var wins = pnls.Where(p => p.Pnl > 0).ToList();
+        var losses = pnls.Where(p => p.Pnl <= 0).ToList();
 
         dto.PnlSummary = new PnlSummaryDto
         {
             TotalTrades = pnls.Count,
             WinningTrades = wins.Count,
             LosingTrades = losses.Count,
-            TotalPnl = pnls.Sum(),
+            TotalPnl = pnls.Sum(p => p.Pnl),
             TotalCommissions = 0,
-            NetPnl = pnls.Sum(),
+            NetPnl = pnls.Sum(p => p.Pnl),
             WinRate = pnls.Count > 0 ? (decimal)wins.Count / pnls.Count * 100 : 0,
-            AvgWin = wins.Count > 0 ? wins.Average() : 0,
-            AvgLoss = losses.Count > 0 ? losses.Average() : 0,
-            BestTrade = pnls.Count > 0 ? pnls.Max() : 0,
-            WorstTrade = pnls.Count > 0 ? pnls.Min() : 0,
+            AvgWin = wins.Count > 0 ? wins.Average(p => p.Pnl) : 0,
+            AvgLoss = losses.Count > 0 ? losses.Average(p => p.Pnl) : 0,
+            BestTrade = pnls.Count > 0 ? pnls.Max(p => p.Pnl) : 0,
+            WorstTrade = pnls.Count > 0 ? pnls.Min(p => p.Pnl) : 0,
             TodayTrades = pnls.Count,
-            TodayPnl = account?.DayPnl ?? pnls.Sum(),
+            TodayPnl = account?.DayPnl ?? pnls.Sum(p => p.Pnl),
+            SourceBreakdown = pnls
+                .Where(p => !string.IsNullOrEmpty(p.Source))
+                .GroupBy(p => p.Source)
+                .Select(g => new SourcePnlDto
+                {
+                    Source = g.Key,
+                    Trades = g.Count(),
+                    Wins = g.Count(p => p.Pnl > 0),
+                    Losses = g.Count(p => p.Pnl <= 0),
+                    WinRate = g.Count() > 0 ? (decimal)g.Count(p => p.Pnl > 0) / g.Count() * 100 : 0,
+                    TotalPnl = g.Sum(p => p.Pnl),
+                    AvgPnl = g.Average(p => p.Pnl),
+                })
+                .OrderByDescending(s => s.Trades)
+                .ToList(),
         };
+    }
+
+    private static string ExtractSource(string reason)
+    {
+        if (reason.StartsWith("[RULE")) return "RULE";
+        if (reason.StartsWith("[SWIN")) return "SWIN";
+        if (reason.StartsWith("[WEIGHTED")) return "WEIGHTED";
+        return "";
     }
 }

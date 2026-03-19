@@ -128,7 +128,7 @@ public class LoadHistoricalBarsJob
             try
             {
                 await LoadBarsForSymbolAsync(authHeader, symbol, timeframes);
-                await Task.Delay(500); // rate limit between symbols
+                await Task.Delay(2_000); // rate limit between symbols (avoid 403)
             }
             catch (Exception ex)
             {
@@ -220,7 +220,7 @@ public class LoadHistoricalBarsJob
                 tf, symbol.Id, count, latestBarTimestamp?.ToString("o") ?? "none");
 
             var bars = await _api.GetBarsAsync(authHeader, symbol.WebullTickerId, apiType, count);
-            await Task.Delay(500); // rate limit
+            await Task.Delay(1_500); // rate limit between timeframes
 
             _logger.LogInformation("Got {Total} bars for {Timeframe} {Ticker}", bars.Count, tf, symbol.Id);
 

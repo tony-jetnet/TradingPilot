@@ -78,7 +78,26 @@ public class WebullApiClient : IWebullApiClient
             var request = new HttpRequestMessage(HttpMethod.Get, url);
             ApplyAuthHeaders(request, authHeaderJson);
 
-            var response = await _http.SendAsync(request, ct);
+            HttpResponseMessage response;
+            int retries = 0;
+            while (true)
+            {
+                response = await _http.SendAsync(request, ct);
+                if (response.StatusCode == System.Net.HttpStatusCode.Forbidden && retries < 3)
+                {
+                    retries++;
+                    int backoffMs = retries * 5_000; // 5s, 10s, 15s
+                    _logger.LogWarning("GetBars 403 rate-limited for {Type} tickerId={TickerId}, backing off {Backoff}ms (attempt {Attempt}/3)",
+                        type, tickerId, backoffMs, retries);
+                    await Task.Delay(backoffMs, ct);
+                    // Rebuild request (HttpRequestMessage can only be sent once)
+                    request = new HttpRequestMessage(HttpMethod.Get, url);
+                    ApplyAuthHeaders(request, authHeaderJson);
+                    continue;
+                }
+                break;
+            }
+
             if (!response.IsSuccessStatusCode)
             {
                 string body = await response.Content.ReadAsStringAsync(ct);
