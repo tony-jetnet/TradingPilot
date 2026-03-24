@@ -12,90 +12,104 @@ namespace TradingPilot.Trading;
 public class PositionMonitorLogicTests
 {
     // ═══════════════════════════════════════════════════════════
-    // Score Flip (CHECK 1)
+    // VWAP Cross (CHECK 1)
     // ═══════════════════════════════════════════════════════════
 
     [Fact]
-    public void ScoreFlip_LongPositionScoreGoesNegative_ShouldExit()
+    public void VwapCross_LongBelowVwap_ShouldExit()
     {
-        var pos = new PositionState { Shares = 100, EntryScore = 0.45m };
-        decimal currentScore = -0.10m;
+        decimal currentPrice = 149.50m;
+        decimal vwap = 150.00m;
+        bool isLong = true;
 
-        bool flipped = (pos.IsLong && currentScore < 0 && pos.EntryScore > 0);
-        flipped.ShouldBeTrue();
+        bool vwapExit = isLong && vwap > 0 && currentPrice < vwap;
+        vwapExit.ShouldBeTrue();
     }
 
     [Fact]
-    public void ScoreFlip_LongPositionScoreStillPositive_ShouldNotExit()
+    public void VwapCross_LongAboveVwap_ShouldHold()
     {
-        var pos = new PositionState { Shares = 100, EntryScore = 0.45m };
-        decimal currentScore = 0.05m; // Weakened but still positive
+        decimal currentPrice = 150.50m;
+        decimal vwap = 150.00m;
+        bool isLong = true;
 
-        bool flipped = (pos.IsLong && currentScore < 0 && pos.EntryScore > 0);
-        flipped.ShouldBeFalse();
+        bool vwapExit = isLong && vwap > 0 && currentPrice < vwap;
+        vwapExit.ShouldBeFalse();
     }
 
     [Fact]
-    public void ScoreFlip_ShortPositionScoreGoesPositive_ShouldExit()
+    public void VwapCross_ShortAboveVwap_ShouldExit()
     {
-        var pos = new PositionState { Shares = -100, EntryScore = -0.40m };
-        decimal currentScore = 0.15m;
+        decimal currentPrice = 150.50m;
+        decimal vwap = 150.00m;
+        bool isLong = false;
 
-        bool flipped = (!pos.IsLong && currentScore > 0 && pos.EntryScore < 0);
-        flipped.ShouldBeTrue();
+        bool vwapExit = !isLong && vwap > 0 && currentPrice > vwap;
+        vwapExit.ShouldBeTrue();
     }
 
     // ═══════════════════════════════════════════════════════════
-    // Score Decay (CHECK 2)
+    // EMA Trend Reversal (CHECK 2)
     // ═══════════════════════════════════════════════════════════
 
     [Fact]
-    public void ScoreDecay_RuleSignal_HighConfidence_TightTolerance()
+    public void TrendReversal_LongEma9BelowEma20_ShouldExit()
     {
-        var pos = new PositionState
-        {
-            Shares = 100,
-            RuleConfidence = 0.62m,
-            PeakFavorableScore = 0.50m,
-        };
+        decimal ema9 = 149.50m;
+        decimal ema20 = 150.00m;
+        bool isLong = true;
 
-        decimal tolerance = 1m - pos.RuleConfidence; // 0.38
-        decimal currentScore = 0.20m;
-        decimal peakAbs = Math.Abs(pos.PeakFavorableScore);
-        decimal currentAbs = currentScore; // Long position
-        decimal decayFromPeak = (peakAbs - currentAbs) / peakAbs; // (0.50 - 0.20) / 0.50 = 0.60
-
-        (decayFromPeak > tolerance).ShouldBeTrue(); // 0.60 > 0.38 → exit
+        bool reversed = isLong && ema9 > 0 && ema20 > 0 && ema9 < ema20;
+        reversed.ShouldBeTrue();
     }
 
     [Fact]
-    public void ScoreDecay_Stage2Signal_WiderTolerance()
+    public void TrendReversal_LongEma9AboveEma20_ShouldHold()
     {
-        var pos = new PositionState
-        {
-            Shares = 100,
-            RuleConfidence = 0, // Stage 2, no rule
-            PeakFavorableScore = 0.50m,
-        };
+        decimal ema9 = 150.50m;
+        decimal ema20 = 150.00m;
+        bool isLong = true;
 
-        decimal tolerance = 0.50m; // Default for Stage 2
-        decimal currentScore = 0.30m;
-        decimal peakAbs = Math.Abs(pos.PeakFavorableScore);
-        decimal currentAbs = currentScore;
-        decimal decayFromPeak = (peakAbs - currentAbs) / peakAbs; // (0.50 - 0.30) / 0.50 = 0.40
-
-        (decayFromPeak > tolerance).ShouldBeFalse(); // 0.40 < 0.50 → hold
-    }
-
-    [Fact]
-    public void ScoreDecay_TinyPeak_IgnoredAsNoise()
-    {
-        decimal peakAbs = 0.03m; // Below 0.05 threshold
-        (peakAbs > 0.05m).ShouldBeFalse(); // Should be skipped
+        bool reversed = isLong && ema9 > 0 && ema20 > 0 && ema9 < ema20;
+        reversed.ShouldBeFalse();
     }
 
     // ═══════════════════════════════════════════════════════════
-    // Stop Loss (CHECK 4)
+    // RSI Extreme (CHECK 3)
+    // ═══════════════════════════════════════════════════════════
+
+    [Fact]
+    public void RsiExtreme_LongOverbought_ShouldExit()
+    {
+        decimal rsi = 78m;
+        bool isLong = true;
+
+        bool extreme = isLong && rsi > 75;
+        extreme.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void RsiExtreme_ShortOversold_ShouldExit()
+    {
+        decimal rsi = 22m;
+        bool isLong = false;
+
+        bool extreme = !isLong && rsi > 0 && rsi < 25;
+        extreme.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void RsiExtreme_LongNormal_ShouldHold()
+    {
+        decimal rsi = 55m;
+        bool isLong = true;
+
+        bool extreme = isLong && rsi > 75;
+        extreme.ShouldBeFalse();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Stop Loss (CHECK 4) — volatility-adaptive with ATR floor
     // ═══════════════════════════════════════════════════════════
 
     [Fact]
@@ -107,14 +121,37 @@ public class PositionMonitorLogicTests
             EntryPrice = 150.00m,
             StopLoss = 0.10m,  // Configured stop
             EntrySpread = 0.25m, // Entry spread is wider
+            EntryAtr = 0.05m, // ATR floor = 0.05 * 1.5 = 0.075
         };
 
-        decimal effectiveStopLoss = Math.Max(pos.StopLoss, pos.EntrySpread);
-        effectiveStopLoss.ShouldBe(0.25m); // Floor at spread
+        decimal atrFloor = pos.EntryAtr * 1.5m;
+        decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, atrFloor), pos.EntrySpread);
+        effectiveStopLoss.ShouldBe(0.25m); // Spread is widest → floor at spread
 
         decimal currentPrice = 149.80m;
         decimal adverse = pos.EntryPrice - currentPrice; // 0.20
         (adverse > effectiveStopLoss).ShouldBeFalse(); // 0.20 < 0.25 → hold
+    }
+
+    [Fact]
+    public void StopLoss_AtrWidensStopBeyondRuleValue()
+    {
+        var pos = new PositionState
+        {
+            Shares = 100,
+            EntryPrice = 150.00m,
+            StopLoss = 0.30m,  // Rule says 0.30
+            EntrySpread = 0.05m,
+            EntryAtr = 0.40m, // ATR floor = 0.40 * 1.5 = 0.60 — wider than rule
+        };
+
+        decimal atrFloor = pos.EntryAtr * 1.5m; // 0.60
+        decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, atrFloor), pos.EntrySpread);
+        effectiveStopLoss.ShouldBe(0.60m); // ATR floor wins
+
+        decimal currentPrice = 149.55m;
+        decimal adverse = pos.EntryPrice - currentPrice; // 0.45
+        (adverse > effectiveStopLoss).ShouldBeFalse(); // 0.45 < 0.60 → hold (ATR saved us from premature exit)
     }
 
     [Fact]
@@ -126,9 +163,11 @@ public class PositionMonitorLogicTests
             EntryPrice = 150.00m,
             StopLoss = 0.30m,
             EntrySpread = 0.05m,
+            EntryAtr = 0.10m, // ATR floor = 0.15
         };
 
-        decimal effectiveStopLoss = Math.Max(pos.StopLoss, pos.EntrySpread); // 0.30
+        decimal atrFloor = pos.EntryAtr * 1.5m;
+        decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, atrFloor), pos.EntrySpread); // 0.30
         decimal currentPrice = 149.60m;
         decimal adverse = pos.EntryPrice - currentPrice; // 0.40
 
@@ -149,8 +188,55 @@ public class PositionMonitorLogicTests
         decimal currentPrice = 150.50m;
         decimal adverse = currentPrice - pos.EntryPrice; // 0.50 (price went up = bad for short)
 
-        decimal effectiveStopLoss = Math.Max(pos.StopLoss, pos.EntrySpread);
+        decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, pos.EntryAtr * 1.5m), pos.EntrySpread);
         (adverse > effectiveStopLoss).ShouldBeTrue();
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Breakeven Stop (CHECK 5a)
+    // ═══════════════════════════════════════════════════════════
+
+    [Fact]
+    public void BreakevenStop_WasProfitableNowLosing_ShouldExit()
+    {
+        var pos = new PositionState
+        {
+            Shares = 100,
+            EntryPrice = 150.00m,
+            PeakFavorablePrice = 150.50m, // Was up +0.50
+            StopLoss = 0.30m,
+            EntrySpread = 0.05m,
+        };
+
+        decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, pos.EntryAtr * 1.5m), pos.EntrySpread);
+        decimal peakProfit = pos.PeakFavorablePrice - pos.EntryPrice; // 0.50
+        decimal currentPrice = 149.95m;
+        decimal currentProfit = currentPrice - pos.EntryPrice; // -0.05
+
+        // peakProfit (0.50) > effectiveStopLoss (0.30) AND currentProfit (-0.05) < 0
+        bool breakevenTriggered = peakProfit > effectiveStopLoss && currentProfit < 0;
+        breakevenTriggered.ShouldBeTrue();
+    }
+
+    [Fact]
+    public void BreakevenStop_StillProfitable_ShouldHold()
+    {
+        var pos = new PositionState
+        {
+            Shares = 100,
+            EntryPrice = 150.00m,
+            PeakFavorablePrice = 150.50m,
+            StopLoss = 0.30m,
+            EntrySpread = 0.05m,
+        };
+
+        decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, pos.EntryAtr * 1.5m), pos.EntrySpread);
+        decimal peakProfit = 0.50m;
+        decimal currentPrice = 150.10m;
+        decimal currentProfit = currentPrice - pos.EntryPrice; // +0.10 (still profitable)
+
+        bool breakevenTriggered = peakProfit > effectiveStopLoss && currentProfit < 0;
+        breakevenTriggered.ShouldBeFalse();
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -259,10 +345,10 @@ public class PositionMonitorLogicTests
     [Fact]
     public void TimeGate_HardCap_AlwaysExits()
     {
-        var pos = new PositionState { HoldSeconds = 60 };
-        decimal elapsed = 181; // > 60 * 3 = 180
+        var pos = new PositionState { HoldSeconds = 3600 };
+        decimal elapsed = 7201; // > 3600 * 2 = 7200
 
-        bool hardCap = elapsed >= pos.HoldSeconds * 3;
+        bool hardCap = elapsed >= pos.HoldSeconds * 2;
         hardCap.ShouldBeTrue();
     }
 

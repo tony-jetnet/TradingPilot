@@ -24,6 +24,10 @@ public class PositionState
     public decimal StopLoss { get; set; }
     public decimal EntrySpread { get; set; }
     public decimal PeakFavorablePrice { get; set; }
+    /// <summary>ATR at entry time — used for volatility-adaptive stop loss and breakeven threshold.</summary>
+    public decimal EntryAtr { get; set; }
+    /// <summary>When PeakFavorablePrice was last updated. Anti-wick: trail only from sustained peaks.</summary>
+    public DateTime PeakPriceSetAt { get; set; }
 
     /// <summary>Tracks in-flight exit order. Null = no pending exit.</summary>
     public string? PendingExitOrderId { get; set; }

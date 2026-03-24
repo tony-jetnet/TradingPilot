@@ -68,8 +68,8 @@ public class PaperTradingExecutor
         _maxPositionDollars = configuration.GetValue<decimal>($"{section}:MaxPositionDollars", 25000m);
         _maxConcurrentPositions = configuration.GetValue<int>($"{section}:MaxConcurrentPositions", 3);
         _dailyLossLimit = configuration.GetValue<decimal>($"{section}:DailyLossLimit", -2000m);
-        _rateLimitSeconds = configuration.GetValue<int>($"{section}:RateLimitSeconds", 90);
-        _orderTimeoutMinutes = configuration.GetValue<int>($"{section}:OrderTimeoutMinutes", 5);
+        _rateLimitSeconds = configuration.GetValue<int>($"{section}:RateLimitSeconds", 600); // 10min cooldown for swing
+        _orderTimeoutMinutes = configuration.GetValue<int>($"{section}:OrderTimeoutMinutes", 10); // longer fill window for passive limits
 
         _logger.LogInformation("Trading executor using broker={Broker} section={Section}: maxPosition=${MaxPos} maxPositions={MaxCount} dailyLimit=${DailyLimit}",
             brokerType, section, _maxPositionDollars, _maxConcurrentPositions, _dailyLossLimit);
@@ -241,13 +241,20 @@ public class PaperTradingExecutor
         }
 
         var latestSnapshot = recentSnapshots[^1];
-        var olderSnapshot = recentSnapshots.FirstOrDefault(s =>
-            (latestSnapshot.Timestamp - s.Timestamp).TotalSeconds >= 25 &&
-            (latestSnapshot.Timestamp - s.Timestamp).TotalSeconds <= 40);
+        // Find snapshot closest to 30 seconds ago within a wide 15-60s window.
+        // Previous 25-40s window was too brittle — a 1-second data gap would block all entries.
+        var olderSnapshot = recentSnapshots
+            .Where(s =>
+            {
+                var age = (latestSnapshot.Timestamp - s.Timestamp).TotalSeconds;
+                return age >= 15 && age <= 60;
+            })
+            .OrderBy(s => Math.Abs((latestSnapshot.Timestamp - s.Timestamp).TotalSeconds - 30))
+            .FirstOrDefault();
 
         if (olderSnapshot == null)
         {
-            _logger.LogDebug("Skipping entry for {Ticker}: no L2 snapshot in 25-40s window for momentum check",
+            _logger.LogDebug("Skipping entry for {Ticker}: no L2 snapshot in 15-60s window for momentum check",
                 signal.Ticker);
             return;
         }
@@ -307,9 +314,24 @@ public class PaperTradingExecutor
 
             int qty = Math.Max(1, (int)(maxDollars / signal.Price));
 
-            // Use limit order at current price (market orders don't work in extended hours)
-            // Add small buffer: pay slightly more for buys, accept slightly less for sells
-            decimal limitPrice = action == "BUY" ? signal.Price * 1.001m : signal.Price * 0.999m;
+            // Use passive limit at favorable side of L2 book (bid for buys, ask for sells).
+            // This saves the full spread on every fill and acts as a natural signal quality
+            // filter: if the signal flips in 3 seconds, the order won't fill — only signals
+            // where the market comes to us get executed. Add 10% of spread as offset to
+            // improve fill probability slightly vs sitting exactly at BBO.
+            decimal limitPrice;
+            if (latestSnapshot.BidPrices.Length > 0 && latestSnapshot.AskPrices.Length > 0)
+            {
+                decimal spreadOffset = latestSnapshot.Spread * 0.10m; // 10% into the spread
+                limitPrice = action == "BUY"
+                    ? latestSnapshot.BidPrices[0] + spreadOffset   // just above best bid
+                    : latestSnapshot.AskPrices[0] - spreadOffset;  // just below best ask
+            }
+            else
+            {
+                // Fallback: no L2 book data, use midprice with tight buffer
+                limitPrice = action == "BUY" ? signal.Price * 1.0002m : signal.Price * 0.9998m;
+            }
             limitPrice = Math.Round(limitPrice, 2);
 
             var result = await _broker.PlaceOrderAsync(new BrokerOrderRequest
@@ -387,7 +409,21 @@ public class PaperTradingExecutor
         string action = pos.IsLong ? "SELL" : "BUY";
         int qty = Math.Abs(pos.Shares);
 
-        decimal limitPrice = action == "BUY" ? currentPrice * 1.001m : currentPrice * 0.999m;
+        // Exit limit: use L2 book to place at best bid/ask instead of crossing the spread.
+        // Exits are more urgent than entries, so place at the BBO directly (no offset).
+        // Still saves ~half the spread vs the old 0.1% cross approach.
+        decimal limitPrice;
+        var exitSnapshot = _l2Cache.GetLatest(pos.TickerId);
+        if (exitSnapshot != null && exitSnapshot.BidPrices.Length > 0 && exitSnapshot.AskPrices.Length > 0)
+        {
+            limitPrice = action == "BUY"
+                ? exitSnapshot.AskPrices[0]   // exit short: buy at best ask
+                : exitSnapshot.BidPrices[0];  // exit long: sell at best bid
+        }
+        else
+        {
+            limitPrice = action == "BUY" ? currentPrice * 1.001m : currentPrice * 0.999m;
+        }
         limitPrice = Math.Round(limitPrice, 2);
 
         var result = await _broker.PlaceOrderAsync(new BrokerOrderRequest
@@ -478,6 +514,7 @@ public class PaperTradingExecutor
                             pending.Action, filledQty, symbol, filledPrice, pending.OrderId);
                     }
 
+                    var entryBar = _barCache.GetIndicators(pending.TickerId);
                     var pos = new PositionState
                     {
                         Symbol = pending.Symbol,
@@ -488,6 +525,7 @@ public class PaperTradingExecutor
                         EntryScore = pending.EntryScore,
                         PeakFavorableScore = pending.EntryScore,
                         PeakFavorablePrice = filledPrice,
+                        PeakPriceSetAt = DateTime.UtcNow,
                         EntryImbalance = pending.EntryImbalance,
                         EntrySpread = pending.EntrySpread,
                         EntrySpreadPercentile = pending.EntrySpreadPercentile,
@@ -497,6 +535,7 @@ public class PaperTradingExecutor
                         RuleConfidence = pending.RuleConfidence,
                         HoldSeconds = pending.HoldSeconds,
                         StopLoss = pending.StopLoss,
+                        EntryAtr = entryBar?.Atr14 ?? 0,
                     };
                     _positions[symbol] = pos;
                     _pendingEntries.TryRemove(symbol, out _);
@@ -542,6 +581,10 @@ public class PaperTradingExecutor
                     if (_positions.TryGetValue(symbol, out var pos))
                     {
                         decimal pnl = (pos.IsLong ? filledPrice - pos.EntryPrice : pos.EntryPrice - filledPrice) * filledQty;
+
+                        // Track live rule performance for auto-disabling losing rules
+                        if (!string.IsNullOrEmpty(pos.EntryRuleId) && pos.EntryRuleId != "RECOVERED" && pos.EntryRuleId != "STARTUP")
+                            _analyzer.RuleEvaluator.RecordTradeOutcome(pos.EntryRuleId, pnl);
 
                         if (order.Status == "PartiallyFilled")
                         {
@@ -636,6 +679,7 @@ public class PaperTradingExecutor
                     long tickerId = pendingEntry?.TickerId ?? _broker.ResolveInternalId(symbol);
                     var tickerConfig = _analyzer.CurrentModelConfig?.Tickers.GetValueOrDefault(tickerId);
 
+                    var syncBar = _barCache.GetIndicators(tickerId);
                     // Preserve pending entry metadata if available (avoids losing hold/stop/score settings)
                     if (pendingEntry != null)
                     {
@@ -649,6 +693,7 @@ public class PaperTradingExecutor
                             EntryScore = pendingEntry.EntryScore,
                             PeakFavorableScore = pendingEntry.EntryScore,
                             PeakFavorablePrice = brokerPos.AvgPrice,
+                            PeakPriceSetAt = DateTime.UtcNow,
                             EntryImbalance = pendingEntry.EntryImbalance,
                             EntrySpread = pendingEntry.EntrySpread,
                             EntrySpreadPercentile = pendingEntry.EntrySpreadPercentile,
@@ -658,6 +703,7 @@ public class PaperTradingExecutor
                             RuleConfidence = pendingEntry.RuleConfidence,
                             HoldSeconds = pendingEntry.HoldSeconds,
                             StopLoss = pendingEntry.StopLoss,
+                            EntryAtr = syncBar?.Atr14 ?? 0,
                         };
                         _logger.LogWarning("ADOPTED broker position (from pending entry): {Symbol} {Qty} shares @ {AvgPrice} | hold={Hold}s stop={Stop} ruleId={RuleId}",
                             symbol, brokerPos.Quantity, brokerPos.AvgPrice,
@@ -677,10 +723,12 @@ public class PaperTradingExecutor
                             EntryScore = initialScore,
                             PeakFavorableScore = initialScore,
                             PeakFavorablePrice = brokerPos.AvgPrice,
+                            PeakPriceSetAt = DateTime.UtcNow,
                             NotionalValue = brokerPos.MarketValue,
                             EntryRuleId = "RECOVERED",
                             HoldSeconds = tickerConfig?.OptimalHoldSeconds ?? 120,
                             StopLoss = tickerConfig?.StopLossAmount ?? 0.50m,
+                            EntryAtr = syncBar?.Atr14 ?? 0,
                         };
                         _logger.LogWarning("ADOPTED broker position: {Symbol} {Qty} shares @ {AvgPrice} (hold={Hold}s stop={Stop} score={Score:F3})",
                             symbol, brokerPos.Quantity, brokerPos.AvgPrice,
@@ -743,6 +791,7 @@ public class PaperTradingExecutor
                 var tickerConfig = _analyzer.CurrentModelConfig?.Tickers.GetValueOrDefault(tickerId);
                 // Compute current score so recovered positions have meaningful exit thresholds
                 decimal initialScore = _analyzer.ComputeCurrentScore(tickerId);
+                var startupBar = _barCache.GetIndicators(tickerId);
                 _positions[brokerPos.Symbol] = new PositionState
                 {
                     Symbol = brokerPos.Symbol,
@@ -753,10 +802,12 @@ public class PaperTradingExecutor
                     EntryScore = initialScore,
                     PeakFavorableScore = initialScore,
                     PeakFavorablePrice = brokerPos.AvgPrice,
+                    PeakPriceSetAt = DateTime.UtcNow,
                     NotionalValue = brokerPos.MarketValue,
                     EntryRuleId = "STARTUP",
                     HoldSeconds = tickerConfig?.OptimalHoldSeconds ?? 120,
                     StopLoss = tickerConfig?.StopLossAmount ?? 0.50m,
+                    EntryAtr = startupBar?.Atr14 ?? 0,
                 };
                 adopted++;
             }

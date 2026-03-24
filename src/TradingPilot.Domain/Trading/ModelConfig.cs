@@ -40,8 +40,8 @@ public class TickerModelConfig
     public bool EnableSell { get; set; } = true;
 
     // Optimal trade parameters
-    public int OptimalHoldSeconds { get; set; } = 60;
-    public decimal StopLossAmount { get; set; } = 0.30m;
+    public int OptimalHoldSeconds { get; set; } = 3600;
+    public decimal StopLossAmount { get; set; } = 1.50m;
 
     // Walk-forward validation metrics (out-of-sample)
     public int ValidationSamples { get; set; }

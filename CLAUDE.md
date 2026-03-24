@@ -35,10 +35,41 @@ ABP Framework 10.1 app with DDD layered architecture. .NET 10.0, PostgreSQL, Red
 
 Real-time L2 order book data flows through a two-stage signal pipeline in `MarketMicrostructureAnalyzer.AnalyzeSnapshot()`:
 
-1. **Stage 1 — AI Rule Evaluation**: `StrategyRuleEvaluator` checks conditional rules from `strategy_rules.json` (generated nightly by Bedrock Sonnet 4.6). If a rule matches, emit signal immediately.
-2. **Stage 2 — Weighted Scoring Fallback**: If no rule matches, compute composite score using 10 weighted indicators (weights from `model_config.json`, trained nightly by hill-climbing optimizer). Apply contextual filters (trend, VWAP, volume, RSI).
+1. **Stage 1 — AI Rule Evaluation**: `StrategyRuleEvaluator` checks conditional rules from `strategy_rules.json` (generated nightly by Bedrock Sonnet 4.6). If a rule matches, apply contextual filters (trend, VWAP, volume, RSI) to the rule's confidence score. Reject if filtered score drops below 0.20. Also checks hourly enablement from model config and live rule performance tracking.
+2. **Stage 2 — Weighted Scoring Fallback**: If no rule matches, compute composite score using **6 L2/tick indicators** (OBI, WOBI, PressureRoc, Spread, LargeOrder, TickMomentum). Weights from `model_config.json` (trained nightly). Then apply contextual filters (trend, VWAP, volume, RSI) as post-scoring multipliers.
+
+**No double penalization**: Trend, VWAP, Volume, and RSI are handled ONLY by contextual filters (weight=0 in the scoring). They are NOT included as weighted indicators in the composite score. This prevents the same signal from being penalized twice.
 
 Both config files live at `D:\Third-Parties\WebullHook\` and are watched via `FileSystemWatcher` + periodic freshness check (1-min polling as failsafe).
+
+### Contextual Filters (applied to BOTH Stage 1 and Stage 2)
+
+Applied in sequence after the base score is computed:
+1. **Trend filter**: Signal against dominant EMA trend → score × 0.5
+2. **VWAP filter**: Signal against VWAP position → score × 0.7
+3. **Volume boost**: High volume → score × 1.3
+4. **RSI filter**: Signal into overbought/oversold → score × 0.5
+5. **Floor protection**: No single filter chain can reduce score below 50% of pre-filter value
+6. **Hourly multiplier**: Per-hour learned multiplier from model config
+
+### Weighted Scoring Indicators (6 indicators, sum to 1.0)
+
+| Indicator | Default Weight | Range | Source |
+|-----------|---------------|-------|--------|
+| OBI (smoothed) | 0.25 | [-1, +1] | L2BookCache (30-snapshot average) |
+| WOBI (weighted) | 0.25 | [-1, +1] | L2 snapshot (inverse-distance weighted) |
+| PressureRoc | 0.15 | [-1, +1] | Short vs long imbalance averages |
+| SpreadSignal | 0.10 | [-1, +1] | Spread percentile (tight=bullish) |
+| LargeOrderSignal | 0.10 | [-1, +1] | Size spikes > 3x average |
+| TickMomentum | 0.15 | [-1, +1] | Uptick/downtick ratio from TickDataCache |
+
+### VWAP Score Formula
+
+`deviation = (currentPrice - VWAP) / VWAP`, then `Clamp(deviation × 10, -1, 1)`. A 0.1% deviation → 0.10 score, 0.5% → 0.50, 1.0% → saturates at ±1.0. Divides by VWAP (not price) for symmetry.
+
+### Live Rule Performance Tracking
+
+`StrategyRuleEvaluator` tracks per-rule win/loss/P&L from closed trades in real-time. Rules with negative total P&L after ≥3 trades are auto-disabled for the rest of the trading day. Performance resets when new `strategy_rules.json` is loaded (nightly).
 
 ### Real-Time Data Flow
 
@@ -61,6 +92,32 @@ Webull MQTT (via injected hook DLL)
 ```
 
 The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars before running AI analysis, so gaps from daytime app downtime don't affect training quality.
+
+### Nightly Trainer Details (NightlyLocalTrainer)
+
+- **Walk-forward**: 75% train (oldest) / 25% validation (newest), time-ordered
+- **Hill-climbing**: 100 iterations, perturbs one of the **6 L2/tick weights** (indices 0-5) by ±0.05, keeps if P&L improves
+- **Overfit guard**: If optimized weights lose money on validation AND defaults do better, falls back to defaults
+- **Training data**: All 10 indicators are loaded from TradingSignalRecord (OBI, WOBI, PressureRoc, SpreadSignal, LargeOrderSignal, TickMomentum, Ema9, Ema20, Rsi14, Vwap, VolumeRatio) — derived scores computed from raw values matching live formulas
+- **Weights 6-9 (Trend, VWAP, Volume, RSI)**: Fixed at 0 — contextual filters handle these. Optimizer only perturbs weights 0-5.
+
+### Position Management (PositionMonitor)
+
+**Entry gating** (PaperTradingExecutor.OnSignalAsync):
+- Auth, position limit, daily loss limit, rate limit (10min cooldown), daily trade count
+- Spread regime filter: reject if spread ≥ 90th percentile
+- Momentum check: find L2 snapshot closest to 30s ago (15-60s window), require price-relative momentum alignment
+- ATR-based position sizing: $25K base scaled by ATR (high vol → smaller position)
+- Passive limit orders: bid+10% spread offset for buys (saves spread, acts as signal quality filter)
+
+**Exit checks** (evaluated every 5s in priority order):
+1. **VWAP Cross** (15min grace): price crosses VWAP against position
+2. **EMA Trend Reversal** (10min grace): EMA9 crosses EMA20 against position
+3. **RSI Extreme** (5min grace): RSI > 75 (long) or < 25 (short)
+4. **Stop Loss**: Max(rule stop, 1.5×ATR, entry spread) — volatility-adaptive
+5. **Breakeven Stop**: Once peak profit > **1.5×** stop distance, exit if position turns negative
+6. **Trailing Stop**: Anti-wick filtered (10s persistence), confidence-scaled giveback (higher confidence → tighter trail)
+7. **Time Gate**: Adaptive — past hold time check score strength; hard cap at 2× hold time
 
 ### Singleton Caches (in-memory, registered in BlazorModule)
 

@@ -22,28 +22,29 @@ public class NightlyLocalTrainer
     private readonly ILogger<NightlyLocalTrainer> _logger;
 
     private const decimal CommissionPerTrade = 0m; // Both Webull and Questrade have $0 commission on US equities
-    private const int SimulationShares = 500;
+    private const int SimulationShares = 100;
     private const int OptimizationIterations = 100;
     private const string ModelConfigPath = @"D:\Third-Parties\WebullHook\model_config.json";
 
-    // Default weights (same as MarketMicrostructureAnalyzer constants)
+    // Default weights: only L2 microstructure + tick momentum are weighted.
+    // Trend, VWAP, Volume, and RSI are handled by contextual filters only (no double penalization).
     private static readonly decimal[] DefaultWeights =
     [
-        0.15m, // OBI
-        0.15m, // WOBI
-        0.10m, // PressureRoc
-        0.05m, // Spread
-        0.05m, // LargeOrder
-        0.10m, // TickMomentum
-        0.15m, // Trend
-        0.10m, // Vwap
-        0.10m, // Volume
-        0.05m, // Rsi
+        0.25m, // OBI
+        0.25m, // WOBI
+        0.15m, // PressureRoc
+        0.10m, // Spread
+        0.10m, // LargeOrder
+        0.15m, // TickMomentum
+        0.00m, // Trend      — contextual filter only
+        0.00m, // Vwap       — contextual filter only
+        0.00m, // Volume     — contextual filter only
+        0.00m, // Rsi        — contextual filter only
     ];
 
     // Candidate thresholds for entry score optimization
     private static readonly decimal[] CandidateThresholds =
-        [0.15m, 0.20m, 0.25m, 0.30m, 0.35m, 0.40m, 0.45m, 0.50m];
+        [0.25m, 0.30m, 0.35m, 0.40m, 0.45m, 0.50m, 0.55m, 0.60m];
 
     public NightlyLocalTrainer(
         IServiceScopeFactory scopeFactory,
@@ -122,8 +123,8 @@ public class NightlyLocalTrainer
         var cutoff = DateTime.UtcNow.AddDays(-lookbackDays);
 
         // Raw SQL for the complex subquery join — EF Core can't efficiently do this
-        // Load both 1-min and 5-min outcomes. Use PriceAfter5Min as primary training label
-        // because actual hold times (60-300s, up to 900s) are much closer to 5 min than 1 min.
+        // Load 1/5/15/30-min outcomes. Use PriceAfter30Min as primary training label
+        // for swing-style hold times, with fallback chain 15Min > 5Min.
         var sql = $@"
             SELECT
                 ts.""TickerId"",
@@ -137,6 +138,12 @@ public class NightlyLocalTrainer
                 ts.""SpreadSignal"",
                 ts.""LargeOrderSignal"",
                 ts.""Imbalance"",
+                ts.""TickMomentum"",
+                ts.""Ema9"",
+                ts.""Ema20"",
+                ts.""Rsi14"",
+                ts.""Vwap"",
+                ts.""VolumeRatio"",
                 COALESCE(ts.""Spread"", 0) AS ""Spread"",
                 EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York')::int AS ""Hour"",
                 COALESCE(ts.""PriceAfter1Min"",
@@ -153,7 +160,23 @@ public class NightlyLocalTrainer
                                                AND ts.""Timestamp"" + INTERVAL '305 seconds'
                      ORDER BY ABS(EXTRACT(EPOCH FROM bs.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '300 seconds')))
                      LIMIT 1)
-                ) AS ""PriceAfter5Min""
+                ) AS ""PriceAfter5Min"",
+                COALESCE(ts.""PriceAfter15Min"",
+                    (SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                     WHERE sb.""SymbolId"" = ts.""SymbolId""
+                     AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '870 seconds'
+                                               AND ts.""Timestamp"" + INTERVAL '930 seconds'
+                     ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '900 seconds')))
+                     LIMIT 1)
+                ) AS ""PriceAfter15Min"",
+                COALESCE(ts.""PriceAfter30Min"",
+                    (SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                     WHERE sb.""SymbolId"" = ts.""SymbolId""
+                     AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '1770 seconds'
+                                               AND ts.""Timestamp"" + INTERVAL '1830 seconds'
+                     ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '1800 seconds')))
+                     LIMIT 1)
+                ) AS ""PriceAfter30Min""
             FROM ""TradingSignals"" ts
             JOIN ""Symbols"" s ON s.""Id"" = ts.""SymbolId""
             WHERE ts.""Timestamp"" > {{0}}
@@ -189,6 +212,12 @@ public class NightlyLocalTrainer
                 SpreadSignal = reader.GetDecimal(reader.GetOrdinal("SpreadSignal")),
                 LargeOrderSignal = reader.GetDecimal(reader.GetOrdinal("LargeOrderSignal")),
                 Imbalance = reader.GetDecimal(reader.GetOrdinal("Imbalance")),
+                TickMomentum = reader.GetDecimal(reader.GetOrdinal("TickMomentum")),
+                Ema9 = reader.GetDecimal(reader.GetOrdinal("Ema9")),
+                Ema20 = reader.GetDecimal(reader.GetOrdinal("Ema20")),
+                Rsi14 = reader.GetDecimal(reader.GetOrdinal("Rsi14")),
+                Vwap = reader.GetDecimal(reader.GetOrdinal("Vwap")),
+                VolumeRatio = reader.GetDecimal(reader.GetOrdinal("VolumeRatio")),
                 Spread = reader.GetDecimal(reader.GetOrdinal("Spread")),
                 Hour = reader.GetInt32(reader.GetOrdinal("Hour")),
             };
@@ -201,9 +230,17 @@ public class NightlyLocalTrainer
             if (!reader.IsDBNull(priceAfter5Ord))
                 row.PriceAfter5Min = reader.GetDecimal(priceAfter5Ord);
 
-            // Label win/loss using PriceAfter5Min (primary) or PriceAfter1Min (fallback).
-            // 5-min outcome better matches actual hold times (60-300s, up to 900s).
-            decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
+            var priceAfter15Ord = reader.GetOrdinal("PriceAfter15Min");
+            if (!reader.IsDBNull(priceAfter15Ord))
+                row.PriceAfter15Min = reader.GetDecimal(priceAfter15Ord);
+
+            var priceAfter30Ord = reader.GetOrdinal("PriceAfter30Min");
+            if (!reader.IsDBNull(priceAfter30Ord))
+                row.PriceAfter30Min = reader.GetDecimal(priceAfter30Ord);
+
+            // Label win/loss using longest available outcome for swing-style training.
+            // Prefer 30-min > 15-min > 5-min to match longer hold times.
+            decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
             if (outcomePrice.HasValue)
             {
                 decimal priceDelta = outcomePrice.Value - row.Price;
@@ -215,8 +252,8 @@ public class NightlyLocalTrainer
             rows.Add(row);
         }
 
-        // Filter to only rows with outcome data (prefer 5-min, fall back to 1-min)
-        return rows.Where(r => r.PriceAfter5Min.HasValue || r.PriceAfter1Min.HasValue).ToList();
+        // Filter to only rows with outcome data (prefer 30-min, fall back to 15/5/1-min)
+        return rows.Where(r => r.PriceAfter30Min.HasValue || r.PriceAfter15Min.HasValue || r.PriceAfter5Min.HasValue || r.PriceAfter1Min.HasValue).ToList();
     }
 
     #endregion
@@ -370,6 +407,8 @@ public class NightlyLocalTrainer
     /// <summary>
     /// Simple hill-climbing optimizer: randomly perturb one weight at a time,
     /// keep the change if it improves total P&amp;L after fees.
+    /// Only optimizes the 6 L2/tick weights (indices 0-5). Trend, VWAP, Volume,
+    /// and RSI (indices 6-9) are fixed at 0 since contextual filters handle them.
     /// </summary>
     private decimal[] OptimizeWeights(List<TrainingRow> rows)
     {
@@ -379,8 +418,8 @@ public class NightlyLocalTrainer
 
         for (int iter = 0; iter < OptimizationIterations; iter++)
         {
-            // Pick a random weight index
-            int idx = rng.Next(weights.Length);
+            // Only optimize L2/tick indicators (0-5), not macro indicators (6-9)
+            int idx = rng.Next(6);
 
             // Perturb by ±0.05
             decimal perturbation = (rng.NextDouble() > 0.5 ? 0.05m : -0.05m);
@@ -407,75 +446,64 @@ public class NightlyLocalTrainer
         return weights;
     }
 
+    /// <summary>
+    /// Normalize the 6 active L2/tick weights (indices 0-5) to sum to 1.0.
+    /// Indices 6-9 (Trend, VWAP, Volume, RSI) are kept at 0 — contextual filters handle them.
+    /// </summary>
     private static void NormalizeWeights(decimal[] weights)
     {
-        decimal absSum = weights.Sum(w => Math.Abs(w));
+        // Only normalize the 6 active weights (0-5); indices 6-9 stay at 0
+        const int activeCount = 6;
+        decimal absSum = 0;
+        for (int i = 0; i < activeCount; i++)
+            absSum += Math.Abs(weights[i]);
+
         if (absSum > 0 && absSum != 1.0m)
         {
-            for (int i = 0; i < weights.Length; i++)
+            for (int i = 0; i < activeCount; i++)
                 weights[i] = weights[i] / absSum;
         }
     }
 
     /// <summary>
     /// Compute the composite score for a training row using given weights.
-    /// Matches the indicator order in MarketMicrostructureAnalyzer.
+    /// All 10 indicators are now available from the DB. Weights 6-9 (Trend, VWAP,
+    /// Volume, RSI) are fixed at 0 since contextual filters handle them,
+    /// but included for correctness if the optimizer ever assigns weight.
     /// </summary>
     private static decimal ComputeCompositeScore(TrainingRow row, decimal[] weights)
     {
+        // Compute derived scores matching MarketMicrostructureAnalyzer formulas
+        decimal trendScore = row.Ema9 > row.Ema20 ? 1m : row.Ema9 < row.Ema20 ? -1m : 0m;
+        decimal vwapScore = row.Price > 0 && row.Vwap > 0
+            ? Math.Clamp((row.Price - row.Vwap) / row.Vwap * 10m, -1m, 1m) : 0;
+        decimal volumeScore = Math.Clamp(row.VolumeRatio - 1.0m, -1m, 1m);
+        decimal rsiScore = Math.Clamp((row.Rsi14 - 50m) / 50m, -1m, 1m);
+
         return row.ObiSmoothed * weights[0]
              + row.Wobi * weights[1]
              + row.PressureRoc * weights[2]
              + row.SpreadSignal * weights[3]
              + row.LargeOrderSignal * weights[4]
-             + row.Imbalance * weights[5]  // TickMomentum proxy — we use Imbalance from DB
-             + row.Score * weights[6] * 0   // Trend not stored separately; use score direction
-             + 0                             // Vwap — not stored in training row
-             + 0                             // Volume — not stored in training row
-             + 0;                            // RSI — not stored in training row
-        // NOTE: For indicators not individually stored in TradingSignalRecord,
-        // we fall back to the stored composite Score as a proxy.
+             + row.TickMomentum * weights[5]
+             + trendScore * weights[6]
+             + vwapScore * weights[7]
+             + volumeScore * weights[8]
+             + rsiScore * weights[9];
     }
 
     /// <summary>
-    /// Recompute composite score using the raw indicators available in TradingSignalRecord.
-    /// Since not all 10 indicators are stored separately, we use what we have and
-    /// weight the stored Score for the missing ones.
+    /// Alias for ComputeCompositeScore — all 10 indicators are now available in TrainingRow.
     /// </summary>
     private static decimal ComputeWeightedScore(TrainingRow row, decimal[] weights)
     {
-        // Available indicators from TradingSignalRecord:
-        // OBI, WOBI, PressureRoc, SpreadSignal, LargeOrderSignal, Imbalance
-        // Missing: TickMomentum, Trend, Vwap, Volume, RSI
-        // The original Score already incorporates all 10, so we blend:
-        // Use available indicators with their weights, and scale original Score for the rest.
-
-        decimal knownScore =
-            row.ObiSmoothed * weights[0]
-          + row.Wobi * weights[1]
-          + row.PressureRoc * weights[2]
-          + row.SpreadSignal * weights[3]
-          + row.LargeOrderSignal * weights[4];
-
-        // Weight of known indicators
-        decimal knownWeight = Math.Abs(weights[0]) + Math.Abs(weights[1]) + Math.Abs(weights[2])
-                            + Math.Abs(weights[3]) + Math.Abs(weights[4]);
-
-        // Weight of unknown indicators
-        decimal unknownWeight = Math.Abs(weights[5]) + Math.Abs(weights[6]) + Math.Abs(weights[7])
-                              + Math.Abs(weights[8]) + Math.Abs(weights[9]);
-
-        // For unknowns, scale the original composite score proportionally
-        // The original score used default weights summing to 1.0
-        decimal unknownScore = unknownWeight > 0 ? row.Score * unknownWeight : 0;
-
-        return knownScore + unknownScore;
+        return ComputeCompositeScore(row, weights);
     }
 
     /// <summary>
     /// Simulate trading all rows with given weights, return total P&amp;L after fees.
     /// Only trades when |score| >= 0.30 (moderate threshold for optimization phase).
-    /// Uses PriceAfter5Min (primary) or PriceAfter1Min (fallback) to match actual hold times.
+    /// Uses PriceAfter30Min (primary) with fallback chain 15Min/5Min for swing-style hold times.
     ///
     /// REALISTIC COSTS:
     /// - Commission: $0 (Webull and Questrade are zero-commission for US equities)
@@ -491,8 +519,8 @@ public class NightlyLocalTrainer
 
         foreach (var row in rows)
         {
-            // Use 5-min outcome (closer to real hold time) with 1-min fallback
-            decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
+            // Use 30-min outcome (swing hold time) with 15/5-min fallback
+            decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
             if (!outcomePrice.HasValue) continue;
 
             decimal score = ComputeWeightedScore(row, weights);
@@ -544,7 +572,7 @@ public class NightlyLocalTrainer
             int buyCount = 0;
             foreach (var row in buyTrades)
             {
-                decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
+                decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
                 decimal score = ComputeWeightedScore(row, weights);
                 if (score >= threshold && outcomePrice.HasValue)
                 {
@@ -567,7 +595,7 @@ public class NightlyLocalTrainer
             int sellCount = 0;
             foreach (var row in sellTrades)
             {
-                decimal? outcomePrice = row.PriceAfter5Min ?? row.PriceAfter1Min;
+                decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
                 decimal score = ComputeWeightedScore(row, weights);
                 if (score <= -threshold && outcomePrice.HasValue)
                 {
@@ -703,16 +731,31 @@ public class TrainingRow
     public int SignalType { get; set; } // 1=BUY, 2=SELL
     public decimal Price { get; set; }
     public decimal Score { get; set; }
+
+    // L2 microstructure indicators (stored as computed scores, [-1, +1])
     public decimal ObiSmoothed { get; set; }
     public decimal Wobi { get; set; }
     public decimal PressureRoc { get; set; }
     public decimal SpreadSignal { get; set; }
     public decimal LargeOrderSignal { get; set; }
     public decimal Imbalance { get; set; }
+
+    // Tick-derived ([-1, +1])
+    public decimal TickMomentum { get; set; }
+
+    // Bar-derived (raw values — converted to scores in ComputeCompositeScore)
+    public decimal Ema9 { get; set; }
+    public decimal Ema20 { get; set; }
+    public decimal Rsi14 { get; set; }
+    public decimal Vwap { get; set; }
+    public decimal VolumeRatio { get; set; }
+
     public decimal Spread { get; set; } // Raw bid-ask spread in dollars
     public int Hour { get; set; } // Hour of day (ET)
     public decimal? PriceAfter1Min { get; set; }
     public decimal? PriceAfter5Min { get; set; }
+    public decimal? PriceAfter15Min { get; set; }
+    public decimal? PriceAfter30Min { get; set; }
     public bool IsWin { get; set; }
     public decimal PnlPer100Shares { get; set; }
 }

@@ -170,6 +170,8 @@ public static class TradingPilotDbContextModelCreatingExtensions
             b.Property(x => x.Reason).HasMaxLength(500);
             b.Property(x => x.PriceAfter1Min).HasPrecision(12, 4);
             b.Property(x => x.PriceAfter5Min).HasPrecision(12, 4);
+            b.Property(x => x.PriceAfter15Min).HasPrecision(12, 4);
+            b.Property(x => x.PriceAfter30Min).HasPrecision(12, 4);
             b.Property(x => x.Type).HasConversion<byte>();
             b.Property(x => x.Strength).HasConversion<byte>();
 

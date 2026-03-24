@@ -92,8 +92,8 @@
             {
                 <div class="tp-col-5">
                     <div class="tp-symbol-card @(s.CurrentPosition != 0 ? "tp-has-position" : "")">
-                        <div class="d-flex justify-content-between align-items-center mb-1">
-                            <div class="d-flex align-items-center gap-2">
+                        <div class="tp-card-header">
+                            <div class="tp-card-header-left">
                                 <span class="tp-ticker">@s.Ticker</span>
                                 @if (s.CurrentPosition != 0)
                                 {
@@ -109,7 +109,7 @@
                                     <span class="tp-signal-score-inline @PnlClass(s.LastSignalScore)">@s.LastSignalScore.ToString("F3")</span>
                                 }
                             </div>
-                            <div class="text-end">
+                            <div class="tp-card-header-right">
                                 <span class="tp-price">@FormatPrice(s.Price)</span>
                                 <span class="@PnlClass(s.Change) tp-change-inline">
                                     @(s.ChangePercent >= 0 ? "+" : "")@s.ChangePercent.ToString("F2")%
@@ -203,11 +203,11 @@
                     <div class="tp-stat-grid">
                         <div class="tp-stat">
                             <div class="tp-stat-label">Best Trade</div>
-                            <div class="tp-stat-val tp-up">@FormatPnl(_data.PnlSummary.BestTrade)</div>
+                            <div class="tp-stat-val @PnlClass(_data.PnlSummary.BestTrade)">@FormatPnl(_data.PnlSummary.BestTrade)</div>
                         </div>
                         <div class="tp-stat">
                             <div class="tp-stat-label">Worst Trade</div>
-                            <div class="tp-stat-val tp-down">@FormatPnl(_data.PnlSummary.WorstTrade)</div>
+                            <div class="tp-stat-val @PnlClass(_data.PnlSummary.WorstTrade)">@FormatPnl(_data.PnlSummary.WorstTrade)</div>
                         </div>
                         <div class="tp-stat">
                             <div class="tp-stat-label">Avg Win</div>

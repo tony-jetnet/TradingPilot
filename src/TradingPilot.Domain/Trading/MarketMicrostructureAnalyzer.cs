@@ -40,19 +40,19 @@ public class MarketMicrostructureAnalyzer
     private const string ModelConfigPath = @"D:\Third-Parties\WebullHook\model_config.json";
     private const string StrategyConfigPath = @"D:\Third-Parties\WebullHook\strategy_rules.json";
 
-    // Default L2 indicator weights (total: 0.50)
-    private const decimal WeightObi = 0.15m;
-    private const decimal WeightWobi = 0.15m;
-    private const decimal WeightPressureRoc = 0.10m;
-    private const decimal WeightSpread = 0.05m;
-    private const decimal WeightLargeOrder = 0.05m;
-
-    // Default new indicator weights (total: 0.50)
-    private const decimal WeightTickMomentum = 0.10m;
-    private const decimal WeightTrendAlignment = 0.15m;
-    private const decimal WeightVwapPosition = 0.10m;
-    private const decimal WeightVolumeConfirmation = 0.10m;
-    private const decimal WeightRsiFilter = 0.05m;
+    // Default indicator weights: only L2 microstructure + tick momentum (total: 1.00).
+    // Trend, VWAP, Volume, RSI are handled exclusively by contextual filters
+    // to avoid double penalization (weighted score + filter multiplier).
+    private const decimal WeightObi = 0.25m;
+    private const decimal WeightWobi = 0.25m;
+    private const decimal WeightPressureRoc = 0.15m;
+    private const decimal WeightSpread = 0.10m;
+    private const decimal WeightLargeOrder = 0.10m;
+    private const decimal WeightTickMomentum = 0.15m;
+    private const decimal WeightTrendAlignment = 0.00m;       // contextual filter only
+    private const decimal WeightVwapPosition = 0.00m;         // contextual filter only
+    private const decimal WeightVolumeConfirmation = 0.00m;   // contextual filter only
+    private const decimal WeightRsiFilter = 0.00m;            // contextual filter only
 
     // Signal thresholds
     private const decimal StrongBuyThreshold = 0.40m;
@@ -62,8 +62,11 @@ public class MarketMicrostructureAnalyzer
     private const decimal ModerateSellThreshold = -0.20m;
     private const decimal WeakSellThreshold = -0.10m;
 
-    // Minimum interval between signals to avoid spam (2s to avoid suppressing reversals)
-    private static readonly TimeSpan MinSignalInterval = TimeSpan.FromSeconds(2);
+    // Minimum interval between signals per ticker.
+    // 5 minutes for swing trading (30min-2hr holds). Reduces signal noise and ensures
+    // only persistent patterns generate entries. Combined with passive limit orders,
+    // this prevents the whipsaw bleeding seen with 30s intervals.
+    private static readonly TimeSpan MinSignalInterval = TimeSpan.FromMinutes(5);
 
     // Window sizes for rolling calculations
     private const int ShortWindow = 10;
@@ -333,14 +336,66 @@ public class MarketMicrostructureAnalyzer
             if (state.LastSignalTime != default && (ruleNow - state.LastSignalTime) < MinSignalInterval)
                 return null;
 
+            // Check hourly trading enablement from model config (same as Stage 2)
+            var ruleTickerConfig = _modelConfig?.Tickers.GetValueOrDefault(tickerId);
+            if (ruleTickerConfig != null)
+            {
+                if (ruleTickerConfig.HourlyAdjustments.TryGetValue(etHour, out var ruleHourAdj) && !ruleHourAdj.EnableTrading)
+                    return null;
+            }
+
+            // Check live rule performance — disable rules losing money in real-time
+            if (_ruleEvaluator.IsRuleDisabledByLivePerformance(rule.Id))
+            {
+                _logger.LogInformation("Rule {RuleId} for {Ticker} disabled by live performance", rule.Id, ticker);
+                return null;
+            }
+
             var ruleSignalType = rule.Direction == "BUY" ? SignalType.Buy : SignalType.Sell;
-            var ruleStrength = rule.Confidence >= 0.70m ? SignalStrength.Strong
-                : rule.Confidence >= 0.60m ? SignalStrength.Moderate
+
+            // Apply contextual filters (same safety net as Stage 2).
+            // Use rule confidence as effective score, with sign for direction.
+            decimal effectiveScore = rule.Confidence * (ruleSignalType == SignalType.Sell ? -1 : 1);
+
+            if (barIndicatorsForRules != null)
+            {
+                if (barIndicatorsForRules.TrendDirection == -1 && effectiveScore > 0)
+                    effectiveScore *= 0.5m;
+                else if (barIndicatorsForRules.TrendDirection == 1 && effectiveScore < 0)
+                    effectiveScore *= 0.5m;
+
+                if (!barIndicatorsForRules.AboveVwap && effectiveScore > 0)
+                    effectiveScore *= 0.7m;
+                else if (barIndicatorsForRules.AboveVwap && effectiveScore < 0)
+                    effectiveScore *= 0.7m;
+
+                if (barIndicatorsForRules.HighVolume)
+                    effectiveScore *= 1.3m;
+
+                if (barIndicatorsForRules.OverboughtRsi && effectiveScore > 0)
+                    effectiveScore *= 0.5m;
+                else if (barIndicatorsForRules.OversoldRsi && effectiveScore < 0)
+                    effectiveScore *= 0.5m;
+            }
+
+            // Reject if filtered score is too weak (below moderate threshold)
+            decimal absFiltered = Math.Abs(effectiveScore);
+            if (absFiltered < ModerateBuyThreshold)
+            {
+                _logger.LogInformation(
+                    "Rule {RuleId} for {Ticker} suppressed by filters: conf={Conf:F2} filtered={Filtered:F2}",
+                    rule.Id, ticker, rule.Confidence, effectiveScore);
+                return null;
+            }
+
+            // Re-classify strength based on filtered score
+            var ruleStrength = absFiltered >= 0.40m ? SignalStrength.Strong
+                : absFiltered >= 0.20m ? SignalStrength.Moderate
                 : SignalStrength.Weak;
 
             var ruleIndicators = new Dictionary<string, decimal>
             {
-                ["CompositeScore"] = rule.Confidence * (ruleSignalType == SignalType.Sell ? -1 : 1),
+                ["CompositeScore"] = effectiveScore,
                 ["RuleConfidence"] = rule.Confidence,
                 ["RuleHoldSeconds"] = rule.HoldSeconds,
                 ["RuleStopLoss"] = rule.StopLoss,
@@ -363,7 +418,7 @@ public class MarketMicrostructureAnalyzer
                 Type = ruleSignalType,
                 Strength = ruleStrength,
                 Price = snapshot.MidPrice,
-                Reason = $"[RULE {rule.Id}] {rule.Name} (conf={rule.Confidence:F2})",
+                Reason = $"[RULE {rule.Id}] {rule.Name} (conf={rule.Confidence:F2} filtered={effectiveScore:F2})",
                 Indicators = ruleIndicators,
             };
 
@@ -371,9 +426,9 @@ public class MarketMicrostructureAnalyzer
             state.LastSignalTime = ruleNow;
 
             _logger.LogWarning(
-                "{Strength} {SignalType} signal for {Ticker} at {Price:F4} | RULE={RuleId} \"{RuleName}\" conf={Confidence:F2} hold={Hold}s",
+                "{Strength} {SignalType} signal for {Ticker} at {Price:F4} | RULE={RuleId} \"{RuleName}\" conf={Confidence:F2} filtered={Filtered:F2} hold={Hold}s",
                 ruleStrength, ruleSignalType, ticker, snapshot.MidPrice,
-                rule.Id, rule.Name, rule.Confidence, rule.HoldSeconds);
+                rule.Id, rule.Name, rule.Confidence, effectiveScore, rule.HoldSeconds);
 
             return ruleSignal;
         }
@@ -395,6 +450,18 @@ public class MarketMicrostructureAnalyzer
         decimal compositeScore;
         var barIndicators = _barCache.GetIndicators(tickerId);
         bool usedSwin = false;
+
+        // Always compute L2 microstructure indicators (needed for DB storage and training)
+        decimal obiScore = ComputeSmoothedObi(state);
+        decimal wobiScore = ComputeWeightedObi(snapshot);
+        decimal pressureRocScore = ComputePressureRoc(state);
+        decimal spreadScore = ComputeSpreadSignal(state, snapshot);
+        decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
+        decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
+        decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
+        decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
+        decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
+        decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
 
         // Try Swin model first — it learns directly from raw L2 heatmaps
         var swinSnapshots = _l2Cache.GetSnapshots(tickerId, 300);
@@ -418,17 +485,6 @@ public class MarketMicrostructureAnalyzer
         else
         {
             // Fallback to weighted scoring (original Stage 2 logic)
-            decimal obiScore = ComputeSmoothedObi(state);
-            decimal wobiScore = ComputeWeightedObi(snapshot);
-            decimal pressureRocScore = ComputePressureRoc(state);
-            decimal spreadScore = ComputeSpreadSignal(state, snapshot);
-            decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
-            decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
-            decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
-            decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
-            decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
-            decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
-
             if (tickerConfig != null)
             {
                 compositeScore =
@@ -457,38 +513,40 @@ public class MarketMicrostructureAnalyzer
                     volumeConfirmationScore * WeightVolumeConfirmation +
                     rsiFilterScore * WeightRsiFilter;
             }
+        }
 
-            // Apply contextual filters (only for weighted scoring — Swin already learned these)
-            if (barIndicators != null)
+        // Apply contextual filters to ALL signals (weighted AND Swin).
+        // Swin only sees L2 heatmaps — it has no awareness of RSI, trend, or VWAP,
+        // so it will sell into oversold conditions and buy into overbought ones.
+        if (barIndicators != null)
+        {
+            decimal preFilterScore = compositeScore;
+
+            if (barIndicators.TrendDirection == -1 && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
+                compositeScore *= 0.5m;
+
+            if (!barIndicators.AboveVwap && compositeScore > 0)
+                compositeScore *= 0.7m;
+            else if (barIndicators.AboveVwap && compositeScore < 0)
+                compositeScore *= 0.7m;
+
+            if (barIndicators.HighVolume)
+                compositeScore *= 1.3m;
+
+            if (barIndicators.OverboughtRsi && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.OversoldRsi && compositeScore < 0)
+                compositeScore *= 0.5m;
+
+            if (preFilterScore != 0)
             {
-                decimal preFilterScore = compositeScore;
-
-                if (barIndicators.TrendDirection == -1 && compositeScore > 0)
-                    compositeScore *= 0.5m;
-                else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
-                    compositeScore *= 0.5m;
-
-                if (!barIndicators.AboveVwap && compositeScore > 0)
-                    compositeScore *= 0.7m;
-                else if (barIndicators.AboveVwap && compositeScore < 0)
-                    compositeScore *= 0.7m;
-
-                if (barIndicators.HighVolume)
-                    compositeScore *= 1.3m;
-
-                if (barIndicators.OverboughtRsi && compositeScore > 0)
-                    compositeScore *= 0.5m;
-                else if (barIndicators.OversoldRsi && compositeScore < 0)
-                    compositeScore *= 0.5m;
-
-                if (preFilterScore != 0)
-                {
-                    decimal minAllowed = preFilterScore * 0.50m;
-                    if (preFilterScore > 0 && compositeScore < minAllowed)
-                        compositeScore = minAllowed;
-                    else if (preFilterScore < 0 && compositeScore > minAllowed)
-                        compositeScore = minAllowed;
-                }
+                decimal minAllowed = preFilterScore * 0.50m;
+                if (preFilterScore > 0 && compositeScore < minAllowed)
+                    compositeScore = minAllowed;
+                else if (preFilterScore < 0 && compositeScore > minAllowed)
+                    compositeScore = minAllowed;
             }
         }
 
@@ -520,9 +578,27 @@ public class MarketMicrostructureAnalyzer
         if (state.LastSignalTime != default && (now - state.LastSignalTime) < MinSignalInterval)
             return null;
 
+        // Same-direction dedup: if the last signal was the same direction,
+        // require a meaningful score change (>0.10) to emit again.
+        // This prevents repeated "Moderate Buy" spam when the score hovers at the same level.
+        // Direction reversals always go through immediately.
+        if (state.LastSignal != null && state.LastSignal.Type == signalType)
+        {
+            decimal lastScore = state.LastSignal.Indicators.GetValueOrDefault("CompositeScore");
+            if (Math.Abs(compositeScore - lastScore) < 0.10m)
+                return null;
+        }
+
         var indicators = new Dictionary<string, decimal>
         {
             ["CompositeScore"] = Math.Round(compositeScore, 4),
+            // L2 microstructure indicators — always stored for training/analysis
+            ["OBI"] = Math.Round(obiScore, 6),
+            ["WOBI"] = Math.Round(wobiScore, 6),
+            ["PressureROC"] = Math.Round(pressureRocScore, 6),
+            ["SpreadSignal"] = Math.Round(spreadScore, 6),
+            ["LargeOrderSignal"] = Math.Round(largeOrderScore, 6),
+            ["TickMomentum"] = Math.Round(tickMomentumScore, 6),
         };
 
         if (usedSwin && swinPrediction != null)
@@ -696,38 +772,38 @@ public class MarketMicrostructureAnalyzer
                     volumeConfirmationScore * WeightVolumeConfirmation +
                     rsiFilterScore * WeightRsiFilter;
             }
+        }
 
-            // Apply contextual filters (only for weighted scoring — Swin already learned these)
-            if (barIndicators != null)
+        // Apply contextual filters to ALL signals (weighted AND Swin)
+        if (barIndicators != null)
+        {
+            decimal preFilterScore = compositeScore;
+
+            if (barIndicators.TrendDirection == -1 && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
+                compositeScore *= 0.5m;
+
+            if (!barIndicators.AboveVwap && compositeScore > 0)
+                compositeScore *= 0.7m;
+            else if (barIndicators.AboveVwap && compositeScore < 0)
+                compositeScore *= 0.7m;
+
+            if (barIndicators.HighVolume)
+                compositeScore *= 1.3m;
+
+            if (barIndicators.OverboughtRsi && compositeScore > 0)
+                compositeScore *= 0.5m;
+            else if (barIndicators.OversoldRsi && compositeScore < 0)
+                compositeScore *= 0.5m;
+
+            if (preFilterScore != 0)
             {
-                decimal preFilterScore = compositeScore;
-
-                if (barIndicators.TrendDirection == -1 && compositeScore > 0)
-                    compositeScore *= 0.5m;
-                else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
-                    compositeScore *= 0.5m;
-
-                if (!barIndicators.AboveVwap && compositeScore > 0)
-                    compositeScore *= 0.7m;
-                else if (barIndicators.AboveVwap && compositeScore < 0)
-                    compositeScore *= 0.7m;
-
-                if (barIndicators.HighVolume)
-                    compositeScore *= 1.3m;
-
-                if (barIndicators.OverboughtRsi && compositeScore > 0)
-                    compositeScore *= 0.5m;
-                else if (barIndicators.OversoldRsi && compositeScore < 0)
-                    compositeScore *= 0.5m;
-
-                if (preFilterScore != 0)
-                {
-                    decimal minAllowed = preFilterScore * 0.50m;
-                    if (preFilterScore > 0 && compositeScore < minAllowed)
-                        compositeScore = minAllowed;
-                    else if (preFilterScore < 0 && compositeScore > minAllowed)
-                        compositeScore = minAllowed;
-                }
+                decimal minAllowed = preFilterScore * 0.50m;
+                if (preFilterScore > 0 && compositeScore < minAllowed)
+                    compositeScore = minAllowed;
+                else if (preFilterScore < 0 && compositeScore > minAllowed)
+                    compositeScore = minAllowed;
             }
         }
 
@@ -886,16 +962,18 @@ public class MarketMicrostructureAnalyzer
 
     /// <summary>
     /// VWAP Position: positive if price is above VWAP (bullish), negative if below.
-    /// Magnitude based on distance from VWAP relative to price.
+    /// Deviation relative to VWAP, scaled so typical intraday deviations (0.1-0.5%)
+    /// produce meaningful scores (0.1-0.5). A 1% deviation saturates at ±1.0.
     /// </summary>
     private static decimal ComputeVwapPositionScore(BarIndicators? barIndicators, decimal currentPrice)
     {
         if (barIndicators == null || barIndicators.Vwap <= 0 || currentPrice <= 0)
             return 0;
 
-        decimal deviation = (currentPrice - barIndicators.Vwap) / currentPrice;
-        // Clamp to [-1, +1], scale by 100 so a 1% deviation maps to ~1.0
-        return Math.Clamp(deviation * 100m, -1m, 1m);
+        // Divide by VWAP (not price) for symmetry: above/below VWAP scale equally.
+        // ×10 so 0.1% deviation → 0.10 score, 0.5% → 0.50, 1.0% → 1.0 (clamped).
+        decimal deviation = (currentPrice - barIndicators.Vwap) / barIndicators.Vwap;
+        return Math.Clamp(deviation * 10m, -1m, 1m);
     }
 
     /// <summary>

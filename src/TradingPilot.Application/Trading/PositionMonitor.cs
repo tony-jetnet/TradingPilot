@@ -24,12 +24,12 @@ public class PositionMonitor : IDisposable
     private bool _disposed;
     private bool _initialized;
 
-    // Hard cap: never hold longer than 3x the configured hold time
-    private const int MaxHoldMultiplier = 3;
-    // Default score decay tolerance for Stage 2 entries (no per-rule confidence)
-    private const decimal DefaultScoreDecayTolerance = 0.50m;
-    // Grace period: don't trigger score-based exits in the first N seconds (noise protection)
-    private const int ScoreExitGracePeriodSeconds = 15;
+    // Hard cap: never hold longer than 2x the configured hold time
+    private const int MaxHoldMultiplier = 2;
+    // Anti-wick: peak price must persist this long before trailing stop uses it
+    private const int PeakPersistenceSeconds = 10;
+    // ATR multiplier for volatility-adaptive stop loss floor
+    private const decimal AtrStopMultiplier = 1.5m;
 
     public PositionMonitor(
         PaperTradingExecutor executor,
@@ -156,6 +156,9 @@ public class PositionMonitor : IDisposable
             }
         }
         if (currentPrice <= 0) return; // No price source at all
+
+        var now = DateTime.UtcNow;
+        decimal elapsed = (decimal)(now - pos.EntryTime).TotalSeconds;
         decimal currentScore = _analyzer.ComputeCurrentScore(pos.TickerId);
 
         // Update peak favorable score
@@ -164,120 +167,141 @@ public class PositionMonitor : IDisposable
         else if (!pos.IsLong && currentScore < pos.PeakFavorableScore)
             pos.PeakFavorableScore = currentScore;
 
-        // Update peak favorable price (for trailing stop)
-        if (pos.IsLong && currentPrice > pos.PeakFavorablePrice)
-            pos.PeakFavorablePrice = currentPrice;
-        else if (!pos.IsLong && currentPrice < pos.PeakFavorablePrice)
-            pos.PeakFavorablePrice = currentPrice;
-
-        decimal elapsed = (decimal)(DateTime.UtcNow - pos.EntryTime).TotalSeconds;
-
-        // ═══════════════════════════════════════════════════════════
-        // CHECK 1: Score flip — entry thesis fully dead
-        // No grace period: a full sign flip is definitive, not noise.
-        // ═══════════════════════════════════════════════════════════
-        bool scoreFlipped = (pos.IsLong && currentScore < 0 && pos.EntryScore > 0) ||
-                            (!pos.IsLong && currentScore > 0 && pos.EntryScore < 0);
-        if (scoreFlipped)
+        // Update peak favorable price with timestamp (for anti-wick trailing stop)
+        bool newPeak = (pos.IsLong && currentPrice > pos.PeakFavorablePrice) ||
+                       (!pos.IsLong && currentPrice < pos.PeakFavorablePrice);
+        if (newPeak)
         {
-            await _executor.ExitPositionAsync(symbol, currentPrice,
-                $"SCORE FLIP entry={pos.EntryScore:F3} now={currentScore:F3} elapsed={elapsed:F0}s", currentScore);
-            _logger.LogWarning("PositionMonitor: {Symbol} EXIT SCORE FLIP entry={Entry:F3} now={Now:F3}",
-                symbol, pos.EntryScore, currentScore);
-            return;
+            pos.PeakFavorablePrice = currentPrice;
+            pos.PeakPriceSetAt = now;
         }
 
+        // Get bar indicators for bar-based exit checks
+        var barIndicators = _barCache.GetIndicators(pos.TickerId);
+
         // ═══════════════════════════════════════════════════════════
-        // CHECK 2: Score decay from peak (grace period: first 15s is noise)
-        // Rule entries: tolerance = (1 - RuleConfidence)
-        // Stage 2 entries: tolerance = 50% (default)
+        // CHECK 1: VWAP Cross — price crossed VWAP against position
+        // Grace period: 15 minutes (ignore early VWAP noise)
         // ═══════════════════════════════════════════════════════════
-        if (elapsed >= ScoreExitGracePeriodSeconds)
+        if (elapsed >= 900 && barIndicators != null)
         {
-            decimal tolerance = pos.RuleConfidence > 0
-                ? (1m - pos.RuleConfidence)       // 0.62 conf → 0.38 tolerance
-                : DefaultScoreDecayTolerance;     // Stage 2: 50% decay allowed
-
-            decimal peakAbs = Math.Abs(pos.PeakFavorableScore);
-            decimal currentAbs = pos.IsLong ? currentScore : -currentScore;
-            decimal decayFromPeak = peakAbs > 0 ? (peakAbs - currentAbs) / peakAbs : 0;
-
-            if (peakAbs > 0.05m && decayFromPeak > tolerance) // Ignore tiny peaks (noise)
+            bool vwapExit = (pos.IsLong && barIndicators.Vwap > 0 && currentPrice < barIndicators.Vwap) ||
+                            (!pos.IsLong && barIndicators.Vwap > 0 && currentPrice > barIndicators.Vwap);
+            if (vwapExit)
             {
                 await _executor.ExitPositionAsync(symbol, currentPrice,
-                    $"SCORE DECAY peak={pos.PeakFavorableScore:F3} now={currentScore:F3} decay={decayFromPeak:P0} tol={tolerance:P0} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Symbol} EXIT SCORE DECAY peak={Peak:F3} now={Now:F3} decay={Decay:P0}",
-                    symbol, pos.PeakFavorableScore, currentScore, decayFromPeak);
+                    $"VWAP CROSS price={currentPrice:F2} vwap={barIndicators.Vwap:F2} elapsed={elapsed:F0}s", currentScore);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT VWAP CROSS price={Price:F2} vwap={Vwap:F2}",
+                    symbol, currentPrice, barIndicators.Vwap);
                 return;
             }
         }
 
         // ═══════════════════════════════════════════════════════════
-        // CHECK 3: Microstructure collapse — spread at 90th percentile + imbalance reversed
+        // CHECK 2: EMA Trend Reversal — EMA9 crossed EMA20 against position
+        // Grace period: 10 minutes (give the trend time to develop)
         // ═══════════════════════════════════════════════════════════
-        var tickData = _tickCache.GetData(pos.TickerId);
-        if (tickData != null)
+        if (elapsed >= 600 && barIndicators != null)
         {
-            bool spreadWide = tickData.SpreadPercentile >= 0.90m;
-            bool imbalanceReversed = pos.IsLong
-                ? (tickData.BookDepthRatio < 0 && pos.EntryImbalance > 0)
-                : (tickData.BookDepthRatio > 0 && pos.EntryImbalance < 0);
-
-            if (spreadWide && imbalanceReversed)
+            bool trendReversed = (pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 < barIndicators.Ema20) ||
+                                 (!pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 > barIndicators.Ema20);
+            if (trendReversed)
             {
                 await _executor.ExitPositionAsync(symbol, currentPrice,
-                    $"MICROSTRUCTURE COLLAPSE spread_pctl={tickData.SpreadPercentile:F2} obi_entry={pos.EntryImbalance:F3} obi_now={tickData.BookDepthRatio:F3} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Symbol} EXIT MICROSTRUCTURE COLLAPSE", symbol);
+                    $"TREND REVERSAL ema9={barIndicators.Ema9:F2} ema20={barIndicators.Ema20:F2} elapsed={elapsed:F0}s", currentScore);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT TREND REVERSAL ema9={Ema9:F2} ema20={Ema20:F2}",
+                    symbol, barIndicators.Ema9, barIndicators.Ema20);
                 return;
             }
         }
 
         // ═══════════════════════════════════════════════════════════
-        // CHECK 4: Stop loss (price-relative, with spread floor)
-        // Floor = actual entry spread to avoid exits on normal bid-ask noise
+        // CHECK 3: RSI Extreme — take profit on overbought/oversold
+        // Grace period: 5 minutes
+        // ═══════════════════════════════════════════════════════════
+        if (elapsed >= 300 && barIndicators != null)
+        {
+            bool rsiExtreme = (pos.IsLong && barIndicators.Rsi14 > 75) ||
+                              (!pos.IsLong && barIndicators.Rsi14 > 0 && barIndicators.Rsi14 < 25);
+            if (rsiExtreme)
+            {
+                await _executor.ExitPositionAsync(symbol, currentPrice,
+                    $"RSI EXTREME rsi={barIndicators.Rsi14:F1} elapsed={elapsed:F0}s", currentScore);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT RSI EXTREME rsi={Rsi:F1}",
+                    symbol, barIndicators.Rsi14);
+                return;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // CHECK 4: Stop loss — volatility-adaptive with spread floor
+        // Uses Max(rule stop, 1.5×ATR, entry spread) so the stop automatically
+        // widens when volatility is high and tightens when it's low.
+        // Falls back to rule stop + spread floor if no ATR data at entry.
         // ═══════════════════════════════════════════════════════════
         decimal adverse = pos.IsLong
             ? pos.EntryPrice - currentPrice
             : currentPrice - pos.EntryPrice;
 
-        decimal effectiveStopLoss = Math.Max(pos.StopLoss, pos.EntrySpread);
+        decimal atrFloor = pos.EntryAtr > 0 ? pos.EntryAtr * AtrStopMultiplier : 0;
+        decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, atrFloor), pos.EntrySpread);
 
         if (adverse > effectiveStopLoss)
         {
             await _executor.ExitPositionAsync(symbol, currentPrice,
-                $"STOP LOSS adverse={adverse:F2} stop={effectiveStopLoss:F2} elapsed={elapsed:F0}s", currentScore);
+                $"STOP LOSS adverse={adverse:F2} stop={effectiveStopLoss:F2} (rule={pos.StopLoss:F2} atr_floor={atrFloor:F2} spread={pos.EntrySpread:F2}) elapsed={elapsed:F0}s", currentScore);
             _logger.LogWarning("PositionMonitor: {Symbol} EXIT STOP LOSS adverse={Adverse:F2} stop={Stop:F2}",
                 symbol, adverse, effectiveStopLoss);
             return;
         }
 
         // ═══════════════════════════════════════════════════════════
-        // CHECK 5: Trailing stop using peak price
-        // Once profitable by > stop amount, trail from peak price.
-        // Higher confidence = tighter trail.
+        // CHECK 5a: Breakeven stop — once profitable by 1.5x stop distance,
+        // move the floor to breakeven (entry price). Prevents winning trades
+        // from turning into losers. Uses 1.5x (not 1.0x) to avoid premature
+        // exits on normal price oscillation near the stop distance.
         // ═══════════════════════════════════════════════════════════
-        decimal peakProfit = pos.IsLong
-            ? pos.PeakFavorablePrice - pos.EntryPrice
-            : pos.EntryPrice - pos.PeakFavorablePrice;
         decimal currentProfit = pos.IsLong
             ? currentPrice - pos.EntryPrice
             : pos.EntryPrice - currentPrice;
+        decimal peakProfit = pos.IsLong
+            ? pos.PeakFavorablePrice - pos.EntryPrice
+            : pos.EntryPrice - pos.PeakFavorablePrice;
 
+        if (peakProfit > effectiveStopLoss * 1.5m && currentProfit < 0)
+        {
+            await _executor.ExitPositionAsync(symbol, currentPrice,
+                $"BREAKEVEN STOP peak_profit={peakProfit:F2} now_loss={currentProfit:F2} elapsed={elapsed:F0}s", currentScore);
+            _logger.LogWarning("PositionMonitor: {Symbol} EXIT BREAKEVEN STOP was_up={PeakProfit:F2} now_down={Loss:F2}",
+                symbol, peakProfit, currentProfit);
+            return;
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // CHECK 5b: Trailing stop using peak price (anti-wick filtered)
+        // Only trail from peaks that have persisted for ≥10 seconds.
+        // A single tick wick won't set an unrealistic peak that immediately
+        // triggers the trail. Higher confidence = tighter trail.
+        // ═══════════════════════════════════════════════════════════
         if (peakProfit > effectiveStopLoss)
         {
+            // Anti-wick: only use peak if it has persisted for PeakPersistenceSeconds
+            bool peakSustained = (now - pos.PeakPriceSetAt).TotalSeconds >= PeakPersistenceSeconds;
+            decimal trailPeak = peakSustained ? peakProfit : peakProfit * 0.90m; // Use 90% of wick peak as conservative estimate
+
             // Trail factor: confidence 0.62 → give back at most 38% of peak profit
             // confidence 0 (Stage 2) → give back at most 60%
             decimal maxGiveBack = pos.RuleConfidence > 0
                 ? (1m - pos.RuleConfidence)
                 : 0.60m;
-            decimal pullback = peakProfit - currentProfit;
+            decimal pullback = trailPeak - currentProfit;
 
-            if (pullback > peakProfit * maxGiveBack)
+            if (pullback > trailPeak * maxGiveBack)
             {
                 await _executor.ExitPositionAsync(symbol, currentPrice,
-                    $"TRAILING STOP peak_profit={peakProfit:F2} now={currentProfit:F2} pullback={pullback:F2} max_giveback={maxGiveBack:P0} elapsed={elapsed:F0}s", currentScore);
+                    $"TRAILING STOP peak={trailPeak:F2} now={currentProfit:F2} pullback={pullback:F2} max_giveback={maxGiveBack:P0} sustained={peakSustained} elapsed={elapsed:F0}s", currentScore);
                 _logger.LogWarning("PositionMonitor: {Symbol} EXIT TRAILING STOP peak={PeakProfit:F2} now={CurrentProfit:F2}",
-                    symbol, peakProfit, currentProfit);
+                    symbol, trailPeak, currentProfit);
                 return;
             }
         }
@@ -285,11 +309,11 @@ public class PositionMonitor : IDisposable
         // ═══════════════════════════════════════════════════════════
         // CHECK 6: Adaptive time gate
         // Past BaseHoldSeconds AND score weakening → exit
-        // Past BaseHoldSeconds BUT score improving → hold (up to 3x cap)
+        // Past BaseHoldSeconds BUT score improving → hold (up to 2x cap)
         // ═══════════════════════════════════════════════════════════
         if (elapsed >= pos.HoldSeconds)
         {
-            // Hard cap: never hold beyond 3x the configured hold time
+            // Hard cap: never hold beyond 2x the configured hold time
             if (elapsed >= pos.HoldSeconds * MaxHoldMultiplier)
             {
                 await _executor.ExitPositionAsync(symbol, currentPrice,

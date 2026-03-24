@@ -1,13 +1,19 @@
+using System.Collections.Concurrent;
+
 namespace TradingPilot.Trading;
 
 /// <summary>
 /// Pure math: evaluates AI-generated strategy rules against current market indicators.
 /// No AI calls — just condition matching. Used in real-time by MarketMicrostructureAnalyzer.
+/// Also tracks live performance per rule to auto-disable losing rules.
 /// </summary>
 public class StrategyRuleEvaluator
 {
     private volatile StrategyConfig? _config;
     private DateTime _configLoadedAt;
+
+    // Live performance tracking: auto-disable rules losing money in real-time
+    private readonly ConcurrentDictionary<string, RuleLivePerformance> _livePerformance = new();
 
     public StrategyConfig? CurrentConfig => _config;
 
@@ -15,7 +21,46 @@ public class StrategyRuleEvaluator
     {
         _config = config;
         _configLoadedAt = DateTime.UtcNow;
+        // Reset live performance when new rules are loaded (nightly refresh)
+        _livePerformance.Clear();
     }
+
+    /// <summary>
+    /// Record the outcome of a closed trade that was triggered by a rule.
+    /// Called by PaperTradingExecutor when an exit fill is confirmed.
+    /// </summary>
+    public void RecordTradeOutcome(string ruleId, decimal pnl)
+    {
+        var perf = _livePerformance.GetOrAdd(ruleId, _ => new RuleLivePerformance());
+        lock (perf)
+        {
+            if (pnl > 0) perf.Wins++;
+            else perf.Losses++;
+            perf.TotalPnl += pnl;
+        }
+    }
+
+    /// <summary>
+    /// Check if a rule should be disabled due to negative live P&amp;L.
+    /// Requires at least 3 trades before disabling to avoid premature judgment.
+    /// </summary>
+    public bool IsRuleDisabledByLivePerformance(string ruleId)
+    {
+        if (!_livePerformance.TryGetValue(ruleId, out var perf))
+            return false;
+
+        // Need at least 3 trades before making a judgment
+        if (perf.TotalTrades < 3) return false;
+
+        // Disable if total P&L is negative after minimum sample
+        return perf.TotalPnl < 0;
+    }
+
+    /// <summary>
+    /// Get live performance stats for all tracked rules (for dashboard display).
+    /// </summary>
+    public IReadOnlyDictionary<string, RuleLivePerformance> GetLivePerformance()
+        => _livePerformance;
 
     /// <summary>
     /// Find the best matching rule for the given ticker at the current hour with current indicators.
@@ -56,6 +101,10 @@ public class StrategyRuleEvaluator
 
             // Quality gate: skip rules that aren't worth trading
             if (!IsRuleTradeworthy(rule))
+                continue;
+
+            // Skip rules disabled by live performance tracking
+            if (IsRuleDisabledByLivePerformance(rule.Id))
                 continue;
 
             // Evaluate all conditions
@@ -145,4 +194,17 @@ public class IndicatorSnapshot
     public decimal Rsi14 { get; set; }
     public decimal VolumeRatio { get; set; }
     public bool AboveVwap { get; set; }
+}
+
+/// <summary>
+/// Tracks live trading performance for a specific AI rule within the current trading day.
+/// Reset when new strategy_rules.json is loaded (nightly).
+/// </summary>
+public class RuleLivePerformance
+{
+    public int Wins { get; set; }
+    public int Losses { get; set; }
+    public decimal TotalPnl { get; set; }
+    public int TotalTrades => Wins + Losses;
+    public decimal WinRate => TotalTrades > 0 ? (decimal)Wins / TotalTrades : 0;
 }

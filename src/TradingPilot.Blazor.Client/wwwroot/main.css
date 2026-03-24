@@ -170,6 +170,7 @@ body, .lp-content-wrapper, .container-fluid, main {
     padding: 14px 16px;
     transition: border-color 0.2s, box-shadow 0.2s;
     height: 100%;
+    overflow: hidden;
 }
 .tp-symbol-card:hover {
     border-color: var(--tp-accent);
@@ -178,17 +179,40 @@ body, .lp-content-wrapper, .container-fluid, main {
 .tp-has-position {
     border-left: 3px solid var(--tp-accent);
 }
+.tp-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+.tp-card-header-left {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
+}
+.tp-card-header-right {
+    display: flex;
+    align-items: baseline;
+    flex-shrink: 0;
+    white-space: nowrap;
+}
 .tp-ticker {
     font-family: var(--tp-mono);
     font-size: 1rem; font-weight: 700;
     color: #e6edf3;
     letter-spacing: 0.03em;
+    flex-shrink: 0;
 }
 .tp-pos-badge {
     font-size: 0.6rem; font-weight: 700;
     padding: 2px 6px; border-radius: 4px;
-    margin-left: 6px; letter-spacing: 0.04em;
+    letter-spacing: 0.04em;
     font-family: var(--tp-mono);
+    flex-shrink: 0;
 }
 .tp-long { background: var(--tp-up-bg); color: var(--tp-up); }
 .tp-short { background: var(--tp-down-bg); color: var(--tp-down); }

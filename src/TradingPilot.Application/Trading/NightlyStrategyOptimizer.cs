@@ -204,19 +204,33 @@ public class NightlyStrategyOptimizer
                 -- Outcomes: price after + P&L (dollar amount per 100 shares)
                 ROUND(ts.""PriceAfter1Min""::numeric, 4) AS price_1m,
                 ROUND(ts.""PriceAfter5Min""::numeric, 4) AS price_5m,
+                ROUND(ts.""PriceAfter15Min""::numeric, 4) AS price_15m,
+                ROUND(ts.""PriceAfter30Min""::numeric, 4) AS price_30m,
                 ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter1Min"" - ts.""Price"") * 100
                            WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter1Min"") * 100
                            ELSE 0 END::numeric, 2) AS pnl_1m,
                 ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter5Min"" - ts.""Price"") * 100
                            WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter5Min"") * 100
                            ELSE 0 END::numeric, 2) AS pnl_5m,
+                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter15Min"" - ts.""Price"") * 100
+                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter15Min"") * 100
+                           ELSE 0 END::numeric, 2) AS pnl_15m,
+                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter30Min"" - ts.""Price"") * 100
+                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter30Min"") * 100
+                           ELSE 0 END::numeric, 2) AS pnl_30m,
                 -- Spread-adjusted win: only count as win if profit > spread (covers entry+exit cost)
                 CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter1Min"" - ts.""Price"") > ts.""Spread"" THEN 1
                      WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter1Min"") > ts.""Spread"" THEN 1
                      ELSE 0 END AS win_1m,
                 CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter5Min"" - ts.""Price"") > ts.""Spread"" THEN 1
                      WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter5Min"") > ts.""Spread"" THEN 1
-                     ELSE 0 END AS win_5m
+                     ELSE 0 END AS win_5m,
+                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter15Min"" - ts.""Price"") > ts.""Spread"" THEN 1
+                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter15Min"") > ts.""Spread"" THEN 1
+                     ELSE 0 END AS win_15m,
+                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter30Min"" - ts.""Price"") > ts.""Spread"" THEN 1
+                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter30Min"") > ts.""Spread"" THEN 1
+                     ELSE 0 END AS win_30m
             FROM ""TradingSignals"" ts
             LEFT JOIN LATERAL (
                 SELECT
@@ -257,9 +271,11 @@ public class NightlyStrategyOptimizer
             while (await reader.ReadAsync())
             {
                 totalRows++;
-                // win columns are now at index 40, 41 (after adding dow, spread_pct, pnl_1m, pnl_5m)
-                int win1m = reader.IsDBNull(40) ? 0 : reader.GetInt32(40);
-                int win5m = reader.IsDBNull(41) ? 0 : reader.GetInt32(41);
+                // win columns are at index 44-47 (after adding price_15m, price_30m, pnl_15m, pnl_30m)
+                int win1m = reader.IsDBNull(44) ? 0 : reader.GetInt32(44);
+                int win5m = reader.IsDBNull(45) ? 0 : reader.GetInt32(45);
+                int win15m = reader.IsDBNull(46) ? 0 : reader.GetInt32(46);
+                int win30m = reader.IsDBNull(47) ? 0 : reader.GetInt32(47);
                 totalWins += win1m;
 
                 // CSV row — compact format to maximize data within token budget
@@ -302,10 +318,16 @@ public class NightlyStrategyOptimizer
                     D(reader, 35),        // a5
                     D(reader, 36),        // price_1m
                     D(reader, 37),        // price_5m
-                    D(reader, 38),        // pnl_1m
-                    D(reader, 39),        // pnl_5m
+                    D(reader, 38),        // price_15m
+                    D(reader, 39),        // price_30m
+                    D(reader, 40),        // pnl_1m
+                    D(reader, 41),        // pnl_5m
+                    D(reader, 42),        // pnl_15m
+                    D(reader, 43),        // pnl_30m
                     win1m,                // win_1m (spread-adjusted)
-                    win5m                 // win_5m (spread-adjusted)
+                    win5m,                // win_5m (spread-adjusted)
+                    win15m,               // win_15m (spread-adjusted)
+                    win30m                // win_30m (spread-adjusted)
                 ));
             }
         }
@@ -418,7 +440,7 @@ public class NightlyStrategyOptimizer
         }
         catch { /* non-fatal — first run or bad file */ }
 
-        string csvHeader = "dow,hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,spread_pct,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,pnl_1m,pnl_5m,win_1m,win_5m";
+        string csvHeader = "dow,hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,spread_pct,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,price_15m,price_30m,pnl_1m,pnl_5m,pnl_15m,pnl_30m,win_1m,win_5m,win_15m,win_30m";
 
         return new SymbolData(rows, ctx.ToString(), csvHeader, totalWins);
         }
@@ -758,16 +780,16 @@ public class NightlyStrategyOptimizer
         _logger.LogInformation("Calling Bedrock {Model} for {Ticker} ({RowCount} rows, {Chunks} chunks)...",
             modelId, ticker, rows.Count, (rows.Count + 999) / 1000);
 
-        var systemPrompt = @"You are a quantitative trading strategy optimizer. You receive RAW TRADE DATA — every signal with all indicator values and the actual outcome (P&L in dollars, spread-adjusted win/loss).
+        var systemPrompt = @"You are a quantitative trading strategy optimizer for 30min-2hr swing trades. You receive RAW TRADE DATA — every signal with all indicator values and the actual outcome (P&L in dollars, spread-adjusted win/loss).
 
-Your job: analyze the raw data to discover patterns that predict profitable trades, then output conditional rules as JSON.
+Your job: analyze the raw data to discover patterns that predict profitable swing trades, then output conditional rules as JSON.
 
 ## How the trading system works
-- Real-time L2 order book snapshots arrive every ~0.5s
+- Signals are generated from 5-minute bar analysis, with L2 data used for entry timing
 - 10 weighted indicators produce a composite score each snapshot
 - YOUR rules are evaluated first — if a rule matches, it fires immediately (bypasses scoring)
 - A PositionMonitor checks exits every 5s (score decay, trailing stops, time gates)
-- Positions can be held up to 3x the holdSeconds you specify (e.g., holdSeconds=120 → max 360s)
+- Positions can be held up to 3x the holdSeconds you specify (e.g., holdSeconds=3600 → max 10800s)
 - Commission: $0 (both Webull and Questrade have zero-commission US equity trades).
 - The real cost per trade is the SPREAD — you must cross it on entry AND exit. Check the spread_pct column.
 
@@ -802,15 +824,25 @@ a1-a5: top 5 ask level sizes (shares) from order book at signal time
   - All zeros means no L2 snapshot was available at signal time
 price_1m: actual midprice 1 minute after signal
 price_5m: actual midprice 5 minutes after signal
-pnl_1m: P&L in $ per 100 shares at 1 min (positive = profitable trade)
-pnl_5m: P&L in $ per 100 shares at 5 min
-win_1m: 1 if profit > spread cost (spread-adjusted), 0 otherwise — NOT just ""price went up""
+price_15m: actual midprice 15 minutes after signal
+price_30m: actual midprice 30 minutes after signal
+pnl_1m: P&L in $ per 100 shares at 1 min (early momentum check)
+pnl_5m: P&L in $ per 100 shares at 5 min (early momentum check)
+pnl_15m: P&L in $ per 100 shares at 15 min (PRIMARY short-term outcome)
+pnl_30m: P&L in $ per 100 shares at 30 min (PRIMARY swing outcome — this is your main target)
+win_1m: 1 if profit > spread cost (spread-adjusted), 0 otherwise
 win_5m: 1 if profit > spread cost at 5 min, 0 otherwise
+win_15m: 1 if profit > spread cost at 15 min, 0 otherwise
+win_30m: 1 if profit > spread cost at 30 min — THIS IS THE PRIMARY WIN METRIC for swing trades
 
 ## IMPORTANT: Reading the P&L columns
-- pnl_1m/pnl_5m tell you the MAGNITUDE of wins and losses. Use these to set expectedPnlPer100Shares and stopLoss.
-- win_1m/win_5m are SPREAD-ADJUSTED: a tiny price move that doesn't cover the spread counts as a LOSS. Win rates here are realistic.
-- Compare pnl_1m vs pnl_5m to decide holdSeconds: if pnl_5m > pnl_1m for winning patterns, use longer holds.
+- pnl_15m and pnl_30m are the PRIMARY outcomes for swing trade evaluation. Use these to set expectedPnlPer100Shares and stopLoss.
+- pnl_1m/pnl_5m are useful for early momentum confirmation but NOT the target hold period.
+- win_30m is the PRIMARY win rate metric — this tells you if the pattern is profitable at swing timeframes.
+- Compare pnl_15m vs pnl_30m to decide holdSeconds: if pnl_30m > pnl_15m for winning patterns, use longer holds (closer to 7200s).
+
+## IMPORTANT: Primary vs optional conditions
+- L2 conditions (OBI, WOBI, etc.) should only be used as OPTIONAL refinements, not primary conditions. Primary conditions should be trend (trendDirection), VWAP position (aboveVwap), RSI (rsiRange), and volume (minVolumeRatio).
 
 ## Your task — WALK-FORWARD VALIDATION REQUIRED
 The data is sorted most-recent-first. You MUST use walk-forward validation:
@@ -825,10 +857,11 @@ Steps:
 4. Look for interactions (e.g., OBI matters more when spread is tight, momentum matters more with high volume)
 5. VALIDATE each candidate rule on the newer 25% — reject rules that don't generalize
 6. Output 3-8 high-confidence rules that pass validation
-7. Each rule MUST have confidence >= 0.55, sample >= 30, positive average pnl_5m IN BOTH train and validation sets
-8. Set holdSeconds (30-600) based on whether pnl_1m or pnl_5m is more favorable for that pattern
-9. Set stopLoss based on the typical adverse pnl for losing trades in that pattern
+7. Each rule MUST have confidence >= 0.55, sample >= 30, positive average pnl_30m IN BOTH train and validation sets
+8. Set holdSeconds (1800-7200) based on whether pnl_15m or pnl_30m is more favorable for that pattern
+9. Set stopLoss as ATR multiplier (1.0-3.0) based on typical adverse pnl for losers in that pattern
 10. Set maxPositionDollars based on price and spread_pct (lower for wide-spread stocks)
+11. Set maxDailyTrades to 3-5 per symbol — swing trades need fewer, higher-quality entries
 
 CRITICAL: Rules that only work on historical data but fail on recent data are WORSE than no rules — they waste commission. Be conservative. A 55% spread-adjusted win rate that holds out-of-sample beats a 70% win rate that only works in-sample.";
 
@@ -857,17 +890,17 @@ CRITICAL: Rules that only work on historical data but fail on recent data are WO
       ""confidence"": 0.60,
       ""expectedPnlPer100Shares"": 8.50,
       ""sampleSize"": 45,
-      ""holdSeconds"": 120,
-      ""stopLoss"": 0.25
+      ""holdSeconds"": 3600,
+      ""stopLoss"": 2.0
     }}
   ],
   ""disabledHours"": [12, 13],
-  ""maxDailyTrades"": 15,
+  ""maxDailyTrades"": 5,
   ""maxPositionShares"": 500,
   ""maxPositionDollars"": 25000
 }}
 
-IMPORTANT: The example above is just a template showing the schema. Replace ALL values with your actual analysis results. Use null for conditions you don't want to constrain. direction must be exactly ""BUY"" or ""SELL"". holdSeconds range: 30-600. stopLoss range: 0.05-2.00.";
+IMPORTANT: The example above is just a template showing the schema. Replace ALL values with your actual analysis results. Use null for conditions you don't want to constrain. direction must be exactly ""BUY"" or ""SELL"". holdSeconds range: 1800-7200. stopLoss range: 0.5-5.0 (ATR multiplier).";
 
         try
         {
@@ -905,7 +938,7 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                 chunkPrompt.AppendLine();
                 chunkPrompt.AppendLine($"## Instructions");
                 chunkPrompt.AppendLine($"Analyze this batch of {ticker} trades. The data is sorted newest-first.");
-                chunkPrompt.AppendLine($"Use pnl_1m and pnl_5m columns to understand move magnitudes, not just win/loss.");
+                chunkPrompt.AppendLine($"Use pnl_15m and pnl_30m columns as primary outcomes. pnl_1m/pnl_5m are early momentum checks only.");
                 chunkPrompt.AppendLine($"Discover patterns in TRAINING rows (older 75%), verify they hold in VALIDATION rows (newest 25%).");
                 chunkPrompt.AppendLine($"Output ONLY the JSON object in this format:");
                 chunkPrompt.AppendLine(jsonTemplate);
@@ -924,7 +957,7 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                     ],
                     InferenceConfig = new InferenceConfiguration
                     {
-                        MaxTokens = 4096,
+                        MaxTokens = 8192,
                         Temperature = 0.3f,
                     },
                 };
@@ -1015,10 +1048,39 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
             if (braceStart >= 0 && braceEnd > braceStart)
                 json = json[braceStart..(braceEnd + 1)];
 
-            var strategy = JsonSerializer.Deserialize<SymbolStrategy>(json, new JsonSerializerOptions
+            SymbolStrategy? strategy;
+            try
             {
-                PropertyNameCaseInsensitive = true,
-            });
+                strategy = JsonSerializer.Deserialize<SymbolStrategy>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true,
+                });
+            }
+            catch (JsonException truncEx) when (json.Contains("\"rules\""))
+            {
+                // Bedrock response was likely truncated (hit max_tokens).
+                // Salvage valid rules by closing the truncated JSON.
+                _logger.LogWarning("JSON truncated for {Ticker}, attempting salvage: {Msg}",
+                    ticker, truncEx.Message);
+
+                // Find the last complete rule object (last '},' or '}]')
+                int lastComplete = json.LastIndexOf("},");
+                if (lastComplete < 0) lastComplete = json.LastIndexOf("}]");
+                if (lastComplete > 0)
+                {
+                    var salvaged = json[..(lastComplete + 1)] + "]}";
+                    strategy = JsonSerializer.Deserialize<SymbolStrategy>(salvaged, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true,
+                    });
+                    _logger.LogInformation("Salvaged {Count} rules from truncated response for {Ticker}",
+                        strategy?.Rules.Count ?? 0, ticker);
+                }
+                else
+                {
+                    throw; // Can't salvage, re-throw original
+                }
+            }
 
             if (strategy == null || strategy.Rules.Count == 0)
             {
@@ -1320,9 +1382,39 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                     ORDER BY ABS(EXTRACT(EPOCH FROM bs.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '300 seconds')))
                     LIMIT 1
                 )),
+                ""PriceAfter15Min"" = COALESCE(ts.""PriceAfter15Min"", (
+                    SELECT bs.""MidPrice"" FROM ""SymbolBookSnapshots"" bs
+                    WHERE bs.""SymbolId"" = ts.""SymbolId""
+                      AND bs.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '895 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '905 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM bs.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '900 seconds')))
+                    LIMIT 1
+                ), (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = ts.""SymbolId""
+                      AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '870 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '930 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '900 seconds')))
+                    LIMIT 1
+                )),
+                ""PriceAfter30Min"" = COALESCE(ts.""PriceAfter30Min"", (
+                    SELECT bs.""MidPrice"" FROM ""SymbolBookSnapshots"" bs
+                    WHERE bs.""SymbolId"" = ts.""SymbolId""
+                      AND bs.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '1795 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '1805 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM bs.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '1800 seconds')))
+                    LIMIT 1
+                ), (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = ts.""SymbolId""
+                      AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '1770 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '1830 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '1800 seconds')))
+                    LIMIT 1
+                )),
                 ""VerifiedAt"" = NOW()
             WHERE ts.""VerifiedAt"" IS NULL
-              AND ts.""Timestamp"" < NOW() - INTERVAL '6 minutes'
+              AND ts.""Timestamp"" < NOW() - INTERVAL '31 minutes'
               AND ts.""Timestamp"" > {0}", lookbackCutoff);
 
         if (updated > 0)
@@ -1336,6 +1428,14 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                     ""WasCorrect5Min"" = CASE
                     WHEN ""PriceAfter5Min"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter5Min"" > ""Price""
                     WHEN ""PriceAfter5Min"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter5Min"" < ""Price""
+                    ELSE NULL END,
+                    ""WasCorrect15Min"" = CASE
+                    WHEN ""PriceAfter15Min"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter15Min"" > ""Price""
+                    WHEN ""PriceAfter15Min"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter15Min"" < ""Price""
+                    ELSE NULL END,
+                    ""WasCorrect30Min"" = CASE
+                    WHEN ""PriceAfter30Min"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter30Min"" > ""Price""
+                    WHEN ""PriceAfter30Min"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter30Min"" < ""Price""
                     ELSE NULL END
                 WHERE ""VerifiedAt"" IS NOT NULL
                   AND ""WasCorrect1Min"" IS NULL
