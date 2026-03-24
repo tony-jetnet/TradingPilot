@@ -18,11 +18,13 @@ public class PaperTradingExecutor
     private readonly decimal _maxPositionDollars;
     private readonly int _maxConcurrentPositions;
     private readonly decimal _dailyLossLimit;
+    private readonly decimal _dailyPnlStopLoss;    // daily realized P&L floor (e.g. -500)
+    private readonly decimal _dailyPnlStopProfit;   // daily realized P&L ceiling (e.g. 500)
     private readonly int _rateLimitSeconds;
-    private readonly int _orderTimeoutMinutes;
+    private readonly int _orderTimeoutSeconds;
 
     // Momentum as % of mid price — adaptive to any price level
-    private const decimal MomentumThresholdPct = 0.0001m; // 0.01% of mid price
+    private const decimal MomentumThresholdPct = 0.0005m; // 0.05% of mid price
 
     private readonly IBrokerClient _broker;
     private readonly SignalStore _signalStore;
@@ -68,8 +70,10 @@ public class PaperTradingExecutor
         _maxPositionDollars = configuration.GetValue<decimal>($"{section}:MaxPositionDollars", 25000m);
         _maxConcurrentPositions = configuration.GetValue<int>($"{section}:MaxConcurrentPositions", 3);
         _dailyLossLimit = configuration.GetValue<decimal>($"{section}:DailyLossLimit", -2000m);
-        _rateLimitSeconds = configuration.GetValue<int>($"{section}:RateLimitSeconds", 600); // 10min cooldown for swing
-        _orderTimeoutMinutes = configuration.GetValue<int>($"{section}:OrderTimeoutMinutes", 10); // longer fill window for passive limits
+        _dailyPnlStopLoss = configuration.GetValue<decimal>($"{section}:DailyPnlStopLoss", -500m);
+        _dailyPnlStopProfit = configuration.GetValue<decimal>($"{section}:DailyPnlStopProfit", 500m);
+        _rateLimitSeconds = configuration.GetValue<int>($"{section}:RateLimitSeconds", 300); // 5min cooldown
+        _orderTimeoutSeconds = configuration.GetValue<int>($"{section}:OrderTimeoutSeconds", 90); // aggressive timeout for passive limits
 
         _logger.LogInformation("Trading executor using broker={Broker} section={Section}: maxPosition=${MaxPos} maxPositions={MaxCount} dailyLimit=${DailyLimit}",
             brokerType, section, _maxPositionDollars, _maxConcurrentPositions, _dailyLossLimit);
@@ -144,6 +148,18 @@ public class PaperTradingExecutor
         {
             _logger.LogDebug("Skipping entry for {Ticker}: daily loss limit hit ({DayPnl:F2})",
                 signal.Ticker, cachedAccount.DayPnl);
+            return;
+        }
+
+        // Daily P&L hard stops: stop if lost $500 or won $500
+        if (cachedAccount.DayPnl <= _dailyPnlStopLoss)
+        {
+            _logger.LogInformation("{Symbol}: daily P&L stop-loss hit ({Pnl:F2} <= {Limit:F2}), no new trades", signal.Ticker, cachedAccount.DayPnl, _dailyPnlStopLoss);
+            return;
+        }
+        if (cachedAccount.DayPnl >= _dailyPnlStopProfit)
+        {
+            _logger.LogInformation("{Symbol}: daily P&L profit target hit ({Pnl:F2} >= {Limit:F2}), no new trades", signal.Ticker, cachedAccount.DayPnl, _dailyPnlStopProfit);
             return;
         }
 
@@ -312,6 +328,10 @@ public class PaperTradingExecutor
                     signal.Ticker, barIndicators.Atr14, barIndicators.Atr14Pct, atrScaleFactor, maxDollars);
             }
 
+            // Scale position size by signal strength: weak signals get smaller positions
+            decimal strengthFactor = Math.Clamp(Math.Abs(score) / 0.40m, 0.50m, 1.0m);
+            maxDollars *= strengthFactor;
+
             int qty = Math.Max(1, (int)(maxDollars / signal.Price));
 
             // Use passive limit at favorable side of L2 book (bid for buys, ask for sells).
@@ -322,7 +342,9 @@ public class PaperTradingExecutor
             decimal limitPrice;
             if (latestSnapshot.BidPrices.Length > 0 && latestSnapshot.AskPrices.Length > 0)
             {
-                decimal spreadOffset = latestSnapshot.Spread * 0.10m; // 10% into the spread
+                // Tiered pricing: strong signals cross more of the spread for better fills
+                bool isStrongSignal = Math.Abs(score) >= 0.40m;
+                decimal spreadOffset = isStrongSignal ? latestSnapshot.Spread * 0.50m : latestSnapshot.Spread * 0.10m;
                 limitPrice = action == "BUY"
                     ? latestSnapshot.BidPrices[0] + spreadOffset   // just above best bid
                     : latestSnapshot.AskPrices[0] - spreadOffset;  // just below best ask
@@ -546,11 +568,11 @@ public class PaperTradingExecutor
                     _pendingEntries.TryRemove(symbol, out _);
                     _logger.LogWarning("ENTRY ORDER {Status}: {Symbol} OrderId={OrderId}", order.Status, symbol, pending.OrderId);
                 }
-                else if ((DateTime.UtcNow - pending.PlacedAt).TotalMinutes > _orderTimeoutMinutes)
+                else if ((DateTime.UtcNow - pending.PlacedAt).TotalSeconds > _orderTimeoutSeconds)
                 {
                     await _broker.CancelOrderAsync(pending.OrderId);
                     _pendingEntries.TryRemove(symbol, out _);
-                    _logger.LogWarning("ENTRY ORDER TIMEOUT: {Symbol} OrderId={OrderId} (>{Timeout}min)", symbol, pending.OrderId, _orderTimeoutMinutes);
+                    _logger.LogWarning("ENTRY ORDER TIMEOUT: {Symbol} OrderId={OrderId} (>{Timeout}s)", symbol, pending.OrderId, _orderTimeoutSeconds);
                 }
             }
             catch (Exception ex)
@@ -631,13 +653,61 @@ public class PaperTradingExecutor
                     _logger.LogWarning("EXIT ORDER {Status}: {Symbol} OrderId={OrderId} — monitor will re-trigger",
                         order.Status, symbol, pending.OrderId);
                 }
-                else if ((DateTime.UtcNow - pending.PlacedAt).TotalMinutes > _orderTimeoutMinutes)
+                else if ((DateTime.UtcNow - pending.PlacedAt).TotalSeconds > 30)
                 {
+                    // Exit order escalation: cancel passive order and resubmit aggressively
                     await _broker.CancelOrderAsync(pending.OrderId);
-                    _pendingExits.TryRemove(symbol, out _);
-                    if (_positions.TryGetValue(symbol, out var pos))
-                        pos.PendingExitOrderId = null;
-                    _logger.LogWarning("EXIT ORDER TIMEOUT: {Symbol} OrderId={OrderId} (>{Timeout}min)", symbol, pending.OrderId, _orderTimeoutMinutes);
+
+                    var exitEscalationSnapshot = _l2Cache.GetLatest(pending.TickerId);
+                    bool isLongExit = pending.Action == "SELL"; // selling = exiting a long
+                    decimal currentMid = exitEscalationSnapshot?.MidPrice ?? pending.LimitPrice;
+                    decimal urgencyBuffer = currentMid * 0.0005m; // cross spread by 0.05%
+
+                    decimal aggressivePrice;
+                    if (exitEscalationSnapshot != null && exitEscalationSnapshot.BidPrices.Length > 0 && exitEscalationSnapshot.AskPrices.Length > 0)
+                    {
+                        aggressivePrice = isLongExit
+                            ? exitEscalationSnapshot.BidPrices[0] - urgencyBuffer   // sell below bid
+                            : exitEscalationSnapshot.AskPrices[0] + urgencyBuffer;  // buy above ask
+                    }
+                    else
+                    {
+                        aggressivePrice = isLongExit
+                            ? currentMid * 0.999m
+                            : currentMid * 1.001m;
+                    }
+                    aggressivePrice = Math.Round(aggressivePrice, 2);
+
+                    var escalationResult = await _broker.PlaceOrderAsync(new BrokerOrderRequest
+                    {
+                        Symbol = symbol,
+                        Action = pending.Action,
+                        Type = OrderType.Limit,
+                        LimitPrice = aggressivePrice,
+                        Quantity = pending.Quantity,
+                        ExtendedHours = true,
+                        TimeInForce = "DAY",
+                    });
+
+                    if (escalationResult.Success && escalationResult.OrderId != null)
+                    {
+                        pending.OrderId = escalationResult.OrderId;
+                        pending.LimitPrice = aggressivePrice;
+                        pending.PlacedAt = DateTime.UtcNow; // reset timer
+                        if (_positions.TryGetValue(symbol, out var pos))
+                            pos.PendingExitOrderId = escalationResult.OrderId;
+
+                        _logger.LogWarning("EXIT ORDER ESCALATED: {Action} {Qty} {Symbol} @ {Price} (aggressive) | OrderId={OrderId}",
+                            pending.Action, pending.Quantity, symbol, aggressivePrice, escalationResult.OrderId);
+                    }
+                    else
+                    {
+                        // Escalation failed — remove pending so monitor can retry
+                        _pendingExits.TryRemove(symbol, out _);
+                        if (_positions.TryGetValue(symbol, out var pos))
+                            pos.PendingExitOrderId = null;
+                        _logger.LogError("EXIT ORDER ESCALATION FAILED: {Symbol} | {Error}", symbol, escalationResult.Error);
+                    }
                 }
             }
             catch (Exception ex)

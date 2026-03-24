@@ -162,37 +162,53 @@ public class TickDataCache
         // 5. AskSweepCost: shares needed to move price up $0.10
         data.AskSweepCost = ComputeSweepCost(snapshot.AskPrices, snapshot.AskSizes, snapshot.MidPrice, 0.10m);
 
-        // 6. ImbalanceVelocity: (current OBI - OBI 30s ago) / 30
+        // 6. ImbalanceVelocity: (current OBI - OBI ~30s ago) normalized to 30s rate
+        //    Uses closest-sample interpolation instead of rigid 25-35s window
         decimal currentObi = snapshot.Imbalance;
-        data.RecentObis.Enqueue((currentObi, DateTime.UtcNow));
-        while (data.RecentObis.Count > 60) // keep ~60 samples (one per ~0.5s)
+        var now = DateTime.UtcNow;
+        data.RecentObis.Enqueue((currentObi, now));
+        while (data.RecentObis.Count > 120) // keep ~120 samples for 60s of history at ~2/sec
             data.RecentObis.Dequeue();
 
-        decimal obi30sAgo = currentObi; // default to current if no history
+        // Find the OBI sample closest to 30 seconds ago (must be at least 10s old)
+        (decimal Obi, double Age) closest = default;
+        double bestDelta = double.MaxValue;
+
         foreach (var (obi, ts) in data.RecentObis)
         {
-            if ((DateTime.UtcNow - ts).TotalSeconds >= 25 && (DateTime.UtcNow - ts).TotalSeconds <= 35)
+            double age = (now - ts).TotalSeconds;
+            double delta = Math.Abs(age - 30.0);
+            if (delta < bestDelta && age >= 10) // at least 10s old to avoid noise
             {
-                obi30sAgo = obi;
-                break;
+                bestDelta = delta;
+                closest = (obi, age);
             }
         }
-        data.ImbalanceVelocity = (currentObi - obi30sAgo) / 30m;
 
-        // 7. SpreadPercentile: rank of current spread in last 5 min (300s)
-        data.RecentSpreads.Enqueue(snapshot.Spread);
-        while (data.RecentSpreads.Count > 60) // ~60 samples at ~5s interval
+        if (closest.Age > 0)
+            data.ImbalanceVelocity = (currentObi - closest.Obi) / (decimal)closest.Age * 30m; // normalize to 30s rate
+        else
+            data.ImbalanceVelocity = 0;
+
+        // 7. SpreadPercentile: rank of current spread in last 5 min (time-based window)
+        data.RecentSpreads.Enqueue((snapshot.Spread, now));
+        while (data.RecentSpreads.Count > 600) // max 600 samples (~5 min at 2 updates/sec)
             data.RecentSpreads.Dequeue();
 
-        if (data.RecentSpreads.Count > 1)
+        var spreadCutoff = now.AddMinutes(-5);
+        var recentSpreads = data.RecentSpreads
+            .Where(s => s.Time >= spreadCutoff)
+            .Select(s => s.Spread)
+            .ToList();
+
+        if (recentSpreads.Count >= 10)
         {
-            var spreads = data.RecentSpreads.ToArray();
-            int countBelow = spreads.Count(s => s < snapshot.Spread);
-            data.SpreadPercentile = (decimal)countBelow / spreads.Length;
+            int countBelow = recentSpreads.Count(s => s < snapshot.Spread);
+            data.SpreadPercentile = (decimal)countBelow / recentSpreads.Count;
         }
         else
         {
-            data.SpreadPercentile = 0.5m;
+            data.SpreadPercentile = 0.50m; // not enough data, assume median
         }
     }
 
@@ -264,7 +280,7 @@ public class TickerLiveData
 
     // Rolling buffers for L2 feature computation
     public Queue<(decimal Obi, DateTime Timestamp)> RecentObis { get; } = new();
-    public Queue<decimal> RecentSpreads { get; } = new();
+    public Queue<(decimal Spread, DateTime Time)> RecentSpreads { get; } = new();
 
     public const int MaxTicks = 500;
 }

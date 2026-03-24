@@ -42,13 +42,14 @@ public class BarIndicatorService
 
             using var uow = uowManager.Begin();
 
-            // Get last 30 1-min bars (Timeframe == Minute1 == 2) for this symbol
+            // Get last 60 1-min bars (Timeframe == Minute1 == 2) for this symbol
+            // 60 bars gives EMA/RSI more history for stability, and allows VWAP to filter to today's session
             var queryable = await barRepo.GetQueryableAsync();
             var bars = await asyncExecuter.ToListAsync(
                 queryable
                     .Where(b => b.SymbolId == symbolId && b.Timeframe == BarTimeframe.Minute1)
                     .OrderByDescending(b => b.Timestamp)
-                    .Take(30));
+                    .Take(60));
 
             await uow.CompleteAsync();
 
@@ -67,15 +68,28 @@ public class BarIndicatorService
             var highs = bars.Select(b => b.High).ToArray();
             var lows = bars.Select(b => b.Low).ToArray();
 
-            // Compute typical price for VWAP: (H+L+C)/3
-            var typicalPrices = new decimal[bars.Count];
-            for (int i = 0; i < bars.Count; i++)
-                typicalPrices[i] = (highs[i] + lows[i] + closes[i]) / 3m;
+            // Filter bars to today's trading session for VWAP only
+            // EMA/RSI benefit from more history, but VWAP should reset daily
+            var eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+            var todayET = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eastern).Date;
+            var todayBars = bars.Where(b => TimeZoneInfo.ConvertTimeFromUtc(b.Timestamp, eastern).Date == todayET).ToList();
+
+            // Use today's bars for VWAP if we have enough; fall back to all bars if too few
+            var vwapBars = todayBars.Count >= 3 ? todayBars : bars;
+
+            // Compute typical price for VWAP: (H+L+C)/3 — using today's session bars
+            var vwapTypicalPrices = new decimal[vwapBars.Count];
+            var vwapVolumes = new long[vwapBars.Count];
+            for (int i = 0; i < vwapBars.Count; i++)
+            {
+                vwapTypicalPrices[i] = (vwapBars[i].High + vwapBars[i].Low + vwapBars[i].Close) / 3m;
+                vwapVolumes[i] = vwapBars[i].Volume;
+            }
 
             decimal ema9 = ComputeEma(closes, 9);
             decimal ema20 = ComputeEma(closes, 20);
             decimal rsi14 = ComputeRsi(closes, 14);
-            decimal vwap = ComputeVwap(typicalPrices, volumes);
+            decimal vwap = ComputeVwap(vwapTypicalPrices, vwapVolumes);
             decimal atr14 = ComputeAtr(highs, lows, closes, 14);
 
             // Volume stats
@@ -110,6 +124,7 @@ public class BarIndicatorService
                 OversoldRsi = rsi14 < 30,
                 HighVolume = volumeRatio > 1.5m,
                 ComputedAt = DateTime.UtcNow,
+                LastRefreshTime = DateTime.UtcNow,
             };
 
             _cache.Update(tickerId, indicators);

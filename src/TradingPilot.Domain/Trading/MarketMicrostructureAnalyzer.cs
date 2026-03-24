@@ -300,6 +300,10 @@ public class MarketMicrostructureAnalyzer
         if (state.ImbalanceCount < ShortWindow)
             return null;
 
+        // Staleness check: skip if L2 data is older than 30 seconds (MQTT disconnected?)
+        if ((DateTime.UtcNow - snapshot.Timestamp).TotalSeconds > 30)
+            return null;
+
         // Periodically check if strategy rules file has been updated
         EnsureStrategyConfigFresh();
 
@@ -359,23 +363,45 @@ public class MarketMicrostructureAnalyzer
 
             if (barIndicatorsForRules != null)
             {
+                decimal preFilterConfidence = effectiveScore;
+                bool trendFilterApplied = false;
+
                 if (barIndicatorsForRules.TrendDirection == -1 && effectiveScore > 0)
-                    effectiveScore *= 0.5m;
+                { effectiveScore *= 0.5m; trendFilterApplied = true; }
                 else if (barIndicatorsForRules.TrendDirection == 1 && effectiveScore < 0)
-                    effectiveScore *= 0.5m;
+                { effectiveScore *= 0.5m; trendFilterApplied = true; }
 
                 if (!barIndicatorsForRules.AboveVwap && effectiveScore > 0)
                     effectiveScore *= 0.7m;
                 else if (barIndicatorsForRules.AboveVwap && effectiveScore < 0)
                     effectiveScore *= 0.7m;
 
-                if (barIndicatorsForRules.HighVolume)
+                if (barIndicatorsForRules.HighVolume && !trendFilterApplied)
                     effectiveScore *= 1.3m;
 
-                if (barIndicatorsForRules.OverboughtRsi && effectiveScore > 0)
-                    effectiveScore *= 0.5m;
-                else if (barIndicatorsForRules.OversoldRsi && effectiveScore < 0)
-                    effectiveScore *= 0.5m;
+                // Graduated RSI filter
+                if (effectiveScore > 0)
+                {
+                    if (barIndicatorsForRules.Rsi14 > 85) effectiveScore *= 0.30m;
+                    else if (barIndicatorsForRules.Rsi14 > 80) effectiveScore *= 0.50m;
+                    else if (barIndicatorsForRules.Rsi14 > 75) effectiveScore *= 0.70m;
+                }
+                else if (effectiveScore < 0)
+                {
+                    if (barIndicatorsForRules.Rsi14 < 15) effectiveScore *= 0.30m;
+                    else if (barIndicatorsForRules.Rsi14 < 20) effectiveScore *= 0.50m;
+                    else if (barIndicatorsForRules.Rsi14 < 25) effectiveScore *= 0.70m;
+                }
+
+                // Floor protection: no filter chain can reduce score below 30% of pre-filter value
+                if (preFilterConfidence != 0)
+                {
+                    decimal minAllowed = Math.Abs(preFilterConfidence) * 0.30m;
+                    if (preFilterConfidence > 0 && effectiveScore < minAllowed)
+                        effectiveScore = minAllowed;
+                    else if (preFilterConfidence < 0 && effectiveScore > -minAllowed)
+                        effectiveScore = -minAllowed;
+                }
             }
 
             // Reject if filtered score is too weak (below moderate threshold)
@@ -449,6 +475,15 @@ public class MarketMicrostructureAnalyzer
 
         decimal compositeScore;
         var barIndicators = _barCache.GetIndicators(tickerId);
+
+        // Staleness check: skip if bar indicators are older than 2 minutes
+        if (barIndicators != null && (DateTime.UtcNow - barIndicators.LastRefreshTime).TotalSeconds > 120)
+        {
+            _logger.LogWarning("{Ticker}: bar indicators stale ({Age:F0}s), skipping Stage 2 signal generation",
+                ticker, (DateTime.UtcNow - barIndicators.LastRefreshTime).TotalSeconds);
+            return null;
+        }
+
         bool usedSwin = false;
 
         // Always compute L2 microstructure indicators (needed for DB storage and training)
@@ -521,28 +556,38 @@ public class MarketMicrostructureAnalyzer
         if (barIndicators != null)
         {
             decimal preFilterScore = compositeScore;
+            bool trendFilterApplied = false;
 
             if (barIndicators.TrendDirection == -1 && compositeScore > 0)
-                compositeScore *= 0.5m;
+            { compositeScore *= 0.5m; trendFilterApplied = true; }
             else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
-                compositeScore *= 0.5m;
+            { compositeScore *= 0.5m; trendFilterApplied = true; }
 
             if (!barIndicators.AboveVwap && compositeScore > 0)
                 compositeScore *= 0.7m;
             else if (barIndicators.AboveVwap && compositeScore < 0)
                 compositeScore *= 0.7m;
 
-            if (barIndicators.HighVolume)
+            if (barIndicators.HighVolume && !trendFilterApplied)
                 compositeScore *= 1.3m;
 
-            if (barIndicators.OverboughtRsi && compositeScore > 0)
-                compositeScore *= 0.5m;
-            else if (barIndicators.OversoldRsi && compositeScore < 0)
-                compositeScore *= 0.5m;
+            // Graduated RSI filter
+            if (compositeScore > 0)
+            {
+                if (barIndicators.Rsi14 > 85) compositeScore *= 0.30m;
+                else if (barIndicators.Rsi14 > 80) compositeScore *= 0.50m;
+                else if (barIndicators.Rsi14 > 75) compositeScore *= 0.70m;
+            }
+            else if (compositeScore < 0)
+            {
+                if (barIndicators.Rsi14 < 15) compositeScore *= 0.30m;
+                else if (barIndicators.Rsi14 < 20) compositeScore *= 0.50m;
+                else if (barIndicators.Rsi14 < 25) compositeScore *= 0.70m;
+            }
 
             if (preFilterScore != 0)
             {
-                decimal minAllowed = preFilterScore * 0.50m;
+                decimal minAllowed = preFilterScore * 0.30m;
                 if (preFilterScore > 0 && compositeScore < minAllowed)
                     compositeScore = minAllowed;
                 else if (preFilterScore < 0 && compositeScore > minAllowed)
@@ -778,28 +823,38 @@ public class MarketMicrostructureAnalyzer
         if (barIndicators != null)
         {
             decimal preFilterScore = compositeScore;
+            bool trendFilterApplied = false;
 
             if (barIndicators.TrendDirection == -1 && compositeScore > 0)
-                compositeScore *= 0.5m;
+            { compositeScore *= 0.5m; trendFilterApplied = true; }
             else if (barIndicators.TrendDirection == 1 && compositeScore < 0)
-                compositeScore *= 0.5m;
+            { compositeScore *= 0.5m; trendFilterApplied = true; }
 
             if (!barIndicators.AboveVwap && compositeScore > 0)
                 compositeScore *= 0.7m;
             else if (barIndicators.AboveVwap && compositeScore < 0)
                 compositeScore *= 0.7m;
 
-            if (barIndicators.HighVolume)
+            if (barIndicators.HighVolume && !trendFilterApplied)
                 compositeScore *= 1.3m;
 
-            if (barIndicators.OverboughtRsi && compositeScore > 0)
-                compositeScore *= 0.5m;
-            else if (barIndicators.OversoldRsi && compositeScore < 0)
-                compositeScore *= 0.5m;
+            // Graduated RSI filter
+            if (compositeScore > 0)
+            {
+                if (barIndicators.Rsi14 > 85) compositeScore *= 0.30m;
+                else if (barIndicators.Rsi14 > 80) compositeScore *= 0.50m;
+                else if (barIndicators.Rsi14 > 75) compositeScore *= 0.70m;
+            }
+            else if (compositeScore < 0)
+            {
+                if (barIndicators.Rsi14 < 15) compositeScore *= 0.30m;
+                else if (barIndicators.Rsi14 < 20) compositeScore *= 0.50m;
+                else if (barIndicators.Rsi14 < 25) compositeScore *= 0.70m;
+            }
 
             if (preFilterScore != 0)
             {
-                decimal minAllowed = preFilterScore * 0.50m;
+                decimal minAllowed = preFilterScore * 0.30m;
                 if (preFilterScore > 0 && compositeScore < minAllowed)
                     compositeScore = minAllowed;
                 else if (preFilterScore < 0 && compositeScore > minAllowed)

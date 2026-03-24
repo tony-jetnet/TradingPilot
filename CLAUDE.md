@@ -45,12 +45,13 @@ Both config files live at `D:\Third-Parties\WebullHook\` and are watched via `Fi
 ### Contextual Filters (applied to BOTH Stage 1 and Stage 2)
 
 Applied in sequence after the base score is computed:
-1. **Trend filter**: Signal against dominant EMA trend → score × 0.5
+1. **Trend filter**: Signal against dominant EMA trend → score × 0.5 (sets `trendFilterApplied = true`)
 2. **VWAP filter**: Signal against VWAP position → score × 0.7
-3. **Volume boost**: High volume → score × 1.3
-4. **RSI filter**: Signal into overbought/oversold → score × 0.5
-5. **Floor protection**: No single filter chain can reduce score below 50% of pre-filter value
+3. **Volume boost**: High volume AND trend not against signal → score × 1.3 (directional — only boosts when `!trendFilterApplied`)
+4. **RSI filter**: Graduated — RSI 75-80 → ×0.70, RSI 80-85 → ×0.50, RSI 85+ → ×0.30 (symmetric for oversold)
+5. **Floor protection**: No single filter chain can reduce score below **30%** of pre-filter value (**applies to BOTH stages** — Stage 1 rules now have floor protection too)
 6. **Hourly multiplier**: Per-hour learned multiplier from model config
+7. **Staleness guards**: Skip signal if L2 data >30s old or bar indicators >2min old
 
 ### Weighted Scoring Indicators (6 indicators, sum to 1.0)
 
@@ -86,38 +87,55 @@ Webull MQTT (via injected hook DLL)
 ### Nightly Job Sequence (after market close, weekdays)
 
 ```
-9:00 PM ET  NightlyModelTrainer.TrainAsync(20)     — hill-climbing weight optimization
-9:15 PM ET  NightlyStrategyOptimizer.OptimizeAsync  — backfill gaps + Bedrock AI per symbol
-9:30 PM ET  NightlyStrategyOptimizer.CleanupOldData — retention: L2 snapshots 20d, ticks 30d
+9:00 PM ET  NightlyStrategyOptimizer.OptimizeAsync    — verify signal outcomes + backfill gaps + Bedrock AI rules
+9:30 PM ET  NightlyLocalTrainer.TrainAsync            — hill-climbing weight optimization (needs verified outcomes from above)
+10:00 PM ET NightlyStrategyOptimizer.CleanupOldDataAsync — retention: L2 snapshots 20d, ticks 30d
 ```
 
-The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars before running AI analysis, so gaps from daytime app downtime don't affect training quality.
+**Order matters**: Optimizer runs first because `VerifySignalOutcomesAsync()` fills PriceAfter5Min/15Min/30Min columns that the trainer needs.
+
+The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars before running AI analysis. **Backfilled signals are excluded from both trainer and Bedrock CSV** (different score distribution from live L2 signals).
+
+### Bedrock AI Rule Generation (NightlyStrategyOptimizer)
+
+- **HoldSeconds**: Prompt instructs 60-600s (1-10 min, matching L2 signal decay). Validator enforces same range.
+- **Per-row outcome columns removed** from Bedrock CSV to prevent look-ahead bias. Aggregate performance summary provided instead.
+- **MaxDailyTrades**: Capped at 5 per symbol in rule output.
+- **Local backtesting**: After Bedrock generates rules, each rule is backtested on the newest 25% of data. Only rules with ≥5 matches AND positive P&L survive.
+- **Backfilled signals excluded** from the CSV sent to Bedrock.
 
 ### Nightly Trainer Details (NightlyLocalTrainer)
 
 - **Walk-forward**: 75% train (oldest) / 25% validation (newest), time-ordered
-- **Hill-climbing**: 100 iterations, perturbs one of the **6 L2/tick weights** (indices 0-5) by ±0.05, keeps if P&L improves
-- **Overfit guard**: If optimized weights lose money on validation AND defaults do better, falls back to defaults
-- **Training data**: All 10 indicators are loaded from TradingSignalRecord (OBI, WOBI, PressureRoc, SpreadSignal, LargeOrderSignal, TickMomentum, Ema9, Ema20, Rsi14, Vwap, VolumeRatio) — derived scores computed from raw values matching live formulas
+- **Multi-start hill-climbing**: 3 restarts × 300 iterations each (900 total), timestamp-based random seeds (different each night). Perturbs one of the **6 L2/tick weights** (indices 0-5) by ±0.05, keeps if P&L improves. Best result across all restarts is kept.
+- **Multi-horizon outcome**: Training labels use weighted blend: `0.20×PriceAfter5Min + 0.40×PriceAfter15Min + 0.40×PriceAfter30Min` (approximates actual exit time distribution instead of fixed 30-min horizon)
+- **Overfit guard (strengthened)**: Falls back to defaults if: (a) optimized weights lose on validation AND defaults win, OR (b) defaults outperform by 2×+, OR (c) validation P&L < 15% of training P&L (train/val divergence)
+- **Threshold validation**: Optimized thresholds are validated on held-out set; reverts to defaults if they lose on validation
+- **Hour/direction gating**: Uses expected value (EV = avgWin×winRate - avgLoss×lossRate) instead of raw win rate. Minimum 10 samples per hour.
+- **Training data filters**: Only signals with |Score| ≥ 0.20 (tradeable signals). Excludes backfilled bar-derived signals (`Reason NOT LIKE '%BACKFILL%'`).
 - **Weights 6-9 (Trend, VWAP, Volume, RSI)**: Fixed at 0 — contextual filters handle these. Optimizer only perturbs weights 0-5.
 
 ### Position Management (PositionMonitor)
 
 **Entry gating** (PaperTradingExecutor.OnSignalAsync):
-- Auth, position limit, daily loss limit, rate limit (10min cooldown), daily trade count
+- Auth, position limit, daily P&L hard stops (stop if day P&L ≤ -$500 or ≥ +$500), rate limit (5min/300s cooldown)
 - Spread regime filter: reject if spread ≥ 90th percentile
-- Momentum check: find L2 snapshot closest to 30s ago (15-60s window), require price-relative momentum alignment
-- ATR-based position sizing: $25K base scaled by ATR (high vol → smaller position)
-- Passive limit orders: bid+10% spread offset for buys (saves spread, acts as signal quality filter)
+- Momentum check: find L2 snapshot closest to 30s ago (15-60s window), require price-relative momentum alignment ≥ 0.05% of mid price
+- ATR-based position sizing: $25K base scaled by ATR (high vol → smaller position), further scaled by signal strength (|score|/0.40, clamped 0.50-1.0)
+- Tiered limit orders: strong signals (score ≥ 0.40) use midprice; moderate signals use bid+10% spread offset
+- Entry order timeout: 90 seconds (stale L2 signals expire quickly)
+- Rule entry threshold: 0.35 (same as Stage 2, since raw confidence already passed 0.55 gate in StrategyRuleEvaluator)
 
 **Exit checks** (evaluated every 5s in priority order):
-1. **VWAP Cross** (15min grace): price crosses VWAP against position
-2. **EMA Trend Reversal** (10min grace): EMA9 crosses EMA20 against position
-3. **RSI Extreme** (5min grace): RSI > 75 (long) or < 25 (short)
-4. **Stop Loss**: Max(rule stop, 1.5×ATR, entry spread) — volatility-adaptive
-5. **Breakeven Stop**: Once peak profit > **1.5×** stop distance, exit if position turns negative
-6. **Trailing Stop**: Anti-wick filtered (10s persistence), confidence-scaled giveback (higher confidence → tighter trail)
+0. **Profit Target**: Exit when profit ≥ 3.0× stop distance (hard capture for tail winners)
+1. **VWAP Cross** (grace: holdTime×0.50, max 15min): **tightens trailing stop to 30% giveback** (NOT a hard exit)
+2. **EMA Trend Reversal** (grace: holdTime×0.33, max 10min): **tightens trailing stop to 30% giveback** (NOT a hard exit)
+3. **RSI Extreme** (grace: holdTime×0.17, max 5min): **graduated tightening** — RSI 75-80→40%, RSI 80+→25% (NOT a hard exit)
+4. **Stop Loss**: Max(rule stop, **2.0×ATR**, entry spread) — volatility-adaptive (widened from 1.5×)
+5. **Breakeven Stop**: Once peak profit > **2.0×** stop distance, exit if position falls below **-0.25× stop** (buffer prevents single-tick exits)
+6. **Trailing Stop**: Anti-wick filtered (10s persistence), **inverted** confidence-scaled giveback: `0.35 + confidence×0.25` (higher confidence → MORE room, 0.85 conf → 56%). Stage 2: 50% giveback. VWAP/EMA/RSI tightening overrides applied here.
 7. **Time Gate**: Adaptive — past hold time check score strength; hard cap at 2× hold time
+8. **Exit order escalation**: If exit order unfilled after 30s, cancel and resubmit with aggressive price (cross spread by 0.05%)
 
 ### Singleton Caches (in-memory, registered in BlazorModule)
 
@@ -178,6 +196,31 @@ Background jobs use `[DisableConcurrentExecution(seconds)]` to prevent overlappi
 - **Redis** — `localhost` database 10 (Hangfire storage + ABP cache)
 - **AWS Bedrock** — `us-west-2`, model `anthropic.claude-sonnet-4-6-20250514-v1:0` (nightly strategy optimization)
 - **Webull Desktop** — MQTT hook DLL injected via `ProcessInjector` for real-time data capture
+
+### Data Quality Guards
+
+- **ImbalanceVelocity**: Uses closest-sample interpolation (finds OBI sample nearest to 30s ago, normalizes by actual time delta). Avoids stuck-at-zero from rigid 25-35s window.
+- **SpreadPercentile**: Time-based 5-minute window (not count-based). Queue size 600. Returns 0.50 if <10 samples.
+- **Bar history**: 60 bars loaded (up from 30) for proper EMA20/RSI14 convergence.
+- **VWAP**: Filtered to today's ET trading session only (prevents cross-day contamination).
+- **BarIndicatorCache.LastRefreshTime**: Tracked per ticker. Analyzer skips signal generation if bar indicators are >2 minutes stale.
+
+## Stabilization Plan (2026-03-23)
+
+**AUTHORITATIVE REFERENCE**: See `docs/final/` for the complete stabilization plan that was implemented. All parameter decisions are final — do NOT re-derive or change without quantitative evidence. Key decisions locked:
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| ATR stop multiplier | 2.0× | 1.5× inside normal candle noise, 2.5× too wide |
+| VWAP/EMA/RSI exits | Trailing tighteners (NOT hard exits) | Hard exits killed winners during oscillation |
+| Floor protection | 30%, both stages | 50% too generous, 0% too brittle |
+| HoldSeconds range | 60-600 | L2 signals decay in minutes, not hours |
+| Training outcome | Multi-horizon weighted (0.20/0.40/0.40) | Actual exits happen at 5-15 min, not 30 min |
+| Trailing giveback (rules) | 0.35 + conf×0.25 (inverted) | High confidence gets MORE room |
+| Entry timeout | 90 seconds | L2 signal stale after 30s |
+| Rate limit | 300 seconds | Balance between whipsaw prevention and re-entry |
+| Daily P&L stops | -$500 loss / +$500 profit → stop for day | Outcome-based, not count-based |
+| Backfills in training | Excluded | Bar-derived scores corrupt L2 weight optimization |
 
 ## Reference
 

@@ -147,7 +147,7 @@ public class NightlyStrategyOptimizer
     #region Symbol Analysis Preparation
 
     /// <summary>
-    private record SymbolData(List<string> Rows, string ContextSection, string CsvHeader, int TotalWins);
+    private record SymbolData(List<string> Rows, string ContextSection, string CsvHeader, int TotalWins, int TotalRows);
 
     /// <summary>
     /// Load raw trade data + context for Bedrock. Returns rows (CSV), context, and header separately
@@ -201,36 +201,11 @@ public class NightlyStrategyOptimizer
                 COALESCE(l2.b4, 0) AS b4, COALESCE(l2.b5, 0) AS b5,
                 COALESCE(l2.a1, 0) AS a1, COALESCE(l2.a2, 0) AS a2, COALESCE(l2.a3, 0) AS a3,
                 COALESCE(l2.a4, 0) AS a4, COALESCE(l2.a5, 0) AS a5,
-                -- Outcomes: price after + P&L (dollar amount per 100 shares)
+                -- Outcomes: price after signal
                 ROUND(ts.""PriceAfter1Min""::numeric, 4) AS price_1m,
                 ROUND(ts.""PriceAfter5Min""::numeric, 4) AS price_5m,
                 ROUND(ts.""PriceAfter15Min""::numeric, 4) AS price_15m,
-                ROUND(ts.""PriceAfter30Min""::numeric, 4) AS price_30m,
-                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter1Min"" - ts.""Price"") * 100
-                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter1Min"") * 100
-                           ELSE 0 END::numeric, 2) AS pnl_1m,
-                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter5Min"" - ts.""Price"") * 100
-                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter5Min"") * 100
-                           ELSE 0 END::numeric, 2) AS pnl_5m,
-                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter15Min"" - ts.""Price"") * 100
-                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter15Min"") * 100
-                           ELSE 0 END::numeric, 2) AS pnl_15m,
-                ROUND(CASE WHEN ts.""Type"" = 1 THEN (ts.""PriceAfter30Min"" - ts.""Price"") * 100
-                           WHEN ts.""Type"" = 2 THEN (ts.""Price"" - ts.""PriceAfter30Min"") * 100
-                           ELSE 0 END::numeric, 2) AS pnl_30m,
-                -- Spread-adjusted win: only count as win if profit > spread (covers entry+exit cost)
-                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter1Min"" - ts.""Price"") > ts.""Spread"" THEN 1
-                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter1Min"") > ts.""Spread"" THEN 1
-                     ELSE 0 END AS win_1m,
-                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter5Min"" - ts.""Price"") > ts.""Spread"" THEN 1
-                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter5Min"") > ts.""Spread"" THEN 1
-                     ELSE 0 END AS win_5m,
-                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter15Min"" - ts.""Price"") > ts.""Spread"" THEN 1
-                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter15Min"") > ts.""Spread"" THEN 1
-                     ELSE 0 END AS win_15m,
-                CASE WHEN ts.""Type"" = 1 AND (ts.""PriceAfter30Min"" - ts.""Price"") > ts.""Spread"" THEN 1
-                     WHEN ts.""Type"" = 2 AND (ts.""Price"" - ts.""PriceAfter30Min"") > ts.""Spread"" THEN 1
-                     ELSE 0 END AS win_30m
+                ROUND(ts.""PriceAfter30Min""::numeric, 4) AS price_30m
             FROM ""TradingSignals"" ts
             LEFT JOIN LATERAL (
                 SELECT
@@ -251,6 +226,7 @@ public class NightlyStrategyOptimizer
                 LIMIT 1
             ) l2 ON true
             WHERE ts.""SymbolId"" = @p0 AND ts.""Timestamp"" > @p1 AND ts.""PriceAfter1Min"" IS NOT NULL
+              AND (ts.""Reason"" IS NULL OR ts.""Reason"" NOT LIKE '%BACKFILL%')
             ORDER BY ts.""Timestamp"" DESC
             LIMIT 3000";
 
@@ -271,12 +247,15 @@ public class NightlyStrategyOptimizer
             while (await reader.ReadAsync())
             {
                 totalRows++;
-                // win columns are at index 44-47 (after adding price_15m, price_30m, pnl_15m, pnl_30m)
-                int win1m = reader.IsDBNull(44) ? 0 : reader.GetInt32(44);
-                int win5m = reader.IsDBNull(45) ? 0 : reader.GetInt32(45);
-                int win15m = reader.IsDBNull(46) ? 0 : reader.GetInt32(46);
-                int win30m = reader.IsDBNull(47) ? 0 : reader.GetInt32(47);
-                totalWins += win1m;
+                // Compute win at 5min for aggregate stats (direction-aware, spread-adjusted)
+                var direction = reader.GetString(2); // "BUY" or "SELL"
+                var price = D(reader, 3);
+                var price5m = D(reader, 37); // price_5m
+                var spread = D(reader, 10);
+                bool win5m = direction == "BUY"
+                    ? (price5m - price) > spread
+                    : (price - price5m) > spread;
+                if (win5m && price5m > 0) totalWins++;
 
                 // CSV row — compact format to maximize data within token budget
                 rows.Add(string.Join(",",
@@ -319,15 +298,7 @@ public class NightlyStrategyOptimizer
                     D(reader, 36),        // price_1m
                     D(reader, 37),        // price_5m
                     D(reader, 38),        // price_15m
-                    D(reader, 39),        // price_30m
-                    D(reader, 40),        // pnl_1m
-                    D(reader, 41),        // pnl_5m
-                    D(reader, 42),        // pnl_15m
-                    D(reader, 43),        // pnl_30m
-                    win1m,                // win_1m (spread-adjusted)
-                    win5m,                // win_5m (spread-adjusted)
-                    win15m,               // win_15m (spread-adjusted)
-                    win30m                // win_30m (spread-adjusted)
+                    D(reader, 39)         // price_30m
                 ));
             }
         }
@@ -417,6 +388,65 @@ public class NightlyStrategyOptimizer
         }
 
         // ═══════════════════════════════════════════════════════════
+        // 2b. Aggregate performance summary (computed from rows, not sent as individual outcomes)
+        // ═══════════════════════════════════════════════════════════
+        {
+            // Parse rows to compute aggregate stats — rows are CSV with columns indexed by csvHeader
+            // dir=index 2, price=3, hour_et=1, price_5m=37 (but in CSV string, index positions may differ)
+            // CSV column indices: 0=dow, 1=hour_et, 2=dir, 3=price, 10=spread, 37=price_5m
+            int totalSignals = 0, wins5m = 0;
+            decimal totalPnl5m = 0;
+            var hourPnl = new Dictionary<int, (int count, decimal pnl)>();
+
+            foreach (var row in rows)
+            {
+                var cols = row.Split(',');
+                if (cols.Length < 38) continue; // need at least through price_5m
+
+                if (!int.TryParse(cols[1], out int hourEt)) continue;
+                var dir = cols[2];
+                if (!decimal.TryParse(cols[3], out decimal rowPrice) || rowPrice <= 0) continue;
+                if (!decimal.TryParse(cols[37], out decimal rowPrice5m) || rowPrice5m <= 0) continue;
+                if (!decimal.TryParse(cols[10], out decimal rowSpread)) rowSpread = 0;
+
+                totalSignals++;
+                decimal pnl5m = dir == "BUY"
+                    ? (rowPrice5m - rowPrice) * 100
+                    : (rowPrice - rowPrice5m) * 100;
+
+                totalPnl5m += pnl5m;
+                bool isWin = dir == "BUY"
+                    ? (rowPrice5m - rowPrice) > rowSpread
+                    : (rowPrice - rowPrice5m) > rowSpread;
+                if (isWin) wins5m++;
+
+                if (!hourPnl.ContainsKey(hourEt))
+                    hourPnl[hourEt] = (0, 0);
+                var (c, p) = hourPnl[hourEt];
+                hourPnl[hourEt] = (c + 1, p + pnl5m);
+            }
+
+            if (totalSignals > 0)
+            {
+                decimal winRate5m = (decimal)wins5m / totalSignals;
+                decimal avgPnl5m = totalPnl5m / totalSignals;
+                var bestHour = hourPnl.Count > 0 ? hourPnl.OrderByDescending(h => h.Value.pnl / Math.Max(h.Value.count, 1)).First() : default;
+                var worstHour = hourPnl.Count > 0 ? hourPnl.OrderBy(h => h.Value.pnl / Math.Max(h.Value.count, 1)).First() : default;
+
+                ctx.AppendLine();
+                ctx.AppendLine("PERFORMANCE SUMMARY (aggregate, not per-signal):");
+                ctx.AppendLine($"- Overall signal count: {totalSignals}");
+                ctx.AppendLine($"- Win rate at 5min: {winRate5m:P1}");
+                ctx.AppendLine($"- Average P&L at 5min: {avgPnl5m:F2}");
+                if (hourPnl.Count > 0)
+                {
+                    ctx.AppendLine($"- Best performing hour (ET): {bestHour.Key}:00 (avg P&L ${bestHour.Value.pnl / Math.Max(bestHour.Value.count, 1):F2}, n={bestHour.Value.count})");
+                    ctx.AppendLine($"- Worst performing hour (ET): {worstHour.Key}:00 (avg P&L ${worstHour.Value.pnl / Math.Max(worstHour.Value.count, 1):F2}, n={worstHour.Value.count})");
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
         // 3. Previous rules feedback — help Bedrock iterate instead of starting from scratch
         // ═══════════════════════════════════════════════════════════
         try
@@ -440,9 +470,9 @@ public class NightlyStrategyOptimizer
         }
         catch { /* non-fatal — first run or bad file */ }
 
-        string csvHeader = "dow,hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,spread_pct,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,price_15m,price_30m,pnl_1m,pnl_5m,pnl_15m,pnl_30m,win_1m,win_5m,win_15m,win_30m";
+        string csvHeader = "dow,hour_et,dir,price,score,obi,wobi,pressure_roc,spread_signal,large_order,spread,spread_pct,imbalance,ema9,ema20,rsi14,vwap,vol_ratio,tick_mom,book_depth,bid_wall,ask_wall,bid_sweep,ask_sweep,imb_vel,spread_pctl,b1,b2,b3,b4,b5,a1,a2,a3,a4,a5,price_1m,price_5m,price_15m,price_30m";
 
-        return new SymbolData(rows, ctx.ToString(), csvHeader, totalWins);
+        return new SymbolData(rows, ctx.ToString(), csvHeader, totalWins, totalRows);
         }
         finally
         {
@@ -780,16 +810,16 @@ public class NightlyStrategyOptimizer
         _logger.LogInformation("Calling Bedrock {Model} for {Ticker} ({RowCount} rows, {Chunks} chunks)...",
             modelId, ticker, rows.Count, (rows.Count + 999) / 1000);
 
-        var systemPrompt = @"You are a quantitative trading strategy optimizer for 30min-2hr swing trades. You receive RAW TRADE DATA — every signal with all indicator values and the actual outcome (P&L in dollars, spread-adjusted win/loss).
+        var systemPrompt = @"You are a quantitative trading strategy optimizer for 1-10 minute L2-based trades. You receive RAW TRADE DATA — every signal with all indicator values and the actual outcome (P&L in dollars, spread-adjusted win/loss).
 
-Your job: analyze the raw data to discover patterns that predict profitable swing trades, then output conditional rules as JSON.
+Your job: analyze the raw data to discover patterns that predict profitable short-duration trades (1-10 min), then output conditional rules as JSON.
 
 ## How the trading system works
-- Signals are generated from 5-minute bar analysis, with L2 data used for entry timing
-- 10 weighted indicators produce a composite score each snapshot
+- Signals are generated from L2 order book microstructure analysis
+- 6 weighted L2/tick indicators produce a composite score each snapshot
 - YOUR rules are evaluated first — if a rule matches, it fires immediately (bypasses scoring)
 - A PositionMonitor checks exits every 5s (score decay, trailing stops, time gates)
-- Positions can be held up to 3x the holdSeconds you specify (e.g., holdSeconds=3600 → max 10800s)
+- Positions can be held up to 2x the holdSeconds you specify (e.g., holdSeconds=300 → max 600s)
 - Commission: $0 (both Webull and Questrade have zero-commission US equity trades).
 - The real cost per trade is the SPREAD — you must cross it on entry AND exit. Check the spread_pct column.
 
@@ -822,24 +852,14 @@ a1-a5: top 5 ask level sizes (shares) from order book at signal time
   - b1 >> a1 means buyers are front-loading → bullish pressure
   - a1 very large = ask wall (resistance), b1 very large = bid wall (support)
   - All zeros means no L2 snapshot was available at signal time
-price_1m: actual midprice 1 minute after signal
-price_5m: actual midprice 5 minutes after signal
+price_1m: actual midprice 1 minute after signal (early momentum check)
+price_5m: actual midprice 5 minutes after signal (PRIMARY outcome — compute P&L as (price_5m - price) * 100 for BUY, (price - price_5m) * 100 for SELL)
 price_15m: actual midprice 15 minutes after signal
 price_30m: actual midprice 30 minutes after signal
-pnl_1m: P&L in $ per 100 shares at 1 min (early momentum check)
-pnl_5m: P&L in $ per 100 shares at 5 min (early momentum check)
-pnl_15m: P&L in $ per 100 shares at 15 min (PRIMARY short-term outcome)
-pnl_30m: P&L in $ per 100 shares at 30 min (PRIMARY swing outcome — this is your main target)
-win_1m: 1 if profit > spread cost (spread-adjusted), 0 otherwise
-win_5m: 1 if profit > spread cost at 5 min, 0 otherwise
-win_15m: 1 if profit > spread cost at 15 min, 0 otherwise
-win_30m: 1 if profit > spread cost at 30 min — THIS IS THE PRIMARY WIN METRIC for swing trades
 
-## IMPORTANT: Reading the P&L columns
-- pnl_15m and pnl_30m are the PRIMARY outcomes for swing trade evaluation. Use these to set expectedPnlPer100Shares and stopLoss.
-- pnl_1m/pnl_5m are useful for early momentum confirmation but NOT the target hold period.
-- win_30m is the PRIMARY win rate metric — this tells you if the pattern is profitable at swing timeframes.
-- Compare pnl_15m vs pnl_30m to decide holdSeconds: if pnl_30m > pnl_15m for winning patterns, use longer holds (closer to 7200s).
+## IMPORTANT: Reading the outcome columns
+- price_5m is the PRIMARY outcome for 1-10 minute trade evaluation. Use it to compute P&L and set expectedPnlPer100Shares and stopLoss.
+- Compare price_1m vs price_5m to decide holdSeconds: if 5m is more favorable, use longer holds (300-600s). If 1m captures most of the move, use shorter holds (60-180s).
 
 ## IMPORTANT: Primary vs optional conditions
 - L2 conditions (OBI, WOBI, etc.) should only be used as OPTIONAL refinements, not primary conditions. Primary conditions should be trend (trendDirection), VWAP position (aboveVwap), RSI (rsiRange), and volume (minVolumeRatio).
@@ -857,11 +877,11 @@ Steps:
 4. Look for interactions (e.g., OBI matters more when spread is tight, momentum matters more with high volume)
 5. VALIDATE each candidate rule on the newer 25% — reject rules that don't generalize
 6. Output 3-8 high-confidence rules that pass validation
-7. Each rule MUST have confidence >= 0.55, sample >= 30, positive average pnl_30m IN BOTH train and validation sets
-8. Set holdSeconds (1800-7200) based on whether pnl_15m or pnl_30m is more favorable for that pattern
-9. Set stopLoss as ATR multiplier (1.0-3.0) based on typical adverse pnl for losers in that pattern
+7. Each rule MUST have confidence >= 0.55, sample >= 30, positive average pnl_5m IN BOTH train and validation sets
+8. Set holdSeconds: 60-600 (1-10 minute holds matching L2 signal decay)
+9. Set stopLoss as ATR multiplier (0.5-3.0) based on typical adverse pnl for losers in that pattern
 10. Set maxPositionDollars based on price and spread_pct (lower for wide-spread stocks)
-11. Set maxDailyTrades to 3-5 per symbol — swing trades need fewer, higher-quality entries
+11. Set maxDailyTrades to 2-4 per symbol — quality over quantity
 
 CRITICAL: Rules that only work on historical data but fail on recent data are WORSE than no rules — they waste commission. Be conservative. A 55% spread-adjusted win rate that holds out-of-sample beats a 70% win rate that only works in-sample.";
 
@@ -890,17 +910,17 @@ CRITICAL: Rules that only work on historical data but fail on recent data are WO
       ""confidence"": 0.60,
       ""expectedPnlPer100Shares"": 8.50,
       ""sampleSize"": 45,
-      ""holdSeconds"": 3600,
+      ""holdSeconds"": 300,
       ""stopLoss"": 2.0
     }}
   ],
   ""disabledHours"": [12, 13],
-  ""maxDailyTrades"": 5,
+  ""maxDailyTrades"": 3,
   ""maxPositionShares"": 500,
   ""maxPositionDollars"": 25000
 }}
 
-IMPORTANT: The example above is just a template showing the schema. Replace ALL values with your actual analysis results. Use null for conditions you don't want to constrain. direction must be exactly ""BUY"" or ""SELL"". holdSeconds range: 1800-7200. stopLoss range: 0.5-5.0 (ATR multiplier).";
+IMPORTANT: The example above is just a template showing the schema. Replace ALL values with your actual analysis results. Use null for conditions you don't want to constrain. direction must be exactly ""BUY"" or ""SELL"". holdSeconds range: 60-600 (1-10 minute holds). stopLoss range: 0.5-5.0 (ATR multiplier). maxDailyTrades: 2-4 per symbol.";
 
         try
         {
@@ -938,7 +958,7 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                 chunkPrompt.AppendLine();
                 chunkPrompt.AppendLine($"## Instructions");
                 chunkPrompt.AppendLine($"Analyze this batch of {ticker} trades. The data is sorted newest-first.");
-                chunkPrompt.AppendLine($"Use pnl_15m and pnl_30m columns as primary outcomes. pnl_1m/pnl_5m are early momentum checks only.");
+                chunkPrompt.AppendLine($"Use price_5m as the primary outcome (compute P&L from direction and price). price_1m is an early momentum check.");
                 chunkPrompt.AppendLine($"Discover patterns in TRAINING rows (older 75%), verify they hold in VALIDATION rows (newest 25%).");
                 chunkPrompt.AppendLine($"Output ONLY the JSON object in this format:");
                 chunkPrompt.AppendLine(jsonTemplate);
@@ -1008,11 +1028,20 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
             _logger.LogWarning("{Ticker}: {Total} rules from {Chunks} chunks, {Deduped} after dedup",
                 ticker, allRules.Count, chunkCount, deduped.Count);
 
+            // Local backtesting: verify rules on validation data (newest 25%) before deployment
+            var backtested = BacktestRulesLocally(ticker, deduped, data.Rows, valSplitRow);
+
+            if (backtested.Count == 0)
+            {
+                _logger.LogWarning("{Ticker}: all {Count} rules failed local backtesting — no rules deployed", ticker, deduped.Count);
+                return null;
+            }
+
             return new SymbolStrategy
             {
                 TickerId = tickerId,
                 OverallWinRate = overallWinRate,
-                Rules = deduped,
+                Rules = backtested,
                 DisabledHours = disabledHours.OrderBy(h => h).ToList(),
                 MaxDailyTrades = maxDailyTrades,
                 MaxPositionDollars = maxPositionDollars,
@@ -1093,14 +1122,15 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                 .Where(r => r.SampleSize >= 30 && r.Confidence >= 0.55m)
                 .Where(r => r.ExpectedPnlPer100Shares > 0) // Must be profitable after fees
                 .Where(r => r.Direction is "BUY" or "SELL")
-                .Where(r => r.HoldSeconds is >= 10 and <= 600)
+                .Where(r => r.HoldSeconds is >= 60 and <= 600)
                 .Where(r => r.StopLoss is >= 0.05m and <= 5.0m)
                 .ToList();
 
             strategy.Rules = validRules;
+            strategy.MaxDailyTrades = Math.Min(strategy.MaxDailyTrades, 5);
 
-            _logger.LogInformation("{Ticker}: {Valid}/{Total} rules passed validation",
-                ticker, validRules.Count, strategy.Rules.Count);
+            _logger.LogInformation("{Ticker}: {Valid}/{Total} rules passed validation (maxDailyTrades capped to {MaxDaily})",
+                ticker, validRules.Count, strategy.Rules.Count, strategy.MaxDailyTrades);
 
             return validRules.Count > 0 ? strategy : null;
         }
@@ -1110,6 +1140,133 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                 ticker, responseText[..Math.Min(200, responseText.Length)]);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Local backtesting of Bedrock-generated rules against validation data (newest 25%).
+    /// Checks direction + hour + confidence filtering on the validation rows.
+    /// Rules must have matchCount >= 5 AND positive total P&L at 5min to be kept.
+    /// </summary>
+    private List<StrategyRule> BacktestRulesLocally(string ticker, List<StrategyRule> candidateRules, List<string> allRows, int valSplitRow)
+    {
+        // Validation rows are the first valSplitRow rows (data is sorted newest-first)
+        var validationRows = allRows.Take(valSplitRow).ToList();
+        if (validationRows.Count < 10)
+        {
+            _logger.LogWarning("{Ticker}: only {Count} validation rows, skipping local backtest (keeping all rules)",
+                ticker, validationRows.Count);
+            return candidateRules;
+        }
+
+        var kept = new List<StrategyRule>();
+
+        foreach (var rule in candidateRules)
+        {
+            int matchCount = 0;
+            decimal totalPnl = 0;
+
+            foreach (var row in validationRows)
+            {
+                var cols = row.Split(',');
+                if (cols.Length < 38) continue; // need at least through price_5m
+
+                // Parse key fields for matching
+                if (!int.TryParse(cols[1], out int hourEt)) continue;
+                var dir = cols[2]; // "BUY" or "SELL"
+                if (!decimal.TryParse(cols[3], out decimal price) || price <= 0) continue;
+                if (!decimal.TryParse(cols[4], out decimal score)) continue;
+                if (!decimal.TryParse(cols[37], out decimal price5m) || price5m <= 0) continue;
+
+                // Direction must match
+                if (!string.Equals(dir, rule.Direction, StringComparison.OrdinalIgnoreCase)) continue;
+
+                // Hour must be in rule's allowed hours (if specified)
+                if (rule.Hours.Count > 0 && !rule.Hours.Contains(hourEt)) continue;
+
+                // Score must meet rule's confidence threshold
+                if (Math.Abs(score) < rule.Confidence) continue;
+
+                // Additional condition checks where data is available
+                bool conditionsMet = true;
+
+                // RSI range check
+                if (rule.Conditions.RsiRange is { Length: >= 2 })
+                {
+                    if (decimal.TryParse(cols[15], out decimal rsi))
+                    {
+                        if (rule.Conditions.RsiRange![0].HasValue && rsi < rule.Conditions.RsiRange[0]!.Value) conditionsMet = false;
+                        if (rule.Conditions.RsiRange![1].HasValue && rsi > rule.Conditions.RsiRange[1]!.Value) conditionsMet = false;
+                    }
+                }
+
+                // Volume ratio check
+                if (rule.Conditions.MinVolumeRatio.HasValue)
+                {
+                    if (decimal.TryParse(cols[17], out decimal volRatio))
+                    {
+                        if (volRatio < rule.Conditions.MinVolumeRatio.Value) conditionsMet = false;
+                    }
+                }
+
+                // VWAP position check
+                if (rule.Conditions.AboveVwap.HasValue)
+                {
+                    if (decimal.TryParse(cols[16], out decimal vwap) && vwap > 0)
+                    {
+                        bool isAbove = price > vwap;
+                        if (rule.Conditions.AboveVwap.Value != isAbove) conditionsMet = false;
+                    }
+                }
+
+                // Trend direction check (EMA9 vs EMA20)
+                if (rule.Conditions.TrendDirection.HasValue)
+                {
+                    if (decimal.TryParse(cols[13], out decimal ema9) && decimal.TryParse(cols[14], out decimal ema20)
+                        && ema9 > 0 && ema20 > 0)
+                    {
+                        int trend = ema9 > ema20 ? 1 : -1;
+                        if (trend != rule.Conditions.TrendDirection.Value) conditionsMet = false;
+                    }
+                }
+
+                // OBI check
+                if (rule.Conditions.MinObi.HasValue || rule.Conditions.MaxObi.HasValue)
+                {
+                    if (decimal.TryParse(cols[5], out decimal obi))
+                    {
+                        if (rule.Conditions.MinObi.HasValue && obi < rule.Conditions.MinObi.Value) conditionsMet = false;
+                        if (rule.Conditions.MaxObi.HasValue && obi > rule.Conditions.MaxObi.Value) conditionsMet = false;
+                    }
+                }
+
+                if (!conditionsMet) continue;
+
+                matchCount++;
+
+                // Compute P&L at 5min (matching hold range 60-600s)
+                decimal pnl = dir == "BUY"
+                    ? (price5m - price) * 100
+                    : (price - price5m) * 100;
+                totalPnl += pnl;
+            }
+
+            if (matchCount >= 5 && totalPnl > 0)
+            {
+                _logger.LogInformation("{Ticker}: rule {RuleId} passed backtest: {Matches} matches, P&L=${Pnl:F2}",
+                    ticker, rule.Id, matchCount, totalPnl);
+                kept.Add(rule);
+            }
+            else
+            {
+                _logger.LogWarning("{Ticker}: rule {RuleId} ({Name}) REJECTED by backtest: {Matches} matches, P&L=${Pnl:F2} (need >=5 matches and positive P&L)",
+                    ticker, rule.Id, rule.Name, matchCount, totalPnl);
+            }
+        }
+
+        _logger.LogWarning("{Ticker}: local backtest kept {Kept}/{Total} rules",
+            ticker, kept.Count, candidateRules.Count);
+
+        return kept;
     }
 
     #endregion

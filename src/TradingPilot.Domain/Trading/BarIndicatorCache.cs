@@ -58,4 +58,10 @@ public class BarIndicators
     public bool HighVolume { get; set; }
 
     public DateTime ComputedAt { get; set; }
+
+    /// <summary>
+    /// UTC time when this snapshot was last refreshed from the database.
+    /// Used by MarketMicrostructureAnalyzer to detect stale bar data and skip signal generation.
+    /// </summary>
+    public DateTime LastRefreshTime { get; set; }
 }

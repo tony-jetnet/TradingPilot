@@ -29,7 +29,7 @@ public class PositionMonitor : IDisposable
     // Anti-wick: peak price must persist this long before trailing stop uses it
     private const int PeakPersistenceSeconds = 10;
     // ATR multiplier for volatility-adaptive stop loss floor
-    private const decimal AtrStopMultiplier = 1.5m;
+    private const decimal AtrStopMultiplier = 2.0m;
 
     public PositionMonitor(
         PaperTradingExecutor executor,
@@ -179,66 +179,7 @@ public class PositionMonitor : IDisposable
         // Get bar indicators for bar-based exit checks
         var barIndicators = _barCache.GetIndicators(pos.TickerId);
 
-        // ═══════════════════════════════════════════════════════════
-        // CHECK 1: VWAP Cross — price crossed VWAP against position
-        // Grace period: 15 minutes (ignore early VWAP noise)
-        // ═══════════════════════════════════════════════════════════
-        if (elapsed >= 900 && barIndicators != null)
-        {
-            bool vwapExit = (pos.IsLong && barIndicators.Vwap > 0 && currentPrice < barIndicators.Vwap) ||
-                            (!pos.IsLong && barIndicators.Vwap > 0 && currentPrice > barIndicators.Vwap);
-            if (vwapExit)
-            {
-                await _executor.ExitPositionAsync(symbol, currentPrice,
-                    $"VWAP CROSS price={currentPrice:F2} vwap={barIndicators.Vwap:F2} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Symbol} EXIT VWAP CROSS price={Price:F2} vwap={Vwap:F2}",
-                    symbol, currentPrice, barIndicators.Vwap);
-                return;
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        // CHECK 2: EMA Trend Reversal — EMA9 crossed EMA20 against position
-        // Grace period: 10 minutes (give the trend time to develop)
-        // ═══════════════════════════════════════════════════════════
-        if (elapsed >= 600 && barIndicators != null)
-        {
-            bool trendReversed = (pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 < barIndicators.Ema20) ||
-                                 (!pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 > barIndicators.Ema20);
-            if (trendReversed)
-            {
-                await _executor.ExitPositionAsync(symbol, currentPrice,
-                    $"TREND REVERSAL ema9={barIndicators.Ema9:F2} ema20={barIndicators.Ema20:F2} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Symbol} EXIT TREND REVERSAL ema9={Ema9:F2} ema20={Ema20:F2}",
-                    symbol, barIndicators.Ema9, barIndicators.Ema20);
-                return;
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        // CHECK 3: RSI Extreme — take profit on overbought/oversold
-        // Grace period: 5 minutes
-        // ═══════════════════════════════════════════════════════════
-        if (elapsed >= 300 && barIndicators != null)
-        {
-            bool rsiExtreme = (pos.IsLong && barIndicators.Rsi14 > 75) ||
-                              (!pos.IsLong && barIndicators.Rsi14 > 0 && barIndicators.Rsi14 < 25);
-            if (rsiExtreme)
-            {
-                await _executor.ExitPositionAsync(symbol, currentPrice,
-                    $"RSI EXTREME rsi={barIndicators.Rsi14:F1} elapsed={elapsed:F0}s", currentScore);
-                _logger.LogWarning("PositionMonitor: {Symbol} EXIT RSI EXTREME rsi={Rsi:F1}",
-                    symbol, barIndicators.Rsi14);
-                return;
-            }
-        }
-
-        // ═══════════════════════════════════════════════════════════
-        // CHECK 4: Stop loss — volatility-adaptive with spread floor
-        // Uses Max(rule stop, 1.5×ATR, entry spread) so the stop automatically
-        // widens when volatility is high and tightens when it's low.
-        // Falls back to rule stop + spread floor if no ATR data at entry.
-        // ═══════════════════════════════════════════════════════════
+        // Pre-compute stop loss, profit, and peak profit for use across all checks
         decimal adverse = pos.IsLong
             ? pos.EntryPrice - currentPrice
             : currentPrice - pos.EntryPrice;
@@ -246,6 +187,97 @@ public class PositionMonitor : IDisposable
         decimal atrFloor = pos.EntryAtr > 0 ? pos.EntryAtr * AtrStopMultiplier : 0;
         decimal effectiveStopLoss = Math.Max(Math.Max(pos.StopLoss, atrFloor), pos.EntrySpread);
 
+        decimal currentProfit = pos.IsLong
+            ? currentPrice - pos.EntryPrice
+            : pos.EntryPrice - currentPrice;
+        decimal peakProfit = pos.IsLong
+            ? pos.PeakFavorablePrice - pos.EntryPrice
+            : pos.EntryPrice - pos.PeakFavorablePrice;
+
+        // ═══════════════════════════════════════════════════════════
+        // CHECK 0: Profit target
+        // ═══════════════════════════════════════════════════════════
+        decimal profitTarget = effectiveStopLoss * 3.0m;
+        if (currentProfit >= profitTarget)
+        {
+            await _executor.ExitPositionAsync(symbol, currentPrice,
+                $"PROFIT TARGET hit={currentProfit:F2} target={profitTarget:F2}", currentScore);
+            return;
+        }
+
+        // Scale grace periods to hold time
+        int vwapGrace = Math.Min(900, (int)(pos.HoldSeconds * 0.50));
+        int emaGrace = Math.Min(600, (int)(pos.HoldSeconds * 0.33));
+        int rsiGrace = Math.Min(300, (int)(pos.HoldSeconds * 0.17));
+
+        // Trailing override: VWAP/EMA/RSI exits tighten the trailing stop instead of hard exiting
+        decimal trailingOverride = -1m;
+
+        // ═══════════════════════════════════════════════════════════
+        // CHECK 1: VWAP Cross — price crossed VWAP against position
+        // Grace period: scaled to hold time (max 15 minutes)
+        // ═══════════════════════════════════════════════════════════
+        if (elapsed >= vwapGrace && barIndicators != null)
+        {
+            bool vwapExit = (pos.IsLong && barIndicators.Vwap > 0 && currentPrice < barIndicators.Vwap) ||
+                            (!pos.IsLong && barIndicators.Vwap > 0 && currentPrice > barIndicators.Vwap);
+            if (vwapExit)
+            {
+                trailingOverride = 0.30m;
+                _logger.LogWarning("PositionMonitor: {Symbol} VWAP CROSS tightening trail to 30% price={Price:F2} vwap={Vwap:F2}",
+                    symbol, currentPrice, barIndicators.Vwap);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // CHECK 2: EMA Trend Reversal — EMA9 crossed EMA20 against position
+        // Grace period: scaled to hold time (max 10 minutes)
+        // ═══════════════════════════════════════════════════════════
+        if (elapsed >= emaGrace && barIndicators != null)
+        {
+            bool trendReversed = (pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 < barIndicators.Ema20) ||
+                                 (!pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 > barIndicators.Ema20);
+            if (trendReversed)
+            {
+                trailingOverride = trailingOverride > 0 ? Math.Min(trailingOverride, 0.30m) : 0.30m;
+                _logger.LogWarning("PositionMonitor: {Symbol} TREND REVERSAL tightening trail to 30% ema9={Ema9:F2} ema20={Ema20:F2}",
+                    symbol, barIndicators.Ema9, barIndicators.Ema20);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // CHECK 3: RSI Extreme — graduated trailing tightening
+        // Grace period: scaled to hold time (max 5 minutes)
+        // ═══════════════════════════════════════════════════════════
+        if (elapsed >= rsiGrace && barIndicators != null)
+        {
+            // Very extreme RSI: tighten to 25%
+            bool rsiVeryExtreme = (pos.IsLong && barIndicators.Rsi14 > 80) ||
+                                  (!pos.IsLong && barIndicators.Rsi14 > 0 && barIndicators.Rsi14 < 20);
+            // Moderately extreme RSI: tighten to 40%
+            bool rsiExtreme = (pos.IsLong && barIndicators.Rsi14 > 75) ||
+                              (!pos.IsLong && barIndicators.Rsi14 > 0 && barIndicators.Rsi14 < 25);
+
+            if (rsiVeryExtreme)
+            {
+                trailingOverride = trailingOverride > 0 ? Math.Min(trailingOverride, 0.25m) : 0.25m;
+                _logger.LogWarning("PositionMonitor: {Symbol} RSI VERY EXTREME tightening trail to 25% rsi={Rsi:F1}",
+                    symbol, barIndicators.Rsi14);
+            }
+            else if (rsiExtreme)
+            {
+                trailingOverride = trailingOverride > 0 ? Math.Min(trailingOverride, 0.40m) : 0.40m;
+                _logger.LogWarning("PositionMonitor: {Symbol} RSI EXTREME tightening trail to 40% rsi={Rsi:F1}",
+                    symbol, barIndicators.Rsi14);
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // CHECK 4: Stop loss — volatility-adaptive with spread floor
+        // Uses Max(rule stop, 2.0×ATR, entry spread) so the stop automatically
+        // widens when volatility is high and tightens when it's low.
+        // Falls back to rule stop + spread floor if no ATR data at entry.
+        // ═══════════════════════════════════════════════════════════
         if (adverse > effectiveStopLoss)
         {
             await _executor.ExitPositionAsync(symbol, currentPrice,
@@ -256,24 +288,19 @@ public class PositionMonitor : IDisposable
         }
 
         // ═══════════════════════════════════════════════════════════
-        // CHECK 5a: Breakeven stop — once profitable by 1.5x stop distance,
-        // move the floor to breakeven (entry price). Prevents winning trades
-        // from turning into losers. Uses 1.5x (not 1.0x) to avoid premature
+        // CHECK 5a: Breakeven stop — once profitable by 2.0x stop distance,
+        // move the floor to breakeven minus buffer. Prevents winning trades
+        // from turning into losers. Uses 2.0x (not 1.0x) to avoid premature
         // exits on normal price oscillation near the stop distance.
+        // Buffer of 0.25x stop allows small drawdown before triggering.
         // ═══════════════════════════════════════════════════════════
-        decimal currentProfit = pos.IsLong
-            ? currentPrice - pos.EntryPrice
-            : pos.EntryPrice - currentPrice;
-        decimal peakProfit = pos.IsLong
-            ? pos.PeakFavorablePrice - pos.EntryPrice
-            : pos.EntryPrice - pos.PeakFavorablePrice;
-
-        if (peakProfit > effectiveStopLoss * 1.5m && currentProfit < 0)
+        decimal breakevenBuffer = effectiveStopLoss * 0.25m;
+        if (peakProfit > effectiveStopLoss * 2.0m && currentProfit < -breakevenBuffer)
         {
             await _executor.ExitPositionAsync(symbol, currentPrice,
-                $"BREAKEVEN STOP peak_profit={peakProfit:F2} now_loss={currentProfit:F2} elapsed={elapsed:F0}s", currentScore);
-            _logger.LogWarning("PositionMonitor: {Symbol} EXIT BREAKEVEN STOP was_up={PeakProfit:F2} now_down={Loss:F2}",
-                symbol, peakProfit, currentProfit);
+                $"BREAKEVEN STOP peak_profit={peakProfit:F2} now_loss={currentProfit:F2} buffer={breakevenBuffer:F2} elapsed={elapsed:F0}s", currentScore);
+            _logger.LogWarning("PositionMonitor: {Symbol} EXIT BREAKEVEN STOP was_up={PeakProfit:F2} now_down={Loss:F2} buffer={Buffer:F2}",
+                symbol, peakProfit, currentProfit, breakevenBuffer);
             return;
         }
 
@@ -282,6 +309,7 @@ public class PositionMonitor : IDisposable
         // Only trail from peaks that have persisted for ≥10 seconds.
         // A single tick wick won't set an unrealistic peak that immediately
         // triggers the trail. Higher confidence = tighter trail.
+        // VWAP/EMA/RSI checks above may tighten via trailingOverride.
         // ═══════════════════════════════════════════════════════════
         if (peakProfit > effectiveStopLoss)
         {
@@ -289,17 +317,21 @@ public class PositionMonitor : IDisposable
             bool peakSustained = (now - pos.PeakPriceSetAt).TotalSeconds >= PeakPersistenceSeconds;
             decimal trailPeak = peakSustained ? peakProfit : peakProfit * 0.90m; // Use 90% of wick peak as conservative estimate
 
-            // Trail factor: confidence 0.62 → give back at most 38% of peak profit
-            // confidence 0 (Stage 2) → give back at most 60%
+            // Trail factor: confidence 0.62 → give back 44% (0.35 + 0.62*0.25 = 0.505 kept)
+            // confidence 0 (Stage 2) → give back 50%
             decimal maxGiveBack = pos.RuleConfidence > 0
-                ? (1m - pos.RuleConfidence)
-                : 0.60m;
+                ? (0.35m + pos.RuleConfidence * 0.25m)
+                : 0.50m;
+
+            // Apply trailing override from VWAP/EMA/RSI tighteners
+            decimal effectiveGiveBack = trailingOverride > 0 ? Math.Min(maxGiveBack, trailingOverride) : maxGiveBack;
+
             decimal pullback = trailPeak - currentProfit;
 
-            if (pullback > trailPeak * maxGiveBack)
+            if (pullback > trailPeak * effectiveGiveBack)
             {
                 await _executor.ExitPositionAsync(symbol, currentPrice,
-                    $"TRAILING STOP peak={trailPeak:F2} now={currentProfit:F2} pullback={pullback:F2} max_giveback={maxGiveBack:P0} sustained={peakSustained} elapsed={elapsed:F0}s", currentScore);
+                    $"TRAILING STOP peak={trailPeak:F2} now={currentProfit:F2} pullback={pullback:F2} max_giveback={effectiveGiveBack:P0} (base={maxGiveBack:P0} override={trailingOverride:F2}) sustained={peakSustained} elapsed={elapsed:F0}s", currentScore);
                 _logger.LogWarning("PositionMonitor: {Symbol} EXIT TRAILING STOP peak={PeakProfit:F2} now={CurrentProfit:F2}",
                     symbol, trailPeak, currentProfit);
                 return;

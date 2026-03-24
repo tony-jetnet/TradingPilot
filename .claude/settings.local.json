@@ -105,7 +105,8 @@
       "Bash(PGPASSWORD='JetNet@Core0' psql -h localhost -p 5432 -U jetnet -d TradingPilot -c \"\n-- Check signals that are likely entries \\(strong scores, rule-based\\)\n-- Type 1=Buy, 2=Sell. Look at Reason for ENTRY/EXIT patterns\nSELECT \\\\\"SymbolId\\\\\", \\\\\"Type\\\\\", \\\\\"Score\\\\\"::numeric\\(6,4\\), \\\\\"Price\\\\\", \n       \\(\\\\\"Timestamp\\\\\" AT TIME ZONE 'UTC'\\) AT TIME ZONE 'America/New_York' as \\\\\"TimeET\\\\\",\n       LEFT\\(\\\\\"Reason\\\\\", 80\\) as reason,\n       \\\\\"Imbalance\\\\\"::numeric\\(6,4\\),\n       \\\\\"SpreadPercentile\\\\\"::numeric\\(4,2\\),\n       \\\\\"Spread\\\\\"\nFROM \\\\\"TradingSignals\\\\\"\nWHERE \\\\\"Timestamp\\\\\" >= '2026-03-20 04:00:00'\n  AND \\\\\"Score\\\\\"::numeric > 0.35\n  AND \\\\\"Type\\\\\" = 1\nORDER BY \\\\\"Timestamp\\\\\"\nLIMIT 30;\" 2>&1)",
       "Bash(sort -t'$' -k2 -n)",
       "Bash(dotnet tool:*)",
-      "Bash(dotnet ilspycmd:*)"
+      "Bash(dotnet ilspycmd:*)",
+      "Bash(git:*)"
     ]
   }
 }

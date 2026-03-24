@@ -23,7 +23,8 @@ public class NightlyLocalTrainer
 
     private const decimal CommissionPerTrade = 0m; // Both Webull and Questrade have $0 commission on US equities
     private const int SimulationShares = 100;
-    private const int OptimizationIterations = 100;
+    private const int IterationsPerRestart = 300;
+    private const int NumRestarts = 3;
     private const string ModelConfigPath = @"D:\Third-Parties\WebullHook\model_config.json";
 
     // Default weights: only L2 microstructure + tick momentum are weighted.
@@ -180,6 +181,8 @@ public class NightlyLocalTrainer
             FROM ""TradingSignals"" ts
             JOIN ""Symbols"" s ON s.""Id"" = ts.""SymbolId""
             WHERE ts.""Timestamp"" > {{0}}
+            AND ABS(ts.""Score"") >= 0.20
+            AND (ts.""Reason"" IS NULL OR ts.""Reason"" NOT LIKE '%BACKFILL%')
             ORDER BY ts.""Timestamp""";
 
         var rows = new List<TrainingRow>();
@@ -238,9 +241,31 @@ public class NightlyLocalTrainer
             if (!reader.IsDBNull(priceAfter30Ord))
                 row.PriceAfter30Min = reader.GetDecimal(priceAfter30Ord);
 
-            // Label win/loss using longest available outcome for swing-style training.
-            // Prefer 30-min > 15-min > 5-min to match longer hold times.
-            decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
+            // Multi-horizon weighted outcome — approximates actual exit time distribution
+            decimal? outcomePrice = null;
+            if (row.PriceAfter5Min.HasValue && row.PriceAfter15Min.HasValue && row.PriceAfter30Min.HasValue)
+            {
+                outcomePrice = row.PriceAfter5Min.Value * 0.20m
+                             + row.PriceAfter15Min.Value * 0.40m
+                             + row.PriceAfter30Min.Value * 0.40m;
+            }
+            else if (row.PriceAfter5Min.HasValue && row.PriceAfter15Min.HasValue)
+            {
+                outcomePrice = row.PriceAfter5Min.Value * 0.30m
+                             + row.PriceAfter15Min.Value * 0.70m;
+            }
+            else if (row.PriceAfter5Min.HasValue)
+            {
+                outcomePrice = row.PriceAfter5Min.Value;
+            }
+            else if (row.PriceAfter15Min.HasValue)
+            {
+                outcomePrice = row.PriceAfter15Min.Value;
+            }
+            else
+            {
+                outcomePrice = row.PriceAfter30Min;
+            }
             if (outcomePrice.HasValue)
             {
                 decimal priceDelta = outcomePrice.Value - row.Price;
@@ -331,7 +356,9 @@ public class NightlyLocalTrainer
         // Step 4: OVERFIT GUARD — If optimized weights lose money on validation
         // AND default weights do better, fall back to defaults.
         // This is the key anti-overfit mechanism.
-        bool overfit = valPnl < 0 && defaultValPnl > valPnl;
+        bool overfit = valPnl < 0
+                    || (defaultValPnl > valPnl * 2m && defaultValPnl > 0)
+                    || (trainPnl > 0 && valPnl > 0 && valPnl < trainPnl * 0.15m);
         if (overfit)
         {
             _logger.LogWarning(
@@ -364,6 +391,21 @@ public class NightlyLocalTrainer
             // Step 5: Find optimal score thresholds ON TRAINING SET,
             // then verify they don't overfit on validation
             FindOptimalThresholds(trainRows, optimizedWeights, config);
+
+            // Validate selected thresholds on held-out data
+            const decimal defaultBuyThreshold = 0.35m;
+            const decimal defaultSellThreshold = -0.35m;
+            decimal threshValPnl = ComputeTotalProfit(valRows, optimizedWeights,
+                config.MinScoreToBuy, config.MinScoreToSell);
+            decimal threshDefaultPnl = ComputeTotalProfit(valRows, optimizedWeights,
+                defaultBuyThreshold, defaultSellThreshold);
+            if (threshValPnl <= 0 && threshDefaultPnl > threshValPnl)
+            {
+                config.MinScoreToBuy = defaultBuyThreshold;
+                config.MinScoreToSell = defaultSellThreshold;
+                config.MinScoreToExit = Math.Min(defaultBuyThreshold, Math.Abs(defaultSellThreshold)) * 0.6m;
+                _logger.LogWarning("{Ticker}: threshold overfit detected, reverting to defaults", ticker);
+            }
 
             // Step 6: Per-hour analysis (uses all data — this is reporting/filtering, not prediction)
             AnalyzeHours(rows, config);
@@ -412,38 +454,51 @@ public class NightlyLocalTrainer
     /// </summary>
     private decimal[] OptimizeWeights(List<TrainingRow> rows)
     {
-        var weights = (decimal[])DefaultWeights.Clone();
-        decimal bestProfit = ComputeTotalProfit(rows, weights);
-        var rng = new Random(42); // deterministic for reproducibility
+        decimal[] globalBestWeights = (decimal[])DefaultWeights.Clone();
+        decimal globalBestProfit = ComputeTotalProfit(rows, globalBestWeights);
 
-        for (int iter = 0; iter < OptimizationIterations; iter++)
+        for (int restart = 0; restart < NumRestarts; restart++)
         {
-            // Only optimize L2/tick indicators (0-5), not macro indicators (6-9)
-            int idx = rng.Next(6);
+            var weights = (decimal[])DefaultWeights.Clone();
+            decimal bestProfit = ComputeTotalProfit(rows, weights);
+            var rng = new Random((int)(DateTime.UtcNow.Ticks % int.MaxValue) + restart * 1000);
 
-            // Perturb by ±0.05
-            decimal perturbation = (rng.NextDouble() > 0.5 ? 0.05m : -0.05m);
-            decimal original = weights[idx];
-            weights[idx] = Math.Clamp(weights[idx] + perturbation, -0.50m, 0.50m);
-
-            // Normalize weights so absolute values sum to ~1.0
-            NormalizeWeights(weights);
-
-            decimal newProfit = ComputeTotalProfit(rows, weights);
-
-            if (newProfit > bestProfit)
+            for (int iter = 0; iter < IterationsPerRestart; iter++)
             {
-                bestProfit = newProfit;
-            }
-            else
-            {
-                // Revert
-                weights[idx] = original;
+                // Only optimize L2/tick indicators (0-5), not macro indicators (6-9)
+                int idx = rng.Next(6);
+
+                // Perturb by ±0.05
+                decimal perturbation = (rng.NextDouble() > 0.5 ? 0.05m : -0.05m);
+                decimal original = weights[idx];
+                weights[idx] = Math.Clamp(weights[idx] + perturbation, -0.50m, 0.50m);
+
+                // Normalize weights so absolute values sum to ~1.0
                 NormalizeWeights(weights);
+
+                decimal newProfit = ComputeTotalProfit(rows, weights);
+
+                if (newProfit > bestProfit)
+                {
+                    bestProfit = newProfit;
+                }
+                else
+                {
+                    // Revert
+                    weights[idx] = original;
+                    NormalizeWeights(weights);
+                }
+            }
+
+            // Track the best result across all restarts
+            if (bestProfit > globalBestProfit)
+            {
+                globalBestProfit = bestProfit;
+                globalBestWeights = (decimal[])weights.Clone();
             }
         }
 
-        return weights;
+        return globalBestWeights;
     }
 
     /// <summary>
@@ -501,6 +556,38 @@ public class NightlyLocalTrainer
     }
 
     /// <summary>
+    /// Multi-horizon weighted outcome — approximates actual exit time distribution.
+    /// Weights: 20% 5-min + 40% 15-min + 40% 30-min when all available,
+    /// graceful fallback when fewer horizons exist.
+    /// </summary>
+    private static decimal? ComputeOutcomePrice(TrainingRow row)
+    {
+        if (row.PriceAfter5Min.HasValue && row.PriceAfter15Min.HasValue && row.PriceAfter30Min.HasValue)
+        {
+            return row.PriceAfter5Min.Value * 0.20m
+                 + row.PriceAfter15Min.Value * 0.40m
+                 + row.PriceAfter30Min.Value * 0.40m;
+        }
+        else if (row.PriceAfter5Min.HasValue && row.PriceAfter15Min.HasValue)
+        {
+            return row.PriceAfter5Min.Value * 0.30m
+                 + row.PriceAfter15Min.Value * 0.70m;
+        }
+        else if (row.PriceAfter5Min.HasValue)
+        {
+            return row.PriceAfter5Min.Value;
+        }
+        else if (row.PriceAfter15Min.HasValue)
+        {
+            return row.PriceAfter15Min.Value;
+        }
+        else
+        {
+            return row.PriceAfter30Min;
+        }
+    }
+
+    /// <summary>
     /// Simulate trading all rows with given weights, return total P&amp;L after fees.
     /// Only trades when |score| >= 0.30 (moderate threshold for optimization phase).
     /// Uses PriceAfter30Min (primary) with fallback chain 15Min/5Min for swing-style hold times.
@@ -519,8 +606,7 @@ public class NightlyLocalTrainer
 
         foreach (var row in rows)
         {
-            // Use 30-min outcome (swing hold time) with 15/5-min fallback
-            decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
+            decimal? outcomePrice = ComputeOutcomePrice(row);
             if (!outcomePrice.HasValue) continue;
 
             decimal score = ComputeWeightedScore(row, weights);
@@ -553,6 +639,40 @@ public class NightlyLocalTrainer
         return totalPnl;
     }
 
+    /// <summary>
+    /// Overload that accepts separate buy and sell thresholds for threshold validation.
+    /// </summary>
+    private static decimal ComputeTotalProfit(List<TrainingRow> rows, decimal[] weights,
+        decimal buyThreshold, decimal sellThreshold)
+    {
+        decimal totalPnl = 0;
+
+        foreach (var row in rows)
+        {
+            decimal? outcomePrice = ComputeOutcomePrice(row);
+            if (!outcomePrice.HasValue) continue;
+
+            decimal score = ComputeWeightedScore(row, weights);
+            bool wouldTrade = (row.SignalType == 1 && score >= buyThreshold)
+                           || (row.SignalType == 2 && score <= sellThreshold);
+
+            if (wouldTrade)
+            {
+                decimal spreadPct = row.Price > 0 ? row.Spread / row.Price : 0;
+                decimal fillProbability = spreadPct <= 0.001m ? 1.0m
+                    : spreadPct <= 0.003m ? 0.85m
+                    : 0.70m;
+
+                decimal priceDelta = outcomePrice.Value - row.Price;
+                decimal tradePnl = (row.SignalType == 1 ? priceDelta : -priceDelta) * SimulationShares;
+                decimal spreadCost = row.Spread * SimulationShares;
+                totalPnl += (tradePnl - spreadCost - CommissionPerTrade * 2) * fillProbability;
+            }
+        }
+
+        return totalPnl;
+    }
+
     #endregion
 
     #region Step 3: Optimal Score Thresholds
@@ -572,7 +692,7 @@ public class NightlyLocalTrainer
             int buyCount = 0;
             foreach (var row in buyTrades)
             {
-                decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
+                decimal? outcomePrice = ComputeOutcomePrice(row);
                 decimal score = ComputeWeightedScore(row, weights);
                 if (score >= threshold && outcomePrice.HasValue)
                 {
@@ -595,7 +715,7 @@ public class NightlyLocalTrainer
             int sellCount = 0;
             foreach (var row in sellTrades)
             {
-                decimal? outcomePrice = row.PriceAfter30Min ?? row.PriceAfter15Min ?? row.PriceAfter5Min;
+                decimal? outcomePrice = ComputeOutcomePrice(row);
                 decimal score = ComputeWeightedScore(row, weights);
                 if (score <= -threshold && outcomePrice.HasValue)
                 {
@@ -633,7 +753,7 @@ public class NightlyLocalTrainer
         for (int hour = 9; hour <= 15; hour++)
         {
             var hourRows = rows.Where(r => r.Hour == hour).ToList();
-            if (hourRows.Count < 5)
+            if (hourRows.Count < 10)
             {
                 config.HourlyAdjustments[hour] = new HourlyAdjustment
                 {
@@ -644,13 +764,19 @@ public class NightlyLocalTrainer
                 continue;
             }
 
-            int hourWins = hourRows.Count(r => r.IsWin);
-            decimal winRate = (decimal)hourWins / hourRows.Count;
+            var hourWinRows = hourRows.Where(r => r.IsWin).ToList();
+            var hourLossRows = hourRows.Where(r => !r.IsWin && r.PnlPer100Shares != 0).ToList();
+            decimal winRate = (decimal)hourWinRows.Count / hourRows.Count;
+
+            // Expected value gating: average win * P(win) - average loss * P(loss)
+            decimal avgWinPnl = hourWinRows.Any() ? hourWinRows.Average(r => r.PnlPer100Shares) : 0;
+            decimal avgLossPnl = hourLossRows.Any() ? hourLossRows.Average(r => Math.Abs(r.PnlPer100Shares)) : 0;
+            decimal expectedValue = avgWinPnl * winRate - avgLossPnl * (1m - winRate);
 
             var adj = new HourlyAdjustment
             {
                 WinRate = Math.Round(winRate, 4),
-                EnableTrading = winRate >= 0.45m, // Disable if win rate < 45%
+                EnableTrading = expectedValue > 0 && hourRows.Count >= 10,
             };
 
             if (winRate > 0.60m)
@@ -663,8 +789,8 @@ public class NightlyLocalTrainer
             config.HourlyAdjustments[hour] = adj;
 
             _logger.LogInformation(
-                "  {Ticker} hour {Hour}: {Count} samples, WinRate={WinRate:P1}, Multiplier={Mult:F1}, Enabled={Enabled}",
-                config.Ticker, hour, hourRows.Count, winRate, adj.ScoreMultiplier, adj.EnableTrading);
+                "  {Ticker} hour {Hour}: {Count} samples, WinRate={WinRate:P1}, EV=${EV:F2}, Multiplier={Mult:F1}, Enabled={Enabled}",
+                config.Ticker, hour, hourRows.Count, winRate, expectedValue, adj.ScoreMultiplier, adj.EnableTrading);
         }
     }
 
@@ -679,18 +805,28 @@ public class NightlyLocalTrainer
 
         if (buyRows.Count >= 10)
         {
-            decimal buyWinRate = (decimal)buyRows.Count(r => r.IsWin) / buyRows.Count;
-            config.EnableBuy = buyWinRate >= 0.48m;
-            _logger.LogInformation("  {Ticker} BUY: {Count} samples, WinRate={WinRate:P1}, Enabled={Enabled}",
-                config.Ticker, buyRows.Count, buyWinRate, config.EnableBuy);
+            var buyWins = buyRows.Where(r => r.IsWin).ToList();
+            var buyLosses = buyRows.Where(r => !r.IsWin && r.PnlPer100Shares != 0).ToList();
+            decimal buyWinRate = (decimal)buyWins.Count / buyRows.Count;
+            decimal avgBuyWinPnl = buyWins.Any() ? buyWins.Average(r => r.PnlPer100Shares) : 0;
+            decimal avgBuyLossPnl = buyLosses.Any() ? buyLosses.Average(r => Math.Abs(r.PnlPer100Shares)) : 0;
+            decimal buyEV = avgBuyWinPnl * buyWinRate - avgBuyLossPnl * (1m - buyWinRate);
+            config.EnableBuy = buyEV > 0 && buyRows.Count >= 10;
+            _logger.LogInformation("  {Ticker} BUY: {Count} samples, WinRate={WinRate:P1}, EV=${EV:F2}, Enabled={Enabled}",
+                config.Ticker, buyRows.Count, buyWinRate, buyEV, config.EnableBuy);
         }
 
         if (sellRows.Count >= 10)
         {
-            decimal sellWinRate = (decimal)sellRows.Count(r => r.IsWin) / sellRows.Count;
-            config.EnableSell = sellWinRate >= 0.48m;
-            _logger.LogInformation("  {Ticker} SELL: {Count} samples, WinRate={WinRate:P1}, Enabled={Enabled}",
-                config.Ticker, sellRows.Count, sellWinRate, config.EnableSell);
+            var sellWins = sellRows.Where(r => r.IsWin).ToList();
+            var sellLosses = sellRows.Where(r => !r.IsWin && r.PnlPer100Shares != 0).ToList();
+            decimal sellWinRate = (decimal)sellWins.Count / sellRows.Count;
+            decimal avgSellWinPnl = sellWins.Any() ? sellWins.Average(r => r.PnlPer100Shares) : 0;
+            decimal avgSellLossPnl = sellLosses.Any() ? sellLosses.Average(r => Math.Abs(r.PnlPer100Shares)) : 0;
+            decimal sellEV = avgSellWinPnl * sellWinRate - avgSellLossPnl * (1m - sellWinRate);
+            config.EnableSell = sellEV > 0 && sellRows.Count >= 10;
+            _logger.LogInformation("  {Ticker} SELL: {Count} samples, WinRate={WinRate:P1}, EV=${EV:F2}, Enabled={Enabled}",
+                config.Ticker, sellRows.Count, sellWinRate, sellEV, config.EnableSell);
         }
     }
 
