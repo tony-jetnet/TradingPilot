@@ -59,20 +59,36 @@ def load_channel_stats() -> tuple[list[float], list[float]]:
 
 
 class HeatmapDataset(Dataset):
-    """Dataset of rendered L2 heatmap images with UP/FLAT/DOWN labels."""
+    """Dataset of rendered L2 heatmap images with UP/FLAT/DOWN labels.
 
-    def __init__(self, images: np.ndarray, labels: np.ndarray, transform=None):
-        self.images = images    # (N, 224, 224, 3) uint8
-        self.labels = labels    # (N,) int64
+    Uses memory-mapped numpy files so the Dataset is lightweight and
+    picklable for multi-worker DataLoader on Windows (spawn pipes can't
+    handle multi-GB arrays).
+    """
+
+    def __init__(self, images_path: str, labels_path: str,
+                 indices: np.ndarray, transform=None):
+        self.images_path = images_path
+        self.labels_path = labels_path
+        self.indices = indices
         self.transform = transform
+        # mmap opened lazily per worker (not pickled across spawn)
+        self._images_mmap = None
+        self._labels_mmap = None
+
+    def _ensure_mmap(self):
+        if self._images_mmap is None:
+            self._images_mmap = np.load(self.images_path, mmap_mode='r')
+            self._labels_mmap = np.load(self.labels_path, mmap_mode='r')
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        img = self.images[idx]  # (224, 224, 3) uint8
+        self._ensure_mmap()
+        real_idx = self.indices[idx]
+        img = np.array(self._images_mmap[real_idx])  # copy from mmap
 
-        # Convert to PIL for torchvision transforms
         from PIL import Image
         img = Image.fromarray(img)
 
@@ -81,7 +97,8 @@ class HeatmapDataset(Dataset):
         else:
             img = transforms.ToTensor()(img)
 
-        return img, self.labels[idx]
+        label = int(self._labels_mmap[real_idx])
+        return img, label
 
 
 def build_model(num_classes: int = config.NUM_CLASSES, pretrained: bool = True) -> nn.Module:
@@ -147,11 +164,12 @@ def get_transforms(train: bool, mean: list[float], std: list[float]):
         ])
 
 
-def train_epoch(model, loader, criterion, optimizer, device, desc="Train"):
+def train_epoch(model, loader, criterion, optimizer, device, scaler=None, desc="Train"):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
+    use_amp = scaler is not None
 
     pbar = tqdm(loader, desc=desc)
     for images, labels in pbar:
@@ -159,14 +177,20 @@ def train_epoch(model, loader, criterion, optimizer, device, desc="Train"):
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
 
-        # Gradient clipping — prevents exploding gradients during fine-tuning
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item() * images.size(0)
         _, predicted = outputs.max(1)
@@ -179,7 +203,7 @@ def train_epoch(model, loader, criterion, optimizer, device, desc="Train"):
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, criterion, device, desc="Val"):
+def eval_epoch(model, loader, criterion, device, use_amp=False, desc="Val"):
     model.eval()
     total_loss = 0
     correct = 0
@@ -191,8 +215,9 @@ def eval_epoch(model, loader, criterion, device, desc="Val"):
         images = images.to(device)
         labels = labels.to(device)
 
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
 
         total_loss += loss.item() * images.size(0)
         _, predicted = outputs.max(1)
@@ -244,23 +269,26 @@ def main():
     # ── Load channel statistics (from actual heatmaps, not ImageNet) ──
     channel_mean, channel_std = load_channel_stats()
 
-    # ── Load data ─────────────────────────────────────────────────────
-    print("Loading data...")
-    images = np.load(os.path.join(config.DATA_DIR, "images.npy"))
-    labels = np.load(os.path.join(config.DATA_DIR, "labels.npy"))
-    print(f"Loaded {len(images)} samples")
+    # ── Load data (mmap — avoids loading full array into RAM) ────────
+    images_path = os.path.join(config.DATA_DIR, "images.npy")
+    labels_path = os.path.join(config.DATA_DIR, "labels.npy")
+    print("Loading data (memory-mapped)...")
+    labels = np.load(labels_path, mmap_mode='r')
+    n_samples = len(labels)
+    print(f"Found {n_samples} samples")
 
-    # Print class distribution
-    unique, counts = np.unique(labels, return_counts=True)
+    # Print class distribution (read labels into RAM for stats only)
+    labels_arr = np.array(labels)
+    unique, counts = np.unique(labels_arr, return_counts=True)
     for u, c in zip(unique, counts):
         name = ["DOWN", "FLAT", "UP"][u]
-        print(f"  {name}: {c} ({100*c/len(labels):.1f}%)")
+        print(f"  {name}: {c} ({100*c/len(labels_arr):.1f}%)")
 
     # ── Split: train / val / test ─────────────────────────────────────
-    idx = np.arange(len(labels))
+    idx = np.arange(n_samples)
     # Time-ordered split: don't shuffle to avoid lookahead bias
-    n_train = int(len(idx) * config.TRAIN_SPLIT)
-    n_val = int(len(idx) * config.VAL_SPLIT)
+    n_train = int(n_samples * config.TRAIN_SPLIT)
+    n_val = int(n_samples * config.VAL_SPLIT)
 
     train_idx = idx[:n_train]
     val_idx = idx[n_train:n_train + n_val]
@@ -269,20 +297,20 @@ def main():
     print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
 
     # ── Class weights for imbalanced data ─────────────────────────────
-    class_weights = compute_class_weight("balanced", classes=np.array([0, 1, 2]), y=labels[train_idx])
+    class_weights = compute_class_weight("balanced", classes=np.array([0, 1, 2]), y=labels_arr[train_idx])
     class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
     print(f"Class weights: DOWN={class_weights[0]:.2f} FLAT={class_weights[1]:.2f} UP={class_weights[2]:.2f}")
 
-    # ── Datasets & loaders ────────────────────────────────────────────
-    train_ds = HeatmapDataset(images[train_idx], labels[train_idx],
+    # ── Datasets & loaders (mmap-backed, lightweight for Windows spawn) ─
+    train_ds = HeatmapDataset(images_path, labels_path, train_idx,
                               transform=get_transforms(train=True, mean=channel_mean, std=channel_std))
-    val_ds = HeatmapDataset(images[val_idx], labels[val_idx],
+    val_ds = HeatmapDataset(images_path, labels_path, val_idx,
                             transform=get_transforms(train=False, mean=channel_mean, std=channel_std))
-    test_ds = HeatmapDataset(images[test_idx], labels[test_idx],
+    test_ds = HeatmapDataset(images_path, labels_path, test_idx,
                              transform=get_transforms(train=False, mean=channel_mean, std=channel_std))
 
     # Weighted sampler to handle class imbalance
-    sample_weights = class_weights[labels[train_idx]].cpu().numpy()
+    sample_weights = class_weights[labels_arr[train_idx]].cpu().numpy()
     sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
 
     train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, sampler=sampler,
@@ -305,6 +333,12 @@ def main():
     os.makedirs(config.MODEL_DIR, exist_ok=True)
     best_val_acc = 0.0
 
+    # Mixed precision — ~2x speedup on CUDA with minimal accuracy impact
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    if use_amp:
+        print("Mixed precision (AMP) enabled")
+
     # ── Phase 1: Train head only ──────────────────────────────────────
     print("\n" + "=" * 60)
     print("PHASE 1: Frozen backbone — training classification head")
@@ -324,8 +358,8 @@ def main():
     for epoch in range(config.EPOCHS_HEAD):
         print(f"\nEpoch {epoch+1}/{config.EPOCHS_HEAD}")
         t0 = time.time()
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = eval_epoch(model, val_loader, criterion, device)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler=scaler)
+        val_loss, val_acc = eval_epoch(model, val_loader, criterion, device, use_amp=use_amp)
 
         elapsed = time.time() - t0
         print(f"  Train loss: {train_loss:.4f}, acc: {100*train_acc:.1f}%")
@@ -378,11 +412,20 @@ def main():
                 labels_batch = labels_batch.to(device)
 
                 optimizer.zero_grad()
-                outputs = model(images_batch)
-                loss = criterion(outputs, labels_batch)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    outputs = model(images_batch)
+                    loss = criterion(outputs, labels_batch)
+
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
                 scheduler.step()  # Per-step update for warmup
 
                 total_loss += loss.item() * images_batch.size(0)
@@ -395,7 +438,7 @@ def main():
             train_loss = total_loss / total
             train_acc = correct / total
 
-            val_loss, val_acc = eval_epoch(model, val_loader, criterion, device)
+            val_loss, val_acc = eval_epoch(model, val_loader, criterion, device, use_amp=use_amp)
 
             elapsed = time.time() - t0
             print(f"  Train loss: {train_loss:.4f}, acc: {100*train_acc:.1f}%")
@@ -419,7 +462,7 @@ def main():
     print("=" * 60)
 
     model.load_state_dict(torch.load(os.path.join(config.MODEL_DIR, "best.pt"), map_location=device))
-    test_loss, test_acc = eval_epoch(model, test_loader, criterion, device, desc="Test")
+    test_loss, test_acc = eval_epoch(model, test_loader, criterion, device, use_amp=use_amp, desc="Test")
     print(f"\nTest accuracy: {100*test_acc:.1f}%")
     print(f"Best val accuracy: {100*best_val_acc:.1f}%")
 

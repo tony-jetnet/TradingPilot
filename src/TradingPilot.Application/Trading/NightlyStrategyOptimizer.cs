@@ -227,6 +227,13 @@ public class NightlyStrategyOptimizer
             ) l2 ON true
             WHERE ts.""SymbolId"" = @p0 AND ts.""Timestamp"" > @p1 AND ts.""PriceAfter1Min"" IS NOT NULL
               AND (ts.""Reason"" IS NULL OR ts.""Reason"" NOT LIKE '%BACKFILL%')
+              AND (
+                  EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') > 9
+                  OR (EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') = 9
+                      AND EXTRACT(MINUTE FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') >= 30)
+              )
+              AND EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') < 16
+              AND NOT (ts.""ObiSmoothed"" = 0 AND ts.""Wobi"" = 0 AND ts.""TickMomentum"" = 0)
             ORDER BY ts.""Timestamp"" DESC
             LIMIT 3000";
 

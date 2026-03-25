@@ -183,6 +183,13 @@ public class NightlyLocalTrainer
             WHERE ts.""Timestamp"" > {{0}}
             AND ABS(ts.""Score"") >= 0.20
             AND (ts.""Reason"" IS NULL OR ts.""Reason"" NOT LIKE '%BACKFILL%')
+            AND (
+                EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') > 9
+                OR (EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') = 9
+                    AND EXTRACT(MINUTE FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') >= 30)
+            )
+            AND EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York') < 16
+            AND NOT (ts.""ObiSmoothed"" = 0 AND ts.""Wobi"" = 0 AND ts.""TickMomentum"" = 0)
             ORDER BY ts.""Timestamp""";
 
         var rows = new List<TrainingRow>();
@@ -277,8 +284,8 @@ public class NightlyLocalTrainer
             rows.Add(row);
         }
 
-        // Filter to only rows with outcome data (prefer 30-min, fall back to 15/5/1-min)
-        return rows.Where(r => r.PriceAfter30Min.HasValue || r.PriceAfter15Min.HasValue || r.PriceAfter5Min.HasValue || r.PriceAfter1Min.HasValue).ToList();
+        // Filter to only rows with at least a 5-min outcome (rows with only 1-min may cross data gaps)
+        return rows.Where(r => r.PriceAfter5Min.HasValue).ToList();
     }
 
     #endregion

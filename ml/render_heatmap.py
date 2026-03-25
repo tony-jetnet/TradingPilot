@@ -19,6 +19,7 @@ import csv
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from PIL import Image
@@ -63,6 +64,30 @@ def load_csv(path: str) -> list[Snapshot]:
                 ask_sizes=az,
             ))
     return snapshots
+
+
+def filter_market_hours(snapshots: list[Snapshot]) -> list[Snapshot]:
+    """Keep only snapshots during regular market hours (9:30 AM - 4:00 PM ET)."""
+    et = ZoneInfo("America/New_York")
+    filtered = []
+    for snap in snapshots:
+        if snap.timestamp.tzinfo:
+            t = snap.timestamp.astimezone(et)
+        else:
+            # Naive datetimes from CSV are assumed UTC
+            t = snap.timestamp.replace(tzinfo=ZoneInfo("UTC")).astimezone(et)
+        if (t.hour > 9 or (t.hour == 9 and t.minute >= 30)) and t.hour < 16:
+            filtered.append(snap)
+    return filtered
+
+
+def has_gap(snapshots: list[Snapshot], max_gap_seconds: float = 5.0) -> bool:
+    """Check if any consecutive pair of snapshots has a time gap exceeding the threshold."""
+    for i in range(1, len(snapshots)):
+        delta = (snapshots[i].timestamp - snapshots[i - 1].timestamp).total_seconds()
+        if delta > max_gap_seconds:
+            return True
+    return False
 
 
 def render_heatmap(window: list[Snapshot]) -> np.ndarray:
@@ -194,11 +219,30 @@ def generate_samples(
     """
     Slide a window across snapshots and generate (image, label) pairs.
 
+    Applies gap detection and market-hours filtering to ensure windows
+    represent continuous, real-time market data.
+
     Returns: (images, labels) lists
     """
+    # Filter to market hours only (9:30 AM - 4:00 PM ET)
+    original_count = len(snapshots)
+    snapshots = filter_market_hours(snapshots)
+    filtered_out = original_count - len(snapshots)
+    if filtered_out > 0:
+        print(f"  {symbol}: filtered {filtered_out} out-of-market-hours snapshots "
+              f"({len(snapshots)} remaining)")
+
     images = []
     labels = []
     preview_count = 0
+
+    # Skip stats
+    skip_window_gap = 0
+    skip_future_gap = 0
+    skip_window_span = 0
+    skip_future_span = 0
+    skip_no_label = 0
+    used = 0
 
     # Estimate how many future snapshots we need for the horizon
     # Snapshots are ~1s apart, horizon is config.HORIZON_SECONDS
@@ -216,15 +260,43 @@ def generate_samples(
         end = start + config.WINDOW_SNAPSHOTS
         window = snapshots[start:end]
 
+        # --- Gap detection for main window ---
+        if has_gap(window):
+            skip_window_gap += 1
+            continue
+
+        # --- Time-span check for main window ---
+        # 300 snapshots at ~1s each = ~300s. Allow 150-600s range.
+        window_span = (window[-1].timestamp - window[0].timestamp).total_seconds()
+        if window_span < 150 or window_span > 600:
+            skip_window_span += 1
+            continue
+
         # Future window for labeling
         future = snapshots[end:end + future_needed]
+
+        # --- Gap detection for future window ---
+        if has_gap(future):
+            skip_future_gap += 1
+            continue
+
+        # --- Time-span check for future window ---
+        # Future should span approximately HORIZON_SECONDS (allow +/-50%)
+        actual_future_span = (future[-1].timestamp - future[0].timestamp).total_seconds()
+        expected_span = config.HORIZON_SECONDS
+        if actual_future_span < expected_span * 0.5 or actual_future_span > expected_span * 1.5:
+            skip_future_span += 1
+            continue
+
         label = compute_label(window, future)
         if label is None:
+            skip_no_label += 1
             continue
 
         img = render_heatmap(window)
         images.append(img)
         labels.append(label)
+        used += 1
 
         # Save preview images for visual inspection
         if save_previews > 0 and preview_count < save_previews:
@@ -234,6 +306,20 @@ def generate_samples(
             preview_path = os.path.join(preview_dir, f"{symbol}_{start}_{label_name}.png")
             Image.fromarray(img).save(preview_path)
             preview_count += 1
+
+    # Print skip statistics
+    total_considered = used + skip_window_gap + skip_future_gap + skip_window_span + skip_future_span + skip_no_label
+    print(f"  {symbol} gap/span stats: {used} used, {total_considered} considered")
+    if skip_window_gap:
+        print(f"    skipped {skip_window_gap} windows with gaps in main window")
+    if skip_future_gap:
+        print(f"    skipped {skip_future_gap} windows with gaps in future window")
+    if skip_window_span:
+        print(f"    skipped {skip_window_span} windows with abnormal main window time span")
+    if skip_future_span:
+        print(f"    skipped {skip_future_span} windows with abnormal future window time span")
+    if skip_no_label:
+        print(f"    skipped {skip_no_label} windows with no valid label")
 
     return images, labels
 

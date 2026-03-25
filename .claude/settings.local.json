@@ -106,7 +106,8 @@
       "Bash(sort -t'$' -k2 -n)",
       "Bash(dotnet tool:*)",
       "Bash(dotnet ilspycmd:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(PGPASSWORD=\"JetNet@Core0\" psql -h localhost -p 5432 -U jetnet -d TradingPilot -c \":*)"
     ]
   }
 }

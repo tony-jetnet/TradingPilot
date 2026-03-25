@@ -36,7 +36,7 @@ ABP Framework 10.1 app with DDD layered architecture. .NET 10.0, PostgreSQL, Red
 Real-time L2 order book data flows through a two-stage signal pipeline in `MarketMicrostructureAnalyzer.AnalyzeSnapshot()`:
 
 1. **Stage 1 — AI Rule Evaluation**: `StrategyRuleEvaluator` checks conditional rules from `strategy_rules.json` (generated nightly by Bedrock Sonnet 4.6). If a rule matches, apply contextual filters (trend, VWAP, volume, RSI) to the rule's confidence score. Reject if filtered score drops below 0.20. Also checks hourly enablement from model config and live rule performance tracking.
-2. **Stage 2 — Weighted Scoring Fallback**: If no rule matches, compute composite score using **6 L2/tick indicators** (OBI, WOBI, PressureRoc, Spread, LargeOrder, TickMomentum). Weights from `model_config.json` (trained nightly). Then apply contextual filters (trend, VWAP, volume, RSI) as post-scoring multipliers.
+2. **Stage 2 — Swin + Weighted Scoring Blend**: If no rule matches, always compute the weighted score from **6 L2/tick indicators** (OBI, WOBI, PressureRoc, Spread, LargeOrder, TickMomentum). If the Swin vision model (ONNX) is confident (≥0.40), **blend** Swin score with weighted score: `composite = swinScore × confidence + weightedScore × (1-confidence)`. If Swin unavailable/low-confidence, use weighted score alone. Then apply contextual filters (trend, VWAP, volume, RSI) as post-scoring multipliers. This prevents Swin from overriding indicator disagreement.
 
 **No double penalization**: Trend, VWAP, Volume, and RSI are handled ONLY by contextual filters (weight=0 in the scoring). They are NOT included as weighted indicators in the composite score. This prevents the same signal from being penalized twice.
 
@@ -103,6 +103,7 @@ The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars befo
 - **MaxDailyTrades**: Capped at 5 per symbol in rule output.
 - **Local backtesting**: After Bedrock generates rules, each rule is backtested on the newest 25% of data. Only rules with ≥5 matches AND positive P&L survive.
 - **Backfilled signals excluded** from the CSV sent to Bedrock.
+- **Data quality filters**: Market hours only (9:30 AM - 4:00 PM ET). Cold-cache signals excluded (OBI=WOBI=TickMomentum=0).
 
 ### Nightly Trainer Details (NightlyLocalTrainer)
 
@@ -112,7 +113,7 @@ The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars befo
 - **Overfit guard (strengthened)**: Falls back to defaults if: (a) optimized weights lose on validation AND defaults win, OR (b) defaults outperform by 2×+, OR (c) validation P&L < 15% of training P&L (train/val divergence)
 - **Threshold validation**: Optimized thresholds are validated on held-out set; reverts to defaults if they lose on validation
 - **Hour/direction gating**: Uses expected value (EV = avgWin×winRate - avgLoss×lossRate) instead of raw win rate. Minimum 10 samples per hour.
-- **Training data filters**: Only signals with |Score| ≥ 0.20 (tradeable signals). Excludes backfilled bar-derived signals (`Reason NOT LIKE '%BACKFILL%'`).
+- **Training data filters**: Only signals with |Score| ≥ 0.20 (tradeable signals). Excludes backfilled bar-derived signals (`Reason NOT LIKE '%BACKFILL%'`). Market hours only (9:30 AM - 4:00 PM ET). Excludes cold-cache signals (OBI=0 AND WOBI=0 AND TickMomentum=0). Requires at least PriceAfter5Min (rows with only 1-min outcome are excluded — they fell into data gaps).
 - **Weights 6-9 (Trend, VWAP, Volume, RSI)**: Fixed at 0 — contextual filters handle these. Optimizer only perturbs weights 0-5.
 
 ### Position Management (PositionMonitor)
@@ -221,6 +222,44 @@ Background jobs use `[DisableConcurrentExecution(seconds)]` to prevent overlappi
 | Rate limit | 300 seconds | Balance between whipsaw prevention and re-entry |
 | Daily P&L stops | -$500 loss / +$500 profit → stop for day | Outcome-based, not count-based |
 | Backfills in training | Excluded | Bar-derived scores corrupt L2 weight optimization |
+
+## Swin Vision Model (ml/ directory)
+
+### Overview
+
+Swin-Tiny (28M params) fine-tuned on L2 order book heatmaps (224×224 RGB). Each image encodes ~300 consecutive L2 snapshots: R=ask sizes, B=bid sizes, G=midprice+spread. Classifies as UP/FLAT/DOWN (5-min horizon, ±30 bps threshold). Integrated into Stage 2 scoring via ONNX inference in the Blazor app.
+
+### Pipeline (`retrain.py` — nightly after market close)
+
+```
+export_data.py --days 20  →  render_heatmap.py  →  train.py  →  export_onnx.py
+(L2 from DB)               (numpy heatmaps)      (fine-tune)   (swin_trading.onnx)
+```
+
+### Key Design Decisions
+
+- **20-day training window**: DB retains L2 snapshots for 20 days. This is the optimal window — older data reflects stale market regimes (different volatility, spreads, market makers). No archiving needed; each nightly export pulls fresh 20-day window directly from DB.
+- **No archive/merge**: Previously archived and merged daily exports, causing massive data duplication (each 20-day export overlaps 19 days with the previous). Removed — the 20-day export IS the training set.
+- **~28K samples is sufficient**: Fine-tuning (not training from scratch) — pretrained ImageNet features transfer to heatmaps. Only top 2 stages unfrozen (~7-8M params). More data adds stale regime noise.
+- **Memory-mapped Dataset**: `images.npy` loaded via `np.load(mmap_mode='r')`. Dataset stores file path + index array (not the array itself). Each DataLoader worker opens its own mmap handle lazily. This avoids Windows `spawn` pipe size limits that crash at ~2 GB+.
+- **Mixed precision (AMP)**: `torch.amp.autocast` + `GradScaler` for ~2x GPU speedup with negligible accuracy impact.
+
+### Training Config (ml/config.py)
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| STRIDE_SNAPSHOTS | 100 | ~67% overlap between windows (was 30 = 90% overlap, too correlated) |
+| UP/DOWN_THRESHOLD | ±0.003 (30 bps) | Must exceed spread + slippage to be profitable |
+| BATCH_SIZE | 64 | |
+| LEARNING_RATE | 1e-4 | Phase 1 and Phase 2 base LR |
+| EPOCHS_HEAD | 5 | Phase 1: frozen backbone |
+| EPOCHS_FINETUNE | 25 | Phase 2: top 2 stages unfrozen, warmup + cosine decay |
+| EARLY_STOPPING_PATIENCE | 10 | |
+| SEED | 42 | Reproducibility |
+
+### Class Imbalance
+
+Typical distribution: ~85% FLAT / ~7.5% DOWN / ~7.5% UP. Handled by `WeightedRandomSampler` + `CrossEntropyLoss(weight=class_weights)`. The real bottleneck is minority class count (~2K UP/DOWN), not total samples.
 
 ## Reference
 

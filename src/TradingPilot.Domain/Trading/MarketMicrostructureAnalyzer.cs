@@ -498,56 +498,67 @@ public class MarketMicrostructureAnalyzer
         decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
         decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
 
-        // Try Swin model first — it learns directly from raw L2 heatmaps
+        // Always compute weighted scoring (needed even when Swin fires, for blending)
+        decimal weightedScore;
+        if (tickerConfig != null)
+        {
+            weightedScore =
+                obiScore * tickerConfig.WeightObi +
+                wobiScore * tickerConfig.WeightWobi +
+                pressureRocScore * tickerConfig.WeightPressureRoc +
+                spreadScore * tickerConfig.WeightSpread +
+                largeOrderScore * tickerConfig.WeightLargeOrder +
+                tickMomentumScore * tickerConfig.WeightTickMomentum +
+                trendAlignmentScore * tickerConfig.WeightTrend +
+                vwapPositionScore * tickerConfig.WeightVwap +
+                volumeConfirmationScore * tickerConfig.WeightVolume +
+                rsiFilterScore * tickerConfig.WeightRsi;
+        }
+        else
+        {
+            weightedScore =
+                obiScore * WeightObi +
+                wobiScore * WeightWobi +
+                pressureRocScore * WeightPressureRoc +
+                spreadScore * WeightSpread +
+                largeOrderScore * WeightLargeOrder +
+                tickMomentumScore * WeightTickMomentum +
+                trendAlignmentScore * WeightTrendAlignment +
+                vwapPositionScore * WeightVwapPosition +
+                volumeConfirmationScore * WeightVolumeConfirmation +
+                rsiFilterScore * WeightRsiFilter;
+        }
+
+        // Try Swin model — blend with weighted scoring instead of overriding
         var swinSnapshots = _l2Cache.GetSnapshots(tickerId, 300);
         var swinPrediction = _swinPredictor.Predict(swinSnapshots);
 
         if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
         {
-            // Use Swin model output as composite score
-            compositeScore = (decimal)swinPrediction.Score; // [-1, +1]
+            // Blend: Swin weight = its confidence, indicator weight = remainder
+            // At 0.40 conf: 40% Swin + 60% indicators (indicators dominate)
+            // At 0.70 conf: 70% Swin + 30% indicators (Swin leads, indicators moderate)
+            decimal swinWeight = (decimal)swinPrediction.Confidence;
+            decimal indicatorWeight = 1m - swinWeight;
+            decimal swinScore = (decimal)swinPrediction.Score;
+
+            compositeScore = swinScore * swinWeight + weightedScore * indicatorWeight;
             usedSwin = true;
-            // Cache for ComputeCurrentScore to reuse (avoids duplicate ONNX inference)
+
+            // Cache the blended score for ComputeCurrentScore
             _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
 
             _logger.LogDebug(
-                "Swin prediction for {Ticker}: {Class} score={Score:F3} " +
+                "Swin BLEND for {Ticker}: swin={SwinScore:F3}×{SwinW:F2} + weighted={WeightedScore:F3}×{IndW:F2} = {Blend:F3} " +
                 "conf={Conf:F3} P(up)={Up:F3} P(down)={Down:F3}",
-                ticker, swinPrediction.PredictedClass, swinPrediction.Score,
+                ticker, swinScore, swinWeight, weightedScore, indicatorWeight, compositeScore,
                 swinPrediction.Confidence, swinPrediction.UpProbability,
                 swinPrediction.DownProbability);
         }
         else
         {
-            // Fallback to weighted scoring (original Stage 2 logic)
-            if (tickerConfig != null)
-            {
-                compositeScore =
-                    obiScore * tickerConfig.WeightObi +
-                    wobiScore * tickerConfig.WeightWobi +
-                    pressureRocScore * tickerConfig.WeightPressureRoc +
-                    spreadScore * tickerConfig.WeightSpread +
-                    largeOrderScore * tickerConfig.WeightLargeOrder +
-                    tickMomentumScore * tickerConfig.WeightTickMomentum +
-                    trendAlignmentScore * tickerConfig.WeightTrend +
-                    vwapPositionScore * tickerConfig.WeightVwap +
-                    volumeConfirmationScore * tickerConfig.WeightVolume +
-                    rsiFilterScore * tickerConfig.WeightRsi;
-            }
-            else
-            {
-                compositeScore =
-                    obiScore * WeightObi +
-                    wobiScore * WeightWobi +
-                    pressureRocScore * WeightPressureRoc +
-                    spreadScore * WeightSpread +
-                    largeOrderScore * WeightLargeOrder +
-                    tickMomentumScore * WeightTickMomentum +
-                    trendAlignmentScore * WeightTrendAlignment +
-                    vwapPositionScore * WeightVwapPosition +
-                    volumeConfirmationScore * WeightVolumeConfirmation +
-                    rsiFilterScore * WeightRsiFilter;
-            }
+            // No Swin available — use weighted scoring only
+            compositeScore = weightedScore;
         }
 
         // Apply contextual filters to ALL signals (weighted AND Swin).
@@ -753,23 +764,66 @@ public class MarketMicrostructureAnalyzer
         decimal compositeScore = 0;
         var barIndicators = _barCache.GetIndicators(tickerId);
 
-        // Try Swin model first — use cached score to avoid expensive ONNX inference every 5s
+        // Always compute weighted scoring for blending
         bool usedSwin = false;
+        decimal obiScore = ComputeSmoothedObi(state);
+        decimal wobiScore = ComputeWeightedObi(snapshot);
+        decimal pressureRocScore = ComputePressureRoc(state);
+        decimal spreadScore = ComputeSpreadSignal(state, snapshot);
+        decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
+        decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
+        decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
+        decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
+        decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
+        decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
+
+        decimal weightedScore;
+        if (tickerConfig != null)
+        {
+            weightedScore =
+                obiScore * tickerConfig.WeightObi +
+                wobiScore * tickerConfig.WeightWobi +
+                pressureRocScore * tickerConfig.WeightPressureRoc +
+                spreadScore * tickerConfig.WeightSpread +
+                largeOrderScore * tickerConfig.WeightLargeOrder +
+                tickMomentumScore * tickerConfig.WeightTickMomentum +
+                trendAlignmentScore * tickerConfig.WeightTrend +
+                vwapPositionScore * tickerConfig.WeightVwap +
+                volumeConfirmationScore * tickerConfig.WeightVolume +
+                rsiFilterScore * tickerConfig.WeightRsi;
+        }
+        else
+        {
+            weightedScore =
+                obiScore * WeightObi +
+                wobiScore * WeightWobi +
+                pressureRocScore * WeightPressureRoc +
+                spreadScore * WeightSpread +
+                largeOrderScore * WeightLargeOrder +
+                tickMomentumScore * WeightTickMomentum +
+                trendAlignmentScore * WeightTrendAlignment +
+                vwapPositionScore * WeightVwapPosition +
+                volumeConfirmationScore * WeightVolumeConfirmation +
+                rsiFilterScore * WeightRsiFilter;
+        }
+
+        // Try Swin model — blend with weighted scoring (use cache to avoid ONNX inference every 5s)
         if (_swinScoreCache.TryGetValue(tickerId, out var cached)
             && (DateTime.UtcNow - cached.CachedAt).TotalSeconds < SwinScoreCacheTtlSeconds)
         {
             compositeScore = cached.Score;
             usedSwin = true;
         }
-
-        if (!usedSwin)
+        else
         {
             var swinSnapshots = _l2Cache.GetSnapshots(tickerId, 300);
             var swinPrediction = _swinPredictor.Predict(swinSnapshots);
 
             if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
             {
-                compositeScore = (decimal)swinPrediction.Score;
+                decimal swinWeight = (decimal)swinPrediction.Confidence;
+                decimal indicatorWeight = 1m - swinWeight;
+                compositeScore = (decimal)swinPrediction.Score * swinWeight + weightedScore * indicatorWeight;
                 _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
                 usedSwin = true;
             }
@@ -777,46 +831,7 @@ public class MarketMicrostructureAnalyzer
 
         if (!usedSwin)
         {
-            // Fallback to weighted scoring
-            decimal obiScore = ComputeSmoothedObi(state);
-            decimal wobiScore = ComputeWeightedObi(snapshot);
-            decimal pressureRocScore = ComputePressureRoc(state);
-            decimal spreadScore = ComputeSpreadSignal(state, snapshot);
-            decimal largeOrderScore = ComputeLargeOrderSignal(snapshot, state);
-            decimal tickMomentumScore = ComputeTickMomentumScore(tickerId);
-            decimal trendAlignmentScore = ComputeTrendAlignmentScore(barIndicators);
-            decimal vwapPositionScore = ComputeVwapPositionScore(barIndicators, snapshot.MidPrice);
-            decimal volumeConfirmationScore = ComputeVolumeConfirmationScore(barIndicators);
-            decimal rsiFilterScore = ComputeRsiFilterScore(barIndicators);
-
-            if (tickerConfig != null)
-            {
-                compositeScore =
-                    obiScore * tickerConfig.WeightObi +
-                    wobiScore * tickerConfig.WeightWobi +
-                    pressureRocScore * tickerConfig.WeightPressureRoc +
-                    spreadScore * tickerConfig.WeightSpread +
-                    largeOrderScore * tickerConfig.WeightLargeOrder +
-                    tickMomentumScore * tickerConfig.WeightTickMomentum +
-                    trendAlignmentScore * tickerConfig.WeightTrend +
-                    vwapPositionScore * tickerConfig.WeightVwap +
-                    volumeConfirmationScore * tickerConfig.WeightVolume +
-                    rsiFilterScore * tickerConfig.WeightRsi;
-            }
-            else
-            {
-                compositeScore =
-                    obiScore * WeightObi +
-                    wobiScore * WeightWobi +
-                    pressureRocScore * WeightPressureRoc +
-                    spreadScore * WeightSpread +
-                    largeOrderScore * WeightLargeOrder +
-                    tickMomentumScore * WeightTickMomentum +
-                    trendAlignmentScore * WeightTrendAlignment +
-                    vwapPositionScore * WeightVwapPosition +
-                    volumeConfirmationScore * WeightVolumeConfirmation +
-                    rsiFilterScore * WeightRsiFilter;
-            }
+            compositeScore = weightedScore;
         }
 
         // Apply contextual filters to ALL signals (weighted AND Swin)
