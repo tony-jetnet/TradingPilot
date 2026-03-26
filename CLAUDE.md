@@ -98,12 +98,13 @@ The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars befo
 
 ### Bedrock AI Rule Generation (NightlyStrategyOptimizer)
 
+- **Rule preservation**: Before calling Bedrock, `EvaluateExistingRulesAsync()` evaluates current rules against last 5 days of live signal data. Rules with ≥5 matches AND positive P&L (using PriceAfter5Min, spread-adjusted) survive. Surviving rules are kept as-is; Bedrock only fills vacated slots (max 5 rules/symbol total). Surviving rules are passed to Bedrock as context so it generates complementary rules, not duplicates.
 - **HoldSeconds**: Prompt instructs 60-600s (1-10 min, matching L2 signal decay). Validator enforces same range.
-- **Per-row outcome columns removed** from Bedrock CSV to prevent look-ahead bias. Aggregate performance summary provided instead.
 - **MaxDailyTrades**: Capped at 5 per symbol in rule output.
 - **Local backtesting**: After Bedrock generates rules, each rule is backtested on the newest 25% of data. Only rules with ≥5 matches AND positive P&L survive.
 - **Backfilled signals excluded** from the CSV sent to Bedrock.
 - **Data quality filters**: Market hours only (9:30 AM - 4:00 PM ET). Cold-cache signals excluded (OBI=WOBI=TickMomentum=0).
+- **Skip guard**: 2-hour cooldown (prevents double-runs on manual trigger), not daily skip.
 
 ### Nightly Trainer Details (NightlyLocalTrainer)
 
@@ -115,6 +116,7 @@ The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars befo
 - **Hour/direction gating**: Uses expected value (EV = avgWin×winRate - avgLoss×lossRate) instead of raw win rate. Minimum 10 samples per hour.
 - **Training data filters**: Only signals with |Score| ≥ 0.20 (tradeable signals). Excludes backfilled bar-derived signals (`Reason NOT LIKE '%BACKFILL%'`). Market hours only (9:30 AM - 4:00 PM ET). Excludes cold-cache signals (OBI=0 AND WOBI=0 AND TickMomentum=0). Requires at least PriceAfter5Min (rows with only 1-min outcome are excluded — they fell into data gaps).
 - **Weights 6-9 (Trend, VWAP, Volume, RSI)**: Fixed at 0 — contextual filters handle these. Optimizer only perturbs weights 0-5.
+- **Hold time optimization (2026-03-25)**: Tests candidates [300, 600, 900, 1200, 1800] seconds per ticker. For each, computes P&L using the closest price outcome columns (PriceAfter5/15/30Min with interpolation). Walk-forward validated: falls back to 1200s default if best candidate loses on validation. Default changed from 3600s to 1200s (20 min) to match the ~19 min weighted training horizon (`0.20×5min + 0.40×15min + 0.40×30min`). The old 3600s default caused all Stage 2 trades to exit via TIME+WEAK because L2 scores naturally decay over 60 min.
 
 ### Position Management (PositionMonitor)
 
@@ -126,16 +128,29 @@ The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars befo
 - Tiered limit orders: strong signals (score ≥ 0.40) use midprice; moderate signals use bid+10% spread offset
 - Entry order timeout: 90 seconds (stale L2 signals expire quickly)
 - Rule entry threshold: 0.35 (same as Stage 2, since raw confidence already passed 0.55 gate in StrategyRuleEvaluator)
+- **Opposing signal exit**: If we hold a position and get a strong opposing signal (|score| ≥ 0.40), exit immediately. Threshold 0.40 matches "strong signal" throughout the codebase, prevents whipsaw from moderate signals. Event-driven (fires on signal arrival, not 5s poll).
 
 **Exit checks** (evaluated every 5s in priority order):
-0. **Profit Target**: Exit when profit ≥ 3.0× stop distance (hard capture for tail winners)
+
+**Key principle — profit-side thresholds are decoupled from stop distance (2026-03-25 fix)**:
+The stop loss uses `Max(ruleStop, 2.0×ATR, entrySpread)` which is correct for max acceptable loss. But profit-protection exits (trailing, breakeven, profit target) use **price-percentage-based thresholds** instead of multiples of stop distance. This is because 2×ATR can be 1-2% of price — unreachable for typical day trades that move 0.1-0.5% in 5-60 minutes.
+
+| Threshold | Formula | AMD $218 (ATR $2) | RIVN $15.66 |
+|-----------|---------|-------------------|-------------|
+| Trailing activation | `Max(entryPrice × 0.0015, entrySpread × 2)` | $0.33 (0.15%) | ~$0.05 (spread floor) |
+| Breakeven activation | `trailingActivation × 2.0` | $0.66 | ~$0.10 |
+| Profit target | `Max(entryPrice × 0.010, effectiveStopLoss × 1.5)` | $6.00 | $2.25 |
+| Regime exit threshold | `effectiveStopLoss × 0.40` | $1.60 | $0.60 |
+
+0. **Profit Target**: Exit when profit ≥ `Max(entryPrice × 1.0%, effectiveStopLoss × 1.5)`. AMD: $6.00. The 1.5× stop floor ensures minimum 1.5:1 risk/reward. Previously was 3.0× stop ($12 for AMD — unreachable intraday).
 1. **VWAP Cross** (grace: holdTime×0.50, max 15min): **tightens trailing stop to 30% giveback** (NOT a hard exit)
 2. **EMA Trend Reversal** (grace: holdTime×0.33, max 10min): **tightens trailing stop to 30% giveback** (NOT a hard exit)
 3. **RSI Extreme** (grace: holdTime×0.17, max 5min): **graduated tightening** — RSI 75-80→40%, RSI 80+→25% (NOT a hard exit)
-4. **Stop Loss**: Max(rule stop, **2.0×ATR**, entry spread) — volatility-adaptive (widened from 1.5×)
-5. **Breakeven Stop**: Once peak profit > **2.0×** stop distance, exit if position falls below **-0.25× stop** (buffer prevents single-tick exits)
-6. **Trailing Stop**: Anti-wick filtered (10s persistence), **inverted** confidence-scaled giveback: `0.35 + confidence×0.25` (higher confidence → MORE room, 0.85 conf → 56%). Stage 2: 50% giveback. VWAP/EMA/RSI tightening overrides applied here.
-7. **Time Gate**: Adaptive — past hold time check score strength; hard cap at 2× hold time
+3.5. **Regime Exit** (NEW): When VWAP/EMA/RSI tighteners fire AND trailing is NOT active (profit below activation) AND loss exceeds 40% of stop distance → exit. This makes VWAP/EMA/RSI indicators effective even without the trailing stop. AMD: exits at $1.60 loss vs $4.00 full stop. NOT a hard exit from VWAP/EMA/RSI directly — requires: indicator adverse + trailing not active + losing 40% of stop.
+4. **Stop Loss**: Max(rule stop, **2.0×ATR**, entry spread) — volatility-adaptive, unchanged
+5. **Breakeven Stop**: Once peak profit > `trailingActivation × 2.0` (AMD: $0.66), exit if position falls below **-0.25× stop** (buffer prevents single-tick exits). Previously required 2.0× stop distance ($8.00 for AMD — unreachable).
+6. **Trailing Stop**: Activates when peak profit > `Max(entryPrice × 0.15%, entrySpread × 2)`. AMD: $0.33. Anti-wick filtered (10s persistence). **Inverted** confidence-scaled giveback: `0.35 + confidence×0.25` (higher confidence → MORE room, 0.85 conf → 56%). Stage 2: 50% giveback. VWAP/EMA/RSI tightening overrides applied here. Previously required peakProfit > effectiveStopLoss ($4 for AMD — unreachable).
+7. **Time Gate**: Adaptive — past hold time check score strength; hard cap at 2× hold time. **Score=0 handling**: ComputeCurrentScore returns 0 on data gaps (cold cache, no snapshots). Score of exactly 0.000 is never natural (6 blended indicators). If score=0 AND profitable → hold (don't exit on stale data). If score=0 AND losing → exit as TIME+NOSIGNAL.
 8. **Exit order escalation**: If exit order unfilled after 30s, cancel and resubmit with aggressive price (cross spread by 0.05%)
 
 ### Singleton Caches (in-memory, registered in BlazorModule)
@@ -206,7 +221,7 @@ Background jobs use `[DisableConcurrentExecution(seconds)]` to prevent overlappi
 - **VWAP**: Filtered to today's ET trading session only (prevents cross-day contamination).
 - **BarIndicatorCache.LastRefreshTime**: Tracked per ticker. Analyzer skips signal generation if bar indicators are >2 minutes stale.
 
-## Stabilization Plan (2026-03-23)
+## Stabilization Plan (2026-03-23, updated 2026-03-25)
 
 **AUTHORITATIVE REFERENCE**: See `docs/final/` for the complete stabilization plan that was implemented. All parameter decisions are final — do NOT re-derive or change without quantitative evidence. Key decisions locked:
 
@@ -215,13 +230,29 @@ Background jobs use `[DisableConcurrentExecution(seconds)]` to prevent overlappi
 | ATR stop multiplier | 2.0× | 1.5× inside normal candle noise, 2.5× too wide |
 | VWAP/EMA/RSI exits | Trailing tighteners (NOT hard exits) | Hard exits killed winners during oscillation |
 | Floor protection | 30%, both stages | 50% too generous, 0% too brittle |
-| HoldSeconds range | 60-600 | L2 signals decay in minutes, not hours |
+| HoldSeconds range (rules) | 60-600 | L2 signals decay in minutes, not hours |
 | Training outcome | Multi-horizon weighted (0.20/0.40/0.40) | Actual exits happen at 5-15 min, not 30 min |
 | Trailing giveback (rules) | 0.35 + conf×0.25 (inverted) | High confidence gets MORE room |
 | Entry timeout | 90 seconds | L2 signal stale after 30s |
 | Rate limit | 300 seconds | Balance between whipsaw prevention and re-entry |
 | Daily P&L stops | -$500 loss / +$500 profit → stop for day | Outcome-based, not count-based |
 | Backfills in training | Excluded | Bar-derived scores corrupt L2 weight optimization |
+
+### Exit Strategy Overhaul (2026-03-25)
+
+**Problem solved**: 8/10 trades exiting via TIME+WEAK because all profit-side exit thresholds scaled off `effectiveStopLoss` (2×ATR ≈ 1-2% of price) which was unreachable for typical 0.1-0.5% day trade moves. VWAP/EMA/RSI tighteners were dead code (set `trailingOverride` but trailing never activated). Score=0 from data gaps triggered false TIME+WEAK exits. Opposing signals were documented but never implemented.
+
+**New locked parameters** (do NOT change without quantitative evidence):
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| OptimalHoldSeconds default | **1200s** (20 min) | Matches weighted training horizon: 0.20×5 + 0.40×15 + 0.40×30 = ~19 min. Old 3600s was 3× longer than what model trained on. Nightly trainer now optimizes per-ticker from [300,600,900,1200,1800]. |
+| Trailing activation | **0.15% of entry price** (floored at 2× entry spread) | AMD $218 → $0.33. Old was effectiveStopLoss ($4 for AMD = 1.8% — unreachable). 0.15% is realistic for 5-60 min day trades. Floor at 2× spread prevents activation from noise inside bid-ask. |
+| Breakeven activation | **2× trailing activation** | AMD → $0.66. Old was 2× stop ($8 — unreachable). Position must reach meaningful profit before protecting at breakeven. |
+| Profit target | **Max(1.0% of entry, 1.5× stop)** | AMD → Max($2.18, $6) = $6. Old was 3× stop ($12 — impossible intraday). 1.5× stop floor guarantees minimum risk/reward ratio. |
+| Regime exit threshold | **40% of stop distance** | AMD → $1.60. When VWAP/EMA/RSI say "wrong direction" AND trailing not active AND losing 40% of stop → exit early. NOT a hard exit from indicators — requires losing money + indicator confirmation + 40% stop threshold. |
+| Opposing signal threshold | **0.40** (strong signal) | Matches "strong" classification throughout codebase. Only exits on high-conviction reversals, prevents whipsaw from moderate signals. |
+| Score=0 handling | **Unknown, not weak** | ComputeCurrentScore returns exactly 0.000 on data gaps (never natural from 6 blended indicators). Profitable positions survive data gaps. Losing positions with no signal exit as TIME+NOSIGNAL. |
 
 ## Swin Vision Model (ml/ directory)
 
@@ -256,6 +287,14 @@ export_data.py --days 20  →  render_heatmap.py  →  train.py  →  export_onn
 | EPOCHS_FINETUNE | 25 | Phase 2: top 2 stages unfrozen, warmup + cosine decay |
 | EARLY_STOPPING_PATIENCE | 10 | |
 | SEED | 42 | Reproducibility |
+
+### Data Quality Guards (render_heatmap.py)
+
+- **Market hours filter**: Only snapshots 9:30 AM - 4:00 PM ET used for training. Pre/post-market have different spread/volume characteristics.
+- **Gap detection**: Windows with any consecutive snapshot gap > 5 seconds are skipped. Prevents cross-gap heatmaps that span hours of real time while looking continuous.
+- **Window time span check**: Main window must span 150-600 seconds of real time (expected ~300s for 300 snapshots). Rejects windows with abnormal snapshot frequency.
+- **Future window validation**: Label window must span 50%-150% of HORIZON_SECONDS. Prevents labels that measure wrong time horizons due to gaps.
+- **Skip statistics**: Logged after each symbol showing how many windows were rejected by each filter.
 
 ### Class Imbalance
 

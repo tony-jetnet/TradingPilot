@@ -39,8 +39,7 @@ public class PaperTradingExecutor
     private readonly ConcurrentDictionary<string, PendingOrder> _pendingExits = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastTradeTime = new();
     // Daily trade counter per symbol (reset on date change)
-    private readonly ConcurrentDictionary<string, int> _dailyTradeCount = new();
-    private DateOnly _dailyTradeDate = DateOnly.FromDateTime(DateTime.UtcNow);
+    // _dailyTradeCount removed — P&L hard stops + rate limit + live rule tracking are sufficient
 
     // Cached broker account (5s TTL) — guarded by SemaphoreSlim for thread safety
     private BrokerAccount? _cachedAccount;
@@ -131,7 +130,29 @@ public class PaperTradingExecutor
         // ═══════════════════════════════════════════════════════════
         if (!_broker.IsAuthenticated) return;
 
-        if (_positions.ContainsKey(signal.Ticker)) return;
+        // ═══════════════════════════════════════════════════════════
+        // OPPOSING SIGNAL EXIT: If we have a position and get a strong
+        // signal in the opposite direction (|score| >= 0.40), exit.
+        // Threshold 0.40 = "strong signal" throughout codebase, prevents whipsaw.
+        // This implements the event-driven exit referenced in PositionMonitor comments.
+        // ═══════════════════════════════════════════════════════════
+        if (_positions.TryGetValue(signal.Ticker, out var existingPos))
+        {
+            decimal opposingScore = signal.Indicators.GetValueOrDefault("CompositeScore");
+            bool isOpposing = (existingPos.IsLong && signal.Type == SignalType.Sell && opposingScore <= -0.40m)
+                           || (!existingPos.IsLong && signal.Type == SignalType.Buy && opposingScore >= 0.40m);
+
+            if (isOpposing && !HasPendingExit(signal.Ticker))
+            {
+                _logger.LogWarning("OPPOSING SIGNAL: {Symbol} has {Dir} position but got strong {Opposing} signal score={Score:F3}",
+                    signal.Ticker, existingPos.IsLong ? "LONG" : "SHORT",
+                    signal.Type, opposingScore);
+                decimal exitPrice = signal.Price > 0 ? signal.Price : existingPos.EntryPrice;
+                await ExitPositionAsync(signal.Ticker, exitPrice,
+                    $"OPPOSING SIGNAL score={opposingScore:F3} vs entry={existingPos.EntryScore:F3}", opposingScore);
+            }
+            return; // Whether we triggered exit or not, don't enter while we have a position
+        }
 
         if (_pendingEntries.ContainsKey(signal.Ticker)) return;
 
@@ -176,26 +197,10 @@ public class PaperTradingExecutor
             && (DateTime.UtcNow - lastTime).TotalSeconds < _rateLimitSeconds)
             return;
 
-        // Daily trade count limit per symbol (from strategy config)
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        if (today != _dailyTradeDate)
-        {
-            _dailyTradeCount.Clear();
-            _dailyTradeDate = today;
-        }
-        {
-            var stratCfg = _analyzer.RuleEvaluator.CurrentConfig;
-            if (stratCfg != null && stratCfg.Symbols.TryGetValue(signal.Ticker, out var symCfg))
-            {
-                int count = _dailyTradeCount.GetValueOrDefault(signal.Ticker, 0);
-                if (count >= symCfg.MaxDailyTrades)
-                {
-                    _logger.LogDebug("Skipping entry for {Ticker}: daily trade limit ({Max}) reached",
-                        signal.Ticker, symCfg.MaxDailyTrades);
-                    return;
-                }
-            }
-        }
+        // Per-symbol daily trade count limit removed — redundant with:
+        //   - Daily P&L hard stops (-$500 / +$500)
+        //   - 300s rate limit per symbol
+        //   - Live rule performance tracking (auto-disables losing rules)
 
         decimal score = signal.Indicators.GetValueOrDefault("CompositeScore");
 
@@ -370,7 +375,6 @@ public class PaperTradingExecutor
             if (result.Success && result.OrderId != null)
             {
                 _lastTradeTime[signal.Ticker] = DateTime.UtcNow;
-                _dailyTradeCount.AddOrUpdate(signal.Ticker, 1, (_, count) => count + 1);
                 // Invalidate cached account so next signal sees fresh state
                 _cachedAccount = null;
 

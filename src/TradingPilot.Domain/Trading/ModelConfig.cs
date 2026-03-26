@@ -40,7 +40,12 @@ public class TickerModelConfig
     public bool EnableSell { get; set; } = true;
 
     // Optimal trade parameters
-    public int OptimalHoldSeconds { get; set; } = 3600;
+    // Default 1200s (20 min) matches weighted training horizon:
+    // 0.20×5min + 0.40×15min + 0.40×30min = ~19 min average outcome.
+    // With 2× time gate cap → max 40 min hold. Winners with strong scores extend via adaptive gate.
+    // Previously 3600s (60 min) — caused all trades to exit via TIME+WEAK because
+    // score naturally decays over 60 min and no other exit mechanism could fire.
+    public int OptimalHoldSeconds { get; set; } = 1200;
     public decimal StopLossAmount { get; set; } = 1.50m;
 
     // Walk-forward validation metrics (out-of-sample)

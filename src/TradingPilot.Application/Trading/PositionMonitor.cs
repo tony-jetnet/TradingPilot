@@ -31,6 +31,19 @@ public class PositionMonitor : IDisposable
     // ATR multiplier for volatility-adaptive stop loss floor
     private const decimal AtrStopMultiplier = 2.0m;
 
+    // ── Profit-side thresholds (decoupled from stop distance) ──
+    // Trailing activates after this % of entry price is gained as profit.
+    // 0.15% = $0.33 for $218 stock, $0.27 for $180 stock. Reachable in 5-60 min day trades.
+    // Previously used effectiveStopLoss (2×ATR ≈ 1-2% of price) which was unreachable.
+    private const decimal TrailingActivationPct = 0.0015m;
+    // Breakeven activates at 2× the trailing activation threshold.
+    // AMD: 2 × $0.33 = $0.66 peak profit needed → then protects at breakeven.
+    private const decimal BreakevenActivationMultiple = 2.0m;
+    // Regime exit: when VWAP/EMA/RSI are adverse AND trailing not active,
+    // exit if loss exceeds this fraction of the full stop distance.
+    // 0.40 × $4 stop = $1.60 loss threshold (vs waiting for $4.00 full stop).
+    private const decimal RegimeExitStopFraction = 0.40m;
+
     public PositionMonitor(
         PaperTradingExecutor executor,
         MarketMicrostructureAnalyzer analyzer,
@@ -195,9 +208,13 @@ public class PositionMonitor : IDisposable
             : pos.EntryPrice - pos.PeakFavorablePrice;
 
         // ═══════════════════════════════════════════════════════════
-        // CHECK 0: Profit target
+        // CHECK 0: Profit target — captures strong intraday moves.
+        // Uses Max(1.0% of entry price, 1.5× stop distance).
+        // AMD $218: Max($2.18, $6.00) = $6.00. Old was $12.00 (unreachable).
+        // RIVN $15.66: Max($0.16, $2.25) = $2.25.
+        // The 1.5× stop floor ensures we never take profit at less than 1.5× risk.
         // ═══════════════════════════════════════════════════════════
-        decimal profitTarget = effectiveStopLoss * 3.0m;
+        decimal profitTarget = Math.Max(pos.EntryPrice * 0.010m, effectiveStopLoss * 1.5m);
         if (currentProfit >= profitTarget)
         {
             await _executor.ExitPositionAsync(symbol, currentPrice,
@@ -212,6 +229,10 @@ public class PositionMonitor : IDisposable
 
         // Trailing override: VWAP/EMA/RSI exits tighten the trailing stop instead of hard exiting
         decimal trailingOverride = -1m;
+
+        // Trailing activation threshold: 0.15% of entry price, floored at 2× entry spread.
+        // This is used by trailing stop, breakeven, and regime exit checks.
+        decimal trailingActivation = Math.Max(pos.EntryPrice * TrailingActivationPct, pos.EntrySpread * 2m);
 
         // ═══════════════════════════════════════════════════════════
         // CHECK 1: VWAP Cross — price crossed VWAP against position
@@ -273,6 +294,43 @@ public class PositionMonitor : IDisposable
         }
 
         // ═══════════════════════════════════════════════════════════
+        // CHECK 3.5: Regime exit — VWAP/EMA/RSI say "wrong direction"
+        // AND trailing is NOT active (small/no profit) AND position is losing.
+        // This makes the VWAP/EMA/RSI tighteners effective even when trailing
+        // hasn't activated. Uses 40% of stop distance as the accelerated exit
+        // threshold (vs 100% for full stop loss).
+        // NOT a hard exit from VWAP/EMA/RSI — requires indicator confirmation
+        // + adverse position + 40% stop threshold. Respects "tighteners not hard exits" principle.
+        // ═══════════════════════════════════════════════════════════
+        if (trailingOverride > 0 && peakProfit <= trailingActivation)
+        {
+            decimal softStopThreshold = effectiveStopLoss * RegimeExitStopFraction;
+            if (adverse > softStopThreshold)
+            {
+                // Identify which indicator triggered for logging
+                string indicator = "RSI";
+                if (barIndicators != null)
+                {
+                    bool vc = (pos.IsLong && barIndicators.Vwap > 0 && currentPrice < barIndicators.Vwap) ||
+                              (!pos.IsLong && barIndicators.Vwap > 0 && currentPrice > barIndicators.Vwap);
+                    if (vc) indicator = "VWAP";
+                    else
+                    {
+                        bool tr = (pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 < barIndicators.Ema20) ||
+                                  (!pos.IsLong && barIndicators.Ema9 > 0 && barIndicators.Ema20 > 0 && barIndicators.Ema9 > barIndicators.Ema20);
+                        if (tr) indicator = "EMA";
+                    }
+                }
+
+                await _executor.ExitPositionAsync(symbol, currentPrice,
+                    $"REGIME EXIT ({indicator}) adverse={adverse:F2} threshold={softStopThreshold:F2} (40% of stop={effectiveStopLoss:F2}) override={trailingOverride:P0} elapsed={elapsed:F0}s", currentScore);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT REGIME ({Indicator}) adverse={Adverse:F2} threshold={Threshold:F2}",
+                    symbol, indicator, adverse, softStopThreshold);
+                return;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
         // CHECK 4: Stop loss — volatility-adaptive with spread floor
         // Uses Max(rule stop, 2.0×ATR, entry spread) so the stop automatically
         // widens when volatility is high and tightens when it's low.
@@ -288,14 +346,16 @@ public class PositionMonitor : IDisposable
         }
 
         // ═══════════════════════════════════════════════════════════
-        // CHECK 5a: Breakeven stop — once profitable by 2.0x stop distance,
+        // CHECK 5a: Breakeven stop — once profitable by 2× trailing activation,
         // move the floor to breakeven minus buffer. Prevents winning trades
-        // from turning into losers. Uses 2.0x (not 1.0x) to avoid premature
-        // exits on normal price oscillation near the stop distance.
-        // Buffer of 0.25x stop allows small drawdown before triggering.
+        // from turning into losers.
+        // AMD $218: activation = $0.33, breakeven triggers at $0.66 peak profit.
+        // Previously used 2× effectiveStopLoss ($8.00 for AMD) — unreachable.
+        // Buffer uses full stop distance (0.25× effectiveStopLoss) to allow normal drawdown.
         // ═══════════════════════════════════════════════════════════
         decimal breakevenBuffer = effectiveStopLoss * 0.25m;
-        if (peakProfit > effectiveStopLoss * 2.0m && currentProfit < -breakevenBuffer)
+        decimal breakevenActivation = trailingActivation * BreakevenActivationMultiple;
+        if (peakProfit > breakevenActivation && currentProfit < -breakevenBuffer)
         {
             await _executor.ExitPositionAsync(symbol, currentPrice,
                 $"BREAKEVEN STOP peak_profit={peakProfit:F2} now_loss={currentProfit:F2} buffer={breakevenBuffer:F2} elapsed={elapsed:F0}s", currentScore);
@@ -306,12 +366,13 @@ public class PositionMonitor : IDisposable
 
         // ═══════════════════════════════════════════════════════════
         // CHECK 5b: Trailing stop using peak price (anti-wick filtered)
-        // Only trail from peaks that have persisted for ≥10 seconds.
-        // A single tick wick won't set an unrealistic peak that immediately
-        // triggers the trail. Higher confidence = tighter trail.
-        // VWAP/EMA/RSI checks above may tighten via trailingOverride.
+        // Activates when peak profit exceeds trailing activation threshold
+        // (0.15% of entry price, floored at 2× entry spread).
+        // AMD $218: activates at $0.33 profit. Old was $4.00 (unreachable).
+        // VWAP/EMA/RSI checks above may tighten giveback via trailingOverride.
+        // Giveback formula UNCHANGED (locked): 0.35 + conf×0.25 for rules, 0.50 for Stage 2.
         // ═══════════════════════════════════════════════════════════
-        if (peakProfit > effectiveStopLoss)
+        if (peakProfit > trailingActivation)
         {
             // Anti-wick: only use peak if it has persisted for PeakPersistenceSeconds
             bool peakSustained = (now - pos.PeakPriceSetAt).TotalSeconds >= PeakPersistenceSeconds;
@@ -354,10 +415,15 @@ public class PositionMonitor : IDisposable
                 return;
             }
 
-            // Past base hold time: exit if score is weakening, hold if improving
+            // Past base hold time: exit if score is weakening, hold if improving.
+            // ComputeCurrentScore returns 0 on data gaps (no snapshots, cold cache).
+            // Score of exactly 0.000 is never natural (6 blended indicators), so treat as "unknown".
+            // Don't exit profitable positions on data gaps — only exit if unknown AND losing.
             decimal scoreStrength = pos.IsLong ? currentScore : -currentScore;
             decimal entryStrength = pos.IsLong ? pos.EntryScore : -pos.EntryScore;
-            bool scoreWeakening = scoreStrength < entryStrength * 0.5m;
+            bool hasValidScore = currentScore != 0;
+            bool scoreWeakening = hasValidScore && scoreStrength < entryStrength * 0.5m;
+            bool unknownAndLosing = !hasValidScore && currentProfit < 0;
 
             if (scoreWeakening)
             {
@@ -365,6 +431,15 @@ public class PositionMonitor : IDisposable
                     $"TIME+WEAK {elapsed:F0}s score={currentScore:F3} (entry={pos.EntryScore:F3})", currentScore);
                 _logger.LogWarning("PositionMonitor: {Symbol} EXIT TIME+WEAK {Elapsed:F0}s score={Score:F3}",
                     symbol, elapsed, currentScore);
+                return;
+            }
+
+            if (unknownAndLosing)
+            {
+                await _executor.ExitPositionAsync(symbol, currentPrice,
+                    $"TIME+NOSIGNAL {elapsed:F0}s score=0 (data gap) loss={currentProfit:F2}", currentScore);
+                _logger.LogWarning("PositionMonitor: {Symbol} EXIT TIME+NOSIGNAL {Elapsed:F0}s loss={Loss:F2} (score=0, data gap)",
+                    symbol, elapsed, currentProfit);
                 return;
             }
 

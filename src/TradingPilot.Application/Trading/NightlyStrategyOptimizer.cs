@@ -47,14 +47,14 @@ public class NightlyStrategyOptimizer
 
         try
         {
-            // 0. Skip if rules were already generated today (non-empty file)
+            // 0. Skip if rules were generated recently (prevents double-runs on manual trigger)
             if (File.Exists(StrategyConfigPath))
             {
                 var fileInfo = new FileInfo(StrategyConfigPath);
-                if (fileInfo.LastWriteTimeUtc.Date == DateTime.UtcNow.Date && fileInfo.Length > 100)
+                if ((DateTime.UtcNow - fileInfo.LastWriteTimeUtc).TotalHours < 2 && fileInfo.Length > 100)
                 {
-                    _logger.LogWarning("Strategy rules already generated today ({LastWrite:HH:mm} UTC, {Size}B). Skipping Bedrock calls.",
-                        fileInfo.LastWriteTimeUtc, fileInfo.Length);
+                    _logger.LogWarning("Strategy rules generated recently ({LastWrite:HH:mm} UTC). Skipping.",
+                        fileInfo.LastWriteTimeUtc);
                     return;
                 }
             }
@@ -90,7 +90,12 @@ public class NightlyStrategyOptimizer
             //    so all signals have outcomes before Bedrock analysis.
             await VerifySignalOutcomesAsync(lookbackDays);
 
-            // 4. For each symbol, prepare analysis and call Bedrock
+            // 4. Evaluate which existing rules are still performing well
+            var survivingRules = await EvaluateExistingRulesAsync();
+            _logger.LogWarning("Rule preservation: {SurvivingSymbols} symbols have surviving rules ({TotalSurviving} rules total)",
+                survivingRules.Count, survivingRules.Values.Sum(r => r.Count));
+
+            // 5. For each symbol, prepare analysis and call Bedrock
             var config = new StrategyConfig
             {
                 GeneratedAt = DateTime.UtcNow,
@@ -101,19 +106,73 @@ public class NightlyStrategyOptimizer
             {
                 try
                 {
-                    var data = await PrepareSymbolDataAsync(symbol.TickerId, symbol.Ticker, symbol.Ticker, lookbackDays);
+                    var tickerSurvivors = survivingRules.GetValueOrDefault(symbol.Ticker, new List<StrategyRule>());
+
+                    var data = await PrepareSymbolDataAsync(symbol.TickerId, symbol.Ticker, symbol.Ticker, lookbackDays, tickerSurvivors);
                     if (data == null)
                     {
-                        _logger.LogWarning("Insufficient data for {Ticker}, skipping", symbol.Ticker);
+                        // No data for Bedrock, but if we have surviving rules, keep them
+                        if (tickerSurvivors.Count > 0)
+                        {
+                            config.Symbols[symbol.Ticker] = new SymbolStrategy
+                            {
+                                TickerId = symbol.TickerId,
+                                Rules = tickerSurvivors,
+                                MaxDailyTrades = Math.Min(5, tickerSurvivors.Count * 2),
+                            };
+                            _logger.LogWarning("Insufficient data for {Ticker}, keeping {Count} surviving rules",
+                                symbol.Ticker, tickerSurvivors.Count);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Insufficient data for {Ticker}, skipping", symbol.Ticker);
+                        }
                         continue;
                     }
 
-                    var symbolStrategy = await CallBedrockAsync(symbol.TickerId, symbol.Ticker, data);
+                    // Determine how many new rule slots are available
+                    int slotsForNew = 5 - tickerSurvivors.Count;
+                    var symbolStrategy = slotsForNew > 0
+                        ? await CallBedrockAsync(symbol.TickerId, symbol.Ticker, data)
+                        : null;
+
                     if (symbolStrategy != null)
                     {
+                        // Merge: surviving rules first, then new rules, cap at 5 total
+                        var mergedRules = new List<StrategyRule>(tickerSurvivors);
+                        var survivorIds = new HashSet<string>(tickerSurvivors.Select(r => r.Id));
+
+                        foreach (var newRule in symbolStrategy.Rules)
+                        {
+                            if (mergedRules.Count >= 5) break;
+                            // Don't add duplicates (same direction + overlapping hours)
+                            bool isDuplicate = tickerSurvivors.Any(s =>
+                                s.Direction == newRule.Direction &&
+                                s.Hours.Intersect(newRule.Hours).Any());
+                            if (!isDuplicate)
+                                mergedRules.Add(newRule);
+                        }
+
+                        symbolStrategy.Rules = mergedRules;
                         config.Symbols[symbol.Ticker] = symbolStrategy;
-                        _logger.LogWarning("Generated {RuleCount} rules for {Ticker}",
-                            symbolStrategy.Rules.Count, symbol.Ticker);
+
+                        _logger.LogWarning("Generated rules for {Ticker}: {Surviving} surviving + {New} new = {Total} total",
+                            symbol.Ticker, tickerSurvivors.Count,
+                            mergedRules.Count - tickerSurvivors.Count, mergedRules.Count);
+                    }
+                    else if (tickerSurvivors.Count > 0)
+                    {
+                        // Bedrock failed or skipped (all slots filled) — keep surviving rules
+                        config.Symbols[symbol.Ticker] = new SymbolStrategy
+                        {
+                            TickerId = symbol.TickerId,
+                            Rules = tickerSurvivors,
+                            MaxDailyTrades = Math.Min(5, tickerSurvivors.Count * 2),
+                        };
+                        _logger.LogWarning(slotsForNew == 0
+                            ? "All 5 rule slots filled by survivors for {Ticker}, skipping Bedrock"
+                            : "Bedrock failed for {Ticker}, keeping {Count} surviving rules",
+                            symbol.Ticker, tickerSurvivors.Count);
                     }
                 }
                 catch (Exception ex)
@@ -128,7 +187,7 @@ public class NightlyStrategyOptimizer
                 return;
             }
 
-            // 5. Save strategy_rules.json
+            // 6. Save strategy_rules.json
             await SaveStrategyRulesAsync(config);
 
             sw.Stop();
@@ -144,6 +203,154 @@ public class NightlyStrategyOptimizer
         }
     }
 
+    #region Rule Preservation
+
+    /// <summary>
+    /// Evaluates existing rules against the last 5 days of signal data.
+    /// Returns rules that are still performing well (surviving rules).
+    /// A rule survives if: matched >= 5 signals, total P&L positive (using PriceAfter5Min).
+    /// </summary>
+    private async Task<Dictionary<string, List<StrategyRule>>> EvaluateExistingRulesAsync()
+    {
+        var surviving = new Dictionary<string, List<StrategyRule>>();
+
+        if (!File.Exists(StrategyConfigPath)) return surviving;
+
+        try
+        {
+            var json = await File.ReadAllTextAsync(StrategyConfigPath);
+            var currentConfig = JsonSerializer.Deserialize<StrategyConfig>(json);
+            if (currentConfig == null) return surviving;
+
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
+            using var connection = dbContext.Database.GetDbConnection();
+            await connection.OpenAsync();
+
+            var cutoff = DateTime.UtcNow.AddDays(-5);
+
+            foreach (var (ticker, symbolStrategy) in currentConfig.Symbols)
+            {
+                var survivingRules = new List<StrategyRule>();
+
+                foreach (var rule in symbolStrategy.Rules)
+                {
+                    int matchCount = 0;
+                    decimal totalPnl = 0m;
+
+                    // Query recent signals for this ticker that have 5min outcomes
+                    using var cmd = connection.CreateCommand();
+                    cmd.CommandText = @"
+                        SELECT ts.""Price"", ts.""PriceAfter5Min"", ts.""Type"",
+                               EXTRACT(HOUR FROM (ts.""Timestamp"" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York')::int AS hour_et,
+                               ts.""ObiSmoothed"", ts.""Rsi14"", ts.""VolumeRatio"", ts.""Vwap""
+                        FROM ""TradingSignals"" ts
+                        WHERE ts.""TickerId"" = @tickerId
+                          AND ts.""Timestamp"" > @cutoff
+                          AND ts.""PriceAfter5Min"" IS NOT NULL
+                          AND ABS(ts.""Score"") >= 0.20
+                          AND (ts.""Reason"" IS NULL OR ts.""Reason"" NOT LIKE '%BACKFILL%')
+                        ORDER BY ts.""Timestamp""";
+
+                    var tickerIdParam = cmd.CreateParameter();
+                    tickerIdParam.ParameterName = "tickerId";
+                    tickerIdParam.Value = symbolStrategy.TickerId;
+                    cmd.Parameters.Add(tickerIdParam);
+
+                    var cutoffParam = cmd.CreateParameter();
+                    cutoffParam.ParameterName = "cutoff";
+                    cutoffParam.Value = cutoff;
+                    cmd.Parameters.Add(cutoffParam);
+                    cmd.CommandTimeout = 30;
+
+                    using var reader = await cmd.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
+                    {
+                        var signalType = reader.GetInt32(2); // 1=BUY, 2=SELL
+                        var hourEt = reader.GetInt32(3);
+
+                        // Direction match
+                        bool dirMatch = (rule.Direction == "BUY" && signalType == 1)
+                                     || (rule.Direction == "SELL" && signalType == 2);
+                        if (!dirMatch) continue;
+
+                        // Hour match (if rule specifies hours)
+                        if (rule.Hours.Count > 0 && !rule.Hours.Contains(hourEt)) continue;
+
+                        // Basic OBI condition match
+                        var obi = reader.IsDBNull(4) ? 0m : reader.GetDecimal(4);
+                        if (rule.Conditions.MinObi.HasValue && obi < rule.Conditions.MinObi.Value) continue;
+                        if (rule.Conditions.MaxObi.HasValue && obi > rule.Conditions.MaxObi.Value) continue;
+
+                        // RSI range check
+                        if (rule.Conditions.RsiRange is { Length: >= 2 })
+                        {
+                            var rsi = reader.IsDBNull(5) ? 50m : reader.GetDecimal(5);
+                            if (rule.Conditions.RsiRange[0].HasValue && rsi < rule.Conditions.RsiRange[0]!.Value) continue;
+                            if (rule.Conditions.RsiRange[1].HasValue && rsi > rule.Conditions.RsiRange[1]!.Value) continue;
+                        }
+
+                        // Volume ratio check
+                        if (rule.Conditions.MinVolumeRatio.HasValue)
+                        {
+                            var volRatio = reader.IsDBNull(6) ? 1m : reader.GetDecimal(6);
+                            if (volRatio < rule.Conditions.MinVolumeRatio.Value) continue;
+                        }
+
+                        // VWAP position check
+                        if (rule.Conditions.AboveVwap.HasValue)
+                        {
+                            var price = reader.GetDecimal(0);
+                            var vwap = reader.IsDBNull(7) ? 0m : reader.GetDecimal(7);
+                            if (vwap > 0)
+                            {
+                                bool isAbove = price > vwap;
+                                if (rule.Conditions.AboveVwap.Value != isAbove) continue;
+                            }
+                        }
+
+                        // This signal matches the rule — compute P&L
+                        matchCount++;
+                        var entryPrice = reader.GetDecimal(0);
+                        var price5m = reader.GetDecimal(1);
+                        var spread = 0.02m; // approximate spread cost
+                        var pnl = rule.Direction == "BUY"
+                            ? (price5m - entryPrice - spread)
+                            : (entryPrice - price5m - spread);
+                        totalPnl += pnl;
+                    }
+
+                    if (matchCount >= 5 && totalPnl > 0)
+                    {
+                        survivingRules.Add(rule);
+                        _logger.LogInformation(
+                            "Rule {RuleId} SURVIVING for {Ticker}: {Matches} matches, P&L={Pnl:F2} in last 5 days",
+                            rule.Id, ticker, matchCount, totalPnl);
+                    }
+                    else
+                    {
+                        _logger.LogInformation(
+                            "Rule {RuleId} EXPIRED for {Ticker}: {Matches} matches, P&L={Pnl:F2} — will be replaced",
+                            rule.Id, ticker, matchCount, totalPnl);
+                    }
+                }
+
+                if (survivingRules.Count > 0)
+                    surviving[ticker] = survivingRules;
+            }
+
+            await connection.CloseAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to evaluate existing rules, generating all new");
+        }
+
+        return surviving;
+    }
+
+    #endregion
+
     #region Symbol Analysis Preparation
 
     /// <summary>
@@ -153,7 +360,7 @@ public class NightlyStrategyOptimizer
     /// Load raw trade data + context for Bedrock. Returns rows (CSV), context, and header separately
     /// so CallBedrockAsync can chunk the rows into multiple API calls.
     /// </summary>
-    private async Task<SymbolData?> PrepareSymbolDataAsync(long tickerId, string ticker, string symbolId, int lookbackDays)
+    private async Task<SymbolData?> PrepareSymbolDataAsync(long tickerId, string ticker, string symbolId, int lookbackDays, List<StrategyRule>? survivingRules = null)
     {
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
@@ -454,24 +661,46 @@ public class NightlyStrategyOptimizer
         }
 
         // ═══════════════════════════════════════════════════════════
-        // 3. Previous rules feedback — help Bedrock iterate instead of starting from scratch
+        // 3. Previous rules feedback — distinguish surviving (keep) vs expired (replace)
         // ═══════════════════════════════════════════════════════════
         try
         {
+            var survivorIds = new HashSet<string>(survivingRules?.Select(r => r.Id) ?? Enumerable.Empty<string>());
+
+            if (survivingRules != null && survivingRules.Count > 0)
+            {
+                ctx.AppendLine();
+                ctx.AppendLine($"SURVIVING RULES (keep these, they are performing well — {survivingRules.Count} rules):");
+                foreach (var rule in survivingRules)
+                {
+                    ctx.AppendLine($"  {rule.Id}: {rule.Name} | {rule.Direction} hours=[{string.Join(",", rule.Hours)}] " +
+                                   $"conf={rule.Confidence:F2} samples={rule.SampleSize} hold={rule.HoldSeconds}s stop={rule.StopLoss:F2} " +
+                                   $"expectedPnl=${rule.ExpectedPnlPer100Shares:F2}/100sh");
+                }
+                ctx.AppendLine("These rules have positive P&L in the last 5 days. They will be KEPT as-is.");
+                ctx.AppendLine($"Generate NEW rules to COMPLEMENT these {survivingRules.Count} surviving rules, not replace them.");
+                ctx.AppendLine($"You have {5 - survivingRules.Count} open rule slots. Focus on patterns the surviving rules don't cover (different hours, opposite direction, different conditions).");
+            }
+
             if (File.Exists(StrategyConfigPath))
             {
                 var prevJson = await File.ReadAllTextAsync(StrategyConfigPath);
                 var prevConfig = System.Text.Json.JsonSerializer.Deserialize<StrategyConfig>(prevJson);
                 if (prevConfig != null && prevConfig.Symbols.TryGetValue(ticker, out var prevSymbol) && prevSymbol.Rules.Count > 0)
                 {
-                    ctx.AppendLine($"PreviousRules (generated {prevConfig.GeneratedAt:yyyy-MM-dd HH:mm} UTC, {prevSymbol.Rules.Count} rules):");
-                    foreach (var rule in prevSymbol.Rules.Take(8))
+                    var expiredRules = prevSymbol.Rules.Where(r => !survivorIds.Contains(r.Id)).ToList();
+                    if (expiredRules.Count > 0)
                     {
-                        ctx.AppendLine($"  {rule.Id}: {rule.Name} | {rule.Direction} hours=[{string.Join(",", rule.Hours)}] " +
-                                       $"conf={rule.Confidence:F2} samples={rule.SampleSize} hold={rule.HoldSeconds}s stop={rule.StopLoss:F2} " +
-                                       $"expectedPnl=${rule.ExpectedPnlPer100Shares:F2}/100sh");
+                        ctx.AppendLine();
+                        ctx.AppendLine($"EXPIRED RULES (these underperformed and were removed — {expiredRules.Count} rules):");
+                        foreach (var rule in expiredRules.Take(8))
+                        {
+                            ctx.AppendLine($"  {rule.Id}: {rule.Name} | {rule.Direction} hours=[{string.Join(",", rule.Hours)}] " +
+                                           $"conf={rule.Confidence:F2} samples={rule.SampleSize} hold={rule.HoldSeconds}s stop={rule.StopLoss:F2} " +
+                                           $"expectedPnl=${rule.ExpectedPnlPer100Shares:F2}/100sh");
+                        }
+                        ctx.AppendLine("These rules lost money or had insufficient matches in the last 5 days. Do NOT regenerate the same patterns. Try different indicator combinations, hours, or directions.");
                     }
-                    ctx.AppendLine("Use these as a starting point. Keep rules that still show positive P&L in the new data. Drop or modify rules that no longer work. Add new rules for patterns the previous set missed.");
                 }
             }
         }
@@ -821,6 +1050,8 @@ public class NightlyStrategyOptimizer
 
 Your job: analyze the raw data to discover patterns that predict profitable short-duration trades (1-10 min), then output conditional rules as JSON.
 
+CRITICAL RESPONSE FORMAT: Your entire response must be a single valid JSON object. No text before or after the JSON. No markdown fences. No analysis, commentary, or explanation. Start with { and end with }. If you include any non-JSON text, the system will fail to parse your response and the rules will be lost.
+
 ## How the trading system works
 - Signals are generated from L2 order book microstructure analysis
 - 6 weighted L2/tick indicators produce a composite score each snapshot
@@ -967,7 +1198,8 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                 chunkPrompt.AppendLine($"Analyze this batch of {ticker} trades. The data is sorted newest-first.");
                 chunkPrompt.AppendLine($"Use price_5m as the primary outcome (compute P&L from direction and price). price_1m is an early momentum check.");
                 chunkPrompt.AppendLine($"Discover patterns in TRAINING rows (older 75%), verify they hold in VALIDATION rows (newest 25%).");
-                chunkPrompt.AppendLine($"Output ONLY the JSON object in this format:");
+                chunkPrompt.AppendLine($"CRITICAL: Output ONLY a raw JSON object. No markdown, no analysis text, no explanation, no ```json fences. Start your response with {{ and end with }}. Any non-JSON text will cause a parsing failure.");
+                chunkPrompt.AppendLine($"Output the JSON object in this exact format:");
                 chunkPrompt.AppendLine(jsonTemplate);
 
                 var request = new ConverseRequest
@@ -1082,7 +1314,16 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
             int braceStart = json.IndexOf('{');
             int braceEnd = json.LastIndexOf('}');
             if (braceStart >= 0 && braceEnd > braceStart)
+            {
                 json = json[braceStart..(braceEnd + 1)];
+            }
+            else
+            {
+                // No JSON object found at all — Bedrock returned pure text analysis
+                _logger.LogWarning("No JSON found in Bedrock response for {Ticker} (got text analysis instead). Response starts with: {Start}",
+                    ticker, responseText.Length > 100 ? responseText[..100] : responseText);
+                return null;
+            }
 
             SymbolStrategy? strategy;
             try

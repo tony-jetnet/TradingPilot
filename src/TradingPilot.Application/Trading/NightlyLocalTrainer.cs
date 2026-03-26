@@ -419,6 +419,9 @@ public class NightlyLocalTrainer
 
             // Step 7: Direction analysis
             AnalyzeDirections(rows, config);
+
+            // Step 8: Optimize hold time from available outcome horizons
+            OptimizeHoldTime(ticker, trainRows, valRows, config);
         }
 
         _logger.LogWarning(
@@ -835,6 +838,98 @@ public class NightlyLocalTrainer
             _logger.LogInformation("  {Ticker} SELL: {Count} samples, WinRate={WinRate:P1}, EV=${EV:F2}, Enabled={Enabled}",
                 config.Ticker, sellRows.Count, sellWinRate, sellEV, config.EnableSell);
         }
+    }
+
+    #endregion
+
+    #region Step 5: Hold Time Optimization
+
+    /// <summary>
+    /// Determine optimal hold time by comparing P&L at different horizons.
+    /// Candidate horizons: 300s (5min), 600s (10min), 900s (15min), 1200s (20min), 1800s (30min).
+    /// Uses training data for discovery, validation data for confirmation.
+    /// Falls back to 1200s default if best candidate loses on validation.
+    /// </summary>
+    private void OptimizeHoldTime(string ticker, List<TrainingRow> trainRows, List<TrainingRow> valRows, TickerModelConfig config)
+    {
+        var candidates = new[] { (300, "5min"), (600, "10min"), (900, "15min"), (1200, "20min"), (1800, "30min") };
+        decimal bestTrainPnl = decimal.MinValue;
+        int bestHoldSeconds = 1200; // default matches ~19 min weighted training horizon
+
+        foreach (var (holdSec, label) in candidates)
+        {
+            decimal pnl = ComputeHoldPnl(trainRows, holdSec);
+            _logger.LogDebug("  {Ticker} hold {Label}: trainPnl=${Pnl:F2}", ticker, label, pnl);
+            if (pnl > bestTrainPnl)
+            {
+                bestTrainPnl = pnl;
+                bestHoldSeconds = holdSec;
+            }
+        }
+
+        // Validate: if best hold time loses money on validation, fall back to 1200s
+        decimal valPnl = ComputeHoldPnl(valRows, bestHoldSeconds);
+        decimal defaultValPnl = ComputeHoldPnl(valRows, 1200);
+
+        if (valPnl <= 0 && defaultValPnl > valPnl)
+        {
+            _logger.LogWarning("  {Ticker}: hold time {Best}s overfits (valPnl=${ValPnl:F2} vs default=${DefaultPnl:F2}), using default 1200s",
+                ticker, bestHoldSeconds, valPnl, defaultValPnl);
+            bestHoldSeconds = 1200;
+            valPnl = defaultValPnl;
+        }
+
+        config.OptimalHoldSeconds = bestHoldSeconds;
+        _logger.LogWarning("  {Ticker}: optimal hold time = {Hold}s (trainPnl=${TrainPnl:F2} valPnl=${ValPnl:F2})",
+            ticker, bestHoldSeconds, bestTrainPnl, valPnl);
+    }
+
+    /// <summary>
+    /// Compute P&L for a given hold horizon. Maps hold seconds to the closest
+    /// available outcome column (PriceAfter5Min/15Min/30Min) using interpolation.
+    /// Includes spread costs and fill probability (same as ComputeTotalProfit).
+    /// </summary>
+    private static decimal ComputeHoldPnl(List<TrainingRow> rows, int holdSeconds)
+    {
+        decimal totalPnl = 0;
+        const decimal threshold = 0.30m;
+
+        foreach (var row in rows)
+        {
+            // Map hold duration to outcome price using closest available columns.
+            // 300s → 5min, 600s → blend(5min,15min), 900s → 15min,
+            // 1200s → blend(15min,30min), 1800s → 30min.
+            decimal? outcomePrice = holdSeconds switch
+            {
+                <= 300 => row.PriceAfter5Min,
+                <= 600 => row.PriceAfter5Min.HasValue && row.PriceAfter15Min.HasValue
+                    ? row.PriceAfter5Min.Value * 0.50m + row.PriceAfter15Min.Value * 0.50m
+                    : row.PriceAfter5Min ?? row.PriceAfter15Min,
+                <= 900 => row.PriceAfter15Min ?? row.PriceAfter5Min,
+                <= 1200 => row.PriceAfter15Min.HasValue && row.PriceAfter30Min.HasValue
+                    ? row.PriceAfter15Min.Value * 0.50m + row.PriceAfter30Min.Value * 0.50m
+                    : row.PriceAfter15Min ?? row.PriceAfter30Min,
+                _ => row.PriceAfter30Min ?? row.PriceAfter15Min
+            };
+
+            if (!outcomePrice.HasValue) continue;
+
+            decimal score = Math.Abs(row.Score);
+            bool wouldTrade = score >= threshold;
+            if (!wouldTrade) continue;
+
+            // Same spread/fill logic as ComputeTotalProfit
+            decimal spreadPct = row.Price > 0 ? row.Spread / row.Price : 0;
+            decimal fillProbability = spreadPct <= 0.001m ? 1.0m
+                : spreadPct <= 0.003m ? 0.85m
+                : 0.70m;
+
+            decimal priceDelta = outcomePrice.Value - row.Price;
+            decimal tradePnl = (row.SignalType == 1 ? priceDelta : -priceDelta) * SimulationShares;
+            decimal spreadCost = row.Spread * SimulationShares;
+            totalPnl += (tradePnl - spreadCost - CommissionPerTrade * 2) * fillProbability;
+        }
+        return totalPnl;
     }
 
     #endregion
