@@ -1152,7 +1152,6 @@ CRITICAL: Rules that only work on historical data but fail on recent data are WO
       ""stopLoss"": 2.0
     }}
   ],
-  ""disabledHours"": [12, 13],
   ""maxDailyTrades"": 3,
   ""maxPositionShares"": 500,
   ""maxPositionDollars"": 25000
@@ -1169,7 +1168,6 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
             int chunkCount = (rows.Count + chunkSize - 1) / chunkSize;
             var allRules = new List<StrategyRule>();
             decimal overallWinRate = 0;
-            var disabledHours = new HashSet<int>();
             int maxDailyTrades = 20;
             decimal maxPositionDollars = 25000m;
 
@@ -1242,8 +1240,6 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                         allRules.Add(rule);
                     }
                     overallWinRate = chunkStrategy.OverallWinRate; // Last chunk wins
-                    foreach (var h in chunkStrategy.DisabledHours)
-                        disabledHours.Add(h);
                     if (chunkStrategy.MaxDailyTrades > 0)
                         maxDailyTrades = chunkStrategy.MaxDailyTrades;
                     if (chunkStrategy.MaxPositionDollars > 0)
@@ -1281,7 +1277,7 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                 TickerId = tickerId,
                 OverallWinRate = overallWinRate,
                 Rules = backtested,
-                DisabledHours = disabledHours.OrderBy(h => h).ToList(),
+                DisabledHours = new List<int>(), // Disabled hours removed — hourly ScoreMultiplier handles this softly
                 MaxDailyTrades = maxDailyTrades,
                 MaxPositionDollars = maxPositionDollars,
             };

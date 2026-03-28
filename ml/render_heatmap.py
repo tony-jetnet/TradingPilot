@@ -18,7 +18,7 @@ import argparse
 import csv
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -185,7 +185,12 @@ def _price_to_y(price: float, price_min: float, price_range: float, height: int)
 
 def compute_label(window: list[Snapshot], future_snapshots: list[Snapshot]) -> int | None:
     """
-    Compute label from price movement after the window.
+    Compute label from MULTI-HORIZON weighted price movement after the window.
+
+    Uses weighted blend: 0.20×5min + 0.40×15min + 0.40×30min
+    (same weights as NightlyLocalTrainer). This matches the actual exit time
+    distribution — prevents learning short-term mean-reversion patterns that
+    conflict with 20-min holds.
 
     Returns: 0=DOWN, 1=FLAT, 2=UP, or None if insufficient future data.
     """
@@ -196,16 +201,43 @@ def compute_label(window: list[Snapshot], future_snapshots: list[Snapshot]) -> i
     if entry_price <= 0:
         return None
 
-    # Use mid-price at the horizon point
-    exit_price = future_snapshots[-1].mid_price
-    if exit_price <= 0:
+    entry_time = window[-1].timestamp
+    weighted_pct = 0.0
+    total_weight = 0.0
+
+    for horizon_sec, weight in zip(config.HORIZON_SECONDS_LIST, config.HORIZON_WEIGHTS):
+        # Find snapshot closest to this horizon
+        target_time = entry_time + timedelta(seconds=horizon_sec)
+        best_snap = None
+        best_delta = float("inf")
+
+        for snap in future_snapshots:
+            delta = abs((snap.timestamp - target_time).total_seconds())
+            if delta < best_delta:
+                best_delta = delta
+                best_snap = snap
+
+        # Allow up to 30% tolerance on horizon timing
+        if best_snap is None or best_delta > horizon_sec * 0.30:
+            continue
+
+        if best_snap.mid_price <= 0:
+            continue
+
+        pct_change = (best_snap.mid_price - entry_price) / entry_price
+        weighted_pct += pct_change * weight
+        total_weight += weight
+
+    # Require at least 5-min horizon to be present (minimum data quality)
+    if total_weight < config.HORIZON_WEIGHTS[0]:
         return None
 
-    pct_change = (exit_price - entry_price) / entry_price
+    # Normalize by actual weight used (handles missing longer horizons)
+    weighted_pct /= total_weight
 
-    if pct_change > config.UP_THRESHOLD:
+    if weighted_pct > config.UP_THRESHOLD:
         return 2  # UP
-    elif pct_change < config.DOWN_THRESHOLD:
+    elif weighted_pct < config.DOWN_THRESHOLD:
         return 0  # DOWN
     else:
         return 1  # FLAT
@@ -244,9 +276,11 @@ def generate_samples(
     skip_no_label = 0
     used = 0
 
-    # Estimate how many future snapshots we need for the horizon
-    # Snapshots are ~1s apart, horizon is config.HORIZON_SECONDS
-    future_needed = config.HORIZON_SECONDS
+    # Need enough future snapshots to cover MAX_HORIZON_SECONDS of real time.
+    # Snapshot rate varies by ticker: LLY ~1/sec, NVDA ~2.6/sec.
+    # Use 3× multiplier to ensure we capture 30 min of data even for high-rate tickers.
+    # 1800s × 3 = 5400 snapshots worst case. compute_label() finds by timestamp, not index.
+    future_needed = config.MAX_HORIZON_SECONDS * 3
 
     total_windows = (len(snapshots) - config.WINDOW_SNAPSHOTS - future_needed) // config.STRIDE_SNAPSHOTS
     if total_windows <= 0:
@@ -266,25 +300,29 @@ def generate_samples(
             continue
 
         # --- Time-span check for main window ---
-        # 300 snapshots at ~1s each = ~300s. Allow 150-600s range.
+        # 300 snapshots at varying rates: NVDA ~2.6/s (115s), LLY ~1/s (300s).
+        # Lower bound 60s: rejects windows with extremely sparse data (<5 snaps/sec)
+        # Upper bound 600s: rejects windows spanning gaps (>2s/snap average)
         window_span = (window[-1].timestamp - window[0].timestamp).total_seconds()
-        if window_span < 150 or window_span > 600:
+        if window_span < 60 or window_span > 600:
             skip_window_span += 1
             continue
 
-        # Future window for labeling
+        # Future window for labeling — collect snapshots up to MAX_HORIZON_SECONDS ahead.
+        # NOT checked for gaps (30 min of gap-free data is too strict — a single 6s hiccup
+        # would reject the entire sample). Instead, compute_label() finds the closest snapshot
+        # to each horizon point and validates per-horizon timing tolerance.
         future = snapshots[end:end + future_needed]
 
-        # --- Gap detection for future window ---
-        if has_gap(future):
+        if len(future) < 10:
             skip_future_gap += 1
             continue
 
-        # --- Time-span check for future window ---
-        # Future should span approximately HORIZON_SECONDS (allow +/-50%)
+        # Cross-day guard: future must not span overnight.
+        # After market-hours filtering, Day1 3:45PM is followed by Day2 9:30AM.
+        # Reject if future spans more than 2× max horizon (>1 hour = definitely cross-day).
         actual_future_span = (future[-1].timestamp - future[0].timestamp).total_seconds()
-        expected_span = config.HORIZON_SECONDS
-        if actual_future_span < expected_span * 0.5 or actual_future_span > expected_span * 1.5:
+        if actual_future_span > config.MAX_HORIZON_SECONDS * 2.0:
             skip_future_span += 1
             continue
 

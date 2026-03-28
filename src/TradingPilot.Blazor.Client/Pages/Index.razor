@@ -127,16 +127,16 @@
                             </div>
                             <div class="tp-ind">
                                 <span class="tp-ind-label">VWAP</span>
-                                <span class="tp-ind-val @(s.Price > s.Vwap ? "tp-up" : "tp-down")">@(s.Price > s.Vwap ? "Above" : "Below")</span>
+                                <span class="tp-ind-val @(s.Price > s.Vwap ? "tp-up" : "tp-down")">@(s.Price > s.Vwap ? "▲" : "▼")</span>
                             </div>
                             <div class="tp-ind">
-                                <span class="tp-ind-label">Vol</span>
+                                <span class="tp-ind-label">VOL</span>
                                 <span class="tp-ind-val">@FormatVolume(s.Volume)</span>
                             </div>
                             @if (s.SignalCount > 0)
                             {
                                 <div class="tp-ind">
-                                    <span class="tp-ind-label">Sig</span>
+                                    <span class="tp-ind-label">SIG</span>
                                     <span class="tp-ind-val">@s.SignalCount</span>
                                 </div>
                             }
@@ -254,6 +254,40 @@
             </div>
             <div class="col-lg-8">
                 <div class="tp-card">
+                    <div class="tp-card-title">Today's Trades</div>
+                    @if (_data.CompletedTrades.Count == 0)
+                    {
+                        <div class="tp-empty">No trades today</div>
+                    }
+                    else
+                    {
+                        <div class="tp-feed">
+                            @foreach (var ct in _data.CompletedTrades)
+                            {
+                                int holdSec = (int)(ct.ExitTime - ct.EntryTime).TotalSeconds;
+                                <div class="tp-feed-item tp-roundtrip">
+                                    <span class="tp-rt-side @(ct.IsLong ? "tp-buy" : "tp-sell")">@(ct.IsLong ? "LONG" : "SHORT")</span>
+                                    <span class="tp-rt-ticker">@ct.Ticker</span>
+                                    <span class="tp-rt-qty">@ct.Quantity</span>
+                                    <span class="tp-rt-prices">$@ct.EntryPrice.ToString("F2") → $@ct.ExitPrice.ToString("F2")</span>
+                                    <span class="tp-rt-source">@ct.EntrySource</span>
+                                    <span class="tp-rt-score @PnlClass(ct.EntryScore)">@ct.EntryScore.ToString("F2")</span>
+                                    <span class="tp-rt-exit">@ExtractExitReason(ct.ExitReason)</span>
+                                    <span class="tp-rt-pnl @PnlClass(ct.Pnl)">@FormatPnl(ct.Pnl)</span>
+                                    <span class="tp-rt-time">@ct.ExitTime.ToLocalTime().ToString("h:mm tt")</span>
+                                    <span class="tp-rt-hold">@FormatHoldTime(holdSec)</span>
+                                </div>
+                            }
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+
+        @* ─── AI RULES + SIGNAL FEED ─── *@
+        <div class="row g-2 mb-3">
+            <div class="col-lg-6">
+                <div class="tp-card">
                     <div class="tp-card-title">AI Strategy Rules</div>
                     @if (_data.StrategyStatus.IsLoaded)
                     {
@@ -267,7 +301,6 @@
                                         <th>Symbol</th>
                                         <th>Rules</th>
                                         <th>Win Rate</th>
-                                        <th>Disabled Hours</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -277,7 +310,6 @@
                                             <td class="tp-ticker-sm">@sr.Ticker</td>
                                             <td>@sr.RuleCount</td>
                                             <td class="@(sr.OverallWinRate >= 0.5m ? "tp-up" : "tp-down")">@((sr.OverallWinRate * 100).ToString("F1"))%</td>
-                                            <td class="tp-muted">@(sr.DisabledHours.Count > 0 ? string.Join(", ", sr.DisabledHours.Select(h => $"{h}:00")) : "None")</td>
                                         </tr>
                                     }
                                 </tbody>
@@ -287,36 +319,6 @@
                     else
                     {
                         <div class="tp-empty">No AI strategy rules loaded. Run nightly optimization first.</div>
-                    }
-                </div>
-            </div>
-        </div>
-
-        @* ─── TRADES + SIGNALS FEEDS ─── *@
-        <div class="row g-2 mb-3">
-            <div class="col-lg-6">
-                <div class="tp-card">
-                    <div class="tp-card-title">Recent Trades</div>
-                    @if (_data.RecentTrades.Count == 0)
-                    {
-                        <div class="tp-empty">No trades today</div>
-                    }
-                    else
-                    {
-                        <div class="tp-feed">
-                            @foreach (var t in _data.RecentTrades.Take(20))
-                            {
-                                <div class="tp-feed-item">
-                                    <span class="tp-feed-badge @(t.Action == "BUY" ? "tp-buy" : "tp-sell")">@t.Action</span>
-                                    <span class="tp-ticker-sm">@t.Ticker</span>
-                                    <span class="tp-feed-qty">@t.Quantity</span>
-                                    <span class="tp-feed-price">@@@t.Price.ToString("F2")</span>
-                                    <span class="tp-feed-reason" title="@t.Reason">@TruncateReason(t.Reason)</span>
-                                    <span class="tp-feed-time">@t.Timestamp.ToLocalTime().ToString("h:mm:ss tt")</span>
-                                    <span class="tp-feed-status @(t.Status?.Contains("Placed") == true ? "tp-up" : "tp-muted")">@t.Status</span>
-                                </div>
-                            }
-                        </div>
                     }
                 </div>
             </div>
@@ -380,6 +382,8 @@
         $"${value:N2}";
 
     private static string FormatVolume(long vol) =>
+        vol >= 1_000_000_000 ? $"{vol / 1_000_000_000.0:F1}B" :
+        vol >= 100_000_000 ? $"{vol / 1_000_000.0:F0}M" :
         vol >= 1_000_000 ? $"{vol / 1_000_000.0:F1}M" :
         vol >= 1_000 ? $"{vol / 1_000.0:F0}K" : vol.ToString();
 
@@ -401,6 +405,60 @@
 
     private static string TruncateReason(string reason) =>
         reason.Length > 40 ? reason[..37] + "..." : reason;
+
+    /// <summary>Extract short exit reason from the full reason string logged by PositionMonitor.</summary>
+    private static string ExtractExitReason(string reason)
+    {
+        if (string.IsNullOrEmpty(reason)) return "—";
+        // Match known exit types from PositionMonitor log messages
+        if (reason.Contains("TRAILING STOP")) return "TRAIL";
+        if (reason.Contains("STOP LOSS")) return "STOP";
+        if (reason.Contains("PROFIT TARGET")) return "TARGET";
+        if (reason.Contains("BREAKEVEN")) return "B/E";
+        if (reason.Contains("REGIME EXIT")) return "REGIME";
+        if (reason.Contains("OPPOSING")) return "OPPOSE";
+        if (reason.Contains("TIME+WEAK")) return "TIME";
+        if (reason.Contains("TIME+NOSIGNAL")) return "NOSIG";
+        if (reason.Contains("TIME CAP")) return "CAP";
+        return reason.Length > 8 ? reason[..8] : reason;
+    }
+
+    private static string FormatHoldTime(int seconds) =>
+        seconds >= 3600 ? $"{seconds / 3600}h{seconds % 3600 / 60}m" :
+        seconds >= 60 ? $"{seconds / 60}m" : $"{seconds}s";
+
+    private record RoundTrip(string Ticker, bool IsLong, int Qty, decimal EntryPrice, decimal ExitPrice,
+        decimal Pnl, DateTime ExitTime, int HoldSeconds, string EntrySource, decimal EntryScore, string ExitReason);
+
+    private static List<RoundTrip> PairTrades(List<TradeDto> trades)
+    {
+        var result = new List<RoundTrip>();
+        var open = new Dictionary<string, TradeDto>();
+        var sorted = trades.Where(t => t.Status == "Filled").OrderBy(t => t.Timestamp).ToList();
+
+        foreach (var t in sorted)
+        {
+            if (open.TryGetValue(t.Ticker, out var entry))
+            {
+                bool isLong = entry.Action == "BUY";
+                int qty = entry.Quantity;
+                decimal pnl = isLong
+                    ? (t.Price - entry.Price) * qty
+                    : (entry.Price - t.Price) * qty;
+                int holdSec = (int)(t.Timestamp - entry.Timestamp).TotalSeconds;
+                string entrySource = !string.IsNullOrEmpty(entry.Source) ? entry.Source : "—";
+                string exitReason = ExtractExitReason(t.Reason);
+                result.Add(new RoundTrip(t.Ticker, isLong, qty, entry.Price, t.Price, pnl, t.Timestamp, holdSec, entrySource, entry.Score, exitReason));
+                open.Remove(t.Ticker);
+            }
+            else
+            {
+                open[t.Ticker] = t;
+            }
+        }
+        result.Reverse(); // Show most recent first
+        return result;
+    }
 
     private static string HealthDotClass(string status) => status switch
     {

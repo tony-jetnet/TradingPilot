@@ -79,10 +79,6 @@ public class StrategyRuleEvaluator
         if (symbolStrategy.TickerId != tickerId)
             return null;
 
-        // Check disabled hours
-        if (symbolStrategy.DisabledHours.Contains(etHour))
-            return null;
-
         StrategyRule? bestRule = null;
 
         foreach (var rule in symbolStrategy.Rules)

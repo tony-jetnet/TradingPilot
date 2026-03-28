@@ -190,6 +190,23 @@ public static class TradingPilotDbContextModelCreatingExtensions
         // TickSnapshots table removed — indicators now stored directly in TradingSignals
         // PaperTrades table removed — broker API is sole source of truth for orders/positions
 
+        // DISPLAY ONLY — not used for trading decisions. Broker API remains sole source of truth.
+        builder.Entity<CompletedTrade>(b =>
+        {
+            b.ToTable(TradingPilotConsts.DbTablePrefix + "CompletedTrades", TradingPilotConsts.DbSchema);
+            b.HasKey(x => x.Id);
+            b.Property(x => x.Ticker).IsRequired().HasMaxLength(20);
+            b.Property(x => x.EntryPrice).HasPrecision(12, 4);
+            b.Property(x => x.ExitPrice).HasPrecision(12, 4);
+            b.Property(x => x.Pnl).HasPrecision(12, 4);
+            b.Property(x => x.EntryScore).HasPrecision(8, 6);
+            b.Property(x => x.EntrySource).HasMaxLength(20);
+            b.Property(x => x.ExitReason).HasMaxLength(500);
+
+            b.HasIndex(x => x.ExitTime).HasDatabaseName("IX_CompletedTrades_ExitTime");
+            b.HasIndex(x => new { x.Ticker, x.ExitTime }).HasDatabaseName("IX_CompletedTrades_Ticker_ExitTime");
+        });
+
         builder.Entity<BrokerSymbolMapping>(b =>
         {
             b.ToTable(TradingPilotConsts.DbTablePrefix + "BrokerSymbolMappings", TradingPilotConsts.DbSchema);

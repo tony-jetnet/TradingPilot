@@ -786,7 +786,7 @@ public class NightlyLocalTrainer
             var adj = new HourlyAdjustment
             {
                 WinRate = Math.Round(winRate, 4),
-                EnableTrading = expectedValue > 0 && hourRows.Count >= 10,
+                EnableTrading = true, // Disabled hours removed — ScoreMultiplier handles bad hours softly
             };
 
             if (winRate > 0.60m)

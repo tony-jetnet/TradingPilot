@@ -17,7 +17,15 @@ STRIDE_SNAPSHOTS = 100          # slide window by 100 snapshots (~100s)
                                 # 100 gives ~67% overlap — much less sample correlation,
                                 # better generalization, and still enough training data.
 PRICE_LEVELS = 200              # Y-axis resolution (number of price rows)
-HORIZON_SECONDS = 300           # 5-min forward look for labeling (matches WasCorrect5Min)
+HORIZON_SECONDS = 300           # Legacy single-horizon (used for future window sizing)
+
+# Multi-horizon labels: matches NightlyLocalTrainer outcome weighting.
+# Prevents Swin from learning short-term mean-reversion patterns that
+# conflict with our 20-min hold time (OptimalHoldSeconds=1200).
+HORIZON_SECONDS_LIST = [300, 900, 1800]   # 5 min, 15 min, 30 min
+HORIZON_WEIGHTS = [0.20, 0.40, 0.40]     # Weighted blend (same as trainer)
+MAX_HORIZON_SECONDS = max(HORIZON_SECONDS_LIST)  # 1800s — how far forward to look
+
 UP_THRESHOLD = 0.003            # min % move to count as UP (30 bps)
                                 # Was 0.001 (10 bps) — barely above transaction costs.
                                 # 30 bps ensures predicted moves are profitable after

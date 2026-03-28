@@ -166,8 +166,8 @@ body, .lp-content-wrapper, .container-fluid, main {
 .tp-symbol-card {
     background: var(--tp-surface);
     border: 1px solid var(--tp-border);
-    border-radius: 10px;
-    padding: 14px 16px;
+    border-radius: 8px;
+    padding: 10px 12px;
     transition: border-color 0.2s, box-shadow 0.2s;
     height: 100%;
     overflow: hidden;
@@ -226,24 +226,31 @@ body, .lp-content-wrapper, .container-fluid, main {
     font-size: 0.75rem; font-weight: 600;
 }
 
-/* Indicator row */
+/* Indicator row — always single row, no wrapping */
 .tp-indicator-row {
-    display: flex; gap: 4px; flex-wrap: wrap;
+    display: flex; gap: 2px; flex-wrap: nowrap;
 }
 .tp-ind {
     display: flex; flex-direction: column; align-items: center;
-    flex: 1; min-width: 50px;
-    padding: 4px 0;
+    flex: 1 1 0; min-width: 0;
+    padding: 3px 2px;
     background: rgba(255,255,255,0.02);
-    border-radius: 6px;
+    border-radius: 4px;
+    overflow: hidden;
 }
 .tp-ind-label {
-    font-size: 0.6rem; color: var(--tp-text-dim);
-    text-transform: uppercase; letter-spacing: 0.06em;
+    font-size: 0.55rem; color: var(--tp-text-dim);
+    text-transform: uppercase; letter-spacing: 0.04em;
+    line-height: 1;
 }
 .tp-ind-val {
     font-family: var(--tp-mono);
-    font-size: 0.78rem; font-weight: 600;
+    font-size: 0.72rem; font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    line-height: 1.2;
 }
 
 /* Signal bar */
@@ -374,11 +381,17 @@ body, .lp-content-wrapper, .container-fluid, main {
     background: rgba(255,255,255,0.02);
 }
 .tp-feed-qty { color: var(--tp-text-dim); }
-.tp-feed-price { color: var(--tp-text); font-weight: 600; }
+.tp-feed-price { color: var(--tp-text); font-weight: 600; white-space: nowrap; }
 .tp-feed-reason {
     color: var(--tp-text-dim); font-size: 0.68rem;
     flex: 1; min-width: 0;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tp-feed-pnl {
+    font-weight: 700; white-space: nowrap; min-width: 60px; text-align: right;
+}
+.tp-feed-hold {
+    color: var(--tp-text-dim); font-size: 0.65rem; white-space: nowrap;
 }
 .tp-feed-time {
     color: var(--tp-text-dim); font-size: 0.68rem;
@@ -386,6 +399,42 @@ body, .lp-content-wrapper, .container-fluid, main {
 }
 .tp-feed-score { font-weight: 700; }
 .tp-feed-status { font-size: 0.65rem; }
+.tp-pending { background: var(--tp-border); color: var(--tp-text-dim); }
+
+/* Round-trip trade row — fixed column widths for alignment */
+/* Columns: SIDE | TICKER | QTY | PRICES | SOURCE | SCORE | EXIT | P&L | TIME | HOLD */
+.tp-roundtrip {
+    display: grid !important;
+    grid-template-columns: 44px 44px 32px 1fr 52px 38px 48px 68px 60px 34px;
+    gap: 4px;
+    align-items: center;
+}
+.tp-roundtrip:nth-child(even) {
+    background: rgba(255,255,255,0.03);
+}
+.tp-rt-side {
+    font-size: 0.55rem; font-weight: 700;
+    padding: 2px 3px; border-radius: 3px;
+    text-align: center; white-space: nowrap;
+    letter-spacing: 0.03em;
+}
+.tp-rt-side.tp-buy { background: var(--tp-up-bg); color: var(--tp-up); }
+.tp-rt-side.tp-sell { background: var(--tp-down-bg); color: var(--tp-down); }
+.tp-rt-ticker { font-weight: 700; color: #e6edf3; white-space: nowrap; }
+.tp-rt-qty { color: var(--tp-text-dim); text-align: right; }
+.tp-rt-prices { color: var(--tp-text); font-size: 0.70rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tp-rt-source {
+    font-size: 0.58rem; font-weight: 600; color: var(--tp-accent);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tp-rt-score { font-size: 0.70rem; font-weight: 600; text-align: right; white-space: nowrap; }
+.tp-rt-exit {
+    font-size: 0.58rem; font-weight: 600; color: var(--tp-gold);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tp-rt-pnl { font-weight: 700; text-align: right; white-space: nowrap; }
+.tp-rt-time { color: var(--tp-text-dim); font-size: 0.65rem; text-align: right; white-space: nowrap; }
+.tp-rt-hold { color: var(--tp-text-dim); font-size: 0.62rem; text-align: right; white-space: nowrap; }
 
 /* Strength badges */
 .tp-strength {

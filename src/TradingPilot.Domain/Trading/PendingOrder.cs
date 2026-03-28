@@ -26,6 +26,9 @@ public class PendingOrder
     public decimal RuleConfidence { get; set; }
     public int HoldSeconds { get; set; }
     public decimal StopLoss { get; set; }
+
+    // Exit metadata (set when exit order is placed, read on fill confirmation)
+    public string ExitReason { get; set; } = "";
 }
 
 public enum OrderPurpose

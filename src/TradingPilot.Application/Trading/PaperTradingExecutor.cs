@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using TradingPilot.EntityFrameworkCore;
 using TradingPilot.Symbols;
 using TradingPilot.Trading;
 
@@ -31,6 +33,7 @@ public class PaperTradingExecutor
     private readonly L2BookCache _l2Cache;
     private readonly BarIndicatorCache _barCache;
     private readonly MarketMicrostructureAnalyzer _analyzer;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<PaperTradingExecutor> _logger;
 
     // State: keyed by Symbol (ticker name)
@@ -38,8 +41,9 @@ public class PaperTradingExecutor
     private readonly ConcurrentDictionary<string, PositionState> _positions = new();
     private readonly ConcurrentDictionary<string, PendingOrder> _pendingExits = new();
     private readonly ConcurrentDictionary<string, DateTime> _lastTradeTime = new();
-    // Daily trade counter per symbol (reset on date change)
-    // _dailyTradeCount removed — P&L hard stops + rate limit + live rule tracking are sufficient
+    // Track last trade outcome per symbol — used for loss cooldown (30 min after a losing trade)
+    private readonly ConcurrentDictionary<string, (DateTime ExitTime, decimal Pnl)> _lastTradeOutcome = new();
+    private const int LossCooldownSeconds = 1800; // 30 minutes after a losing trade on same symbol
 
     // Cached broker account (5s TTL) — guarded by SemaphoreSlim for thread safety
     private BrokerAccount? _cachedAccount;
@@ -52,6 +56,7 @@ public class PaperTradingExecutor
         L2BookCache l2Cache,
         BarIndicatorCache barCache,
         MarketMicrostructureAnalyzer analyzer,
+        IServiceScopeFactory scopeFactory,
         IConfiguration configuration,
         ILogger<PaperTradingExecutor> logger)
     {
@@ -60,6 +65,7 @@ public class PaperTradingExecutor
         _l2Cache = l2Cache;
         _barCache = barCache;
         _analyzer = analyzer;
+        _scopeFactory = scopeFactory;
         _logger = logger;
 
         // Read config from the active broker's section (Broker or BrokerQuestrade)
@@ -83,6 +89,33 @@ public class PaperTradingExecutor
     /// </summary>
     public IReadOnlyDictionary<string, PositionState> GetOpenPositions()
         => _positions;
+
+    /// <summary>
+    /// Get today's completed round-trip trades from DB for dashboard display.
+    /// DISPLAY ONLY — not used for trading decisions.
+    /// </summary>
+    public List<CompletedTrade> GetCompletedTrades()
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
+            var eastern = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
+            var todayEt = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eastern).Date;
+            var todayUtcStart = TimeZoneInfo.ConvertTimeToUtc(todayEt, eastern);
+
+            return dbContext.CompletedTrades
+                .Where(ct => ct.ExitTime >= todayUtcStart)
+                .OrderByDescending(ct => ct.ExitTime)
+                .Take(20)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load completed trades from DB");
+            return [];
+        }
+    }
 
     /// <summary>
     /// Check if an exit order is already in flight for this symbol.
@@ -192,15 +225,22 @@ public class PaperTradingExecutor
             return;
         }
 
-        // Rate limit per symbol
+        // Rate limit per symbol (5 min base cooldown)
         if (_lastTradeTime.TryGetValue(signal.Ticker, out var lastTime)
             && (DateTime.UtcNow - lastTime).TotalSeconds < _rateLimitSeconds)
             return;
 
-        // Per-symbol daily trade count limit removed — redundant with:
-        //   - Daily P&L hard stops (-$500 / +$500)
-        //   - 300s rate limit per symbol
-        //   - Live rule performance tracking (auto-disables losing rules)
+        // Loss cooldown: 30 min after a losing trade on same symbol.
+        // Prevents repeatedly entering the same losing setup (e.g., SMCI shorted 4x into a rally).
+        if (_lastTradeOutcome.TryGetValue(signal.Ticker, out var lastOutcome)
+            && lastOutcome.Pnl <= 0
+            && (DateTime.UtcNow - lastOutcome.ExitTime).TotalSeconds < LossCooldownSeconds)
+        {
+            _logger.LogDebug("Skipping {Ticker}: loss cooldown ({Pnl:F2} at {Time}, {Remaining}s remaining)",
+                signal.Ticker, lastOutcome.Pnl, lastOutcome.ExitTime,
+                LossCooldownSeconds - (int)(DateTime.UtcNow - lastOutcome.ExitTime).TotalSeconds);
+            return;
+        }
 
         decimal score = signal.Indicators.GetValueOrDefault("CompositeScore");
 
@@ -475,6 +515,7 @@ public class PaperTradingExecutor
                 LimitPrice = limitPrice,
                 PlacedAt = DateTime.UtcNow,
                 Purpose = OrderPurpose.Exit,
+                ExitReason = reason,
             };
 
             // Atomic add — if another thread already placed an exit, cancel this one
@@ -607,6 +648,38 @@ public class PaperTradingExecutor
                     if (_positions.TryGetValue(symbol, out var pos))
                     {
                         decimal pnl = (pos.IsLong ? filledPrice - pos.EntryPrice : pos.EntryPrice - filledPrice) * filledQty;
+
+                        // Record outcome for loss cooldown (30 min after losing trade on same symbol)
+                        _lastTradeOutcome[symbol] = (DateTime.UtcNow, pnl);
+
+                        // Record completed round-trip to DB for dashboard (DISPLAY ONLY — not used for trading)
+                        try
+                        {
+                            string entrySource = !string.IsNullOrEmpty(pos.EntryRuleId) && pos.EntryRuleId != "RECOVERED" && pos.EntryRuleId != "STARTUP"
+                                ? "RULE" : "WEIGHTED";
+                            using var tradeScope = _scopeFactory.CreateScope();
+                            var tradeDb = tradeScope.ServiceProvider.GetRequiredService<TradingPilotDbContext>();
+                            tradeDb.CompletedTrades.Add(new CompletedTrade
+                            {
+                                Ticker = symbol,
+                                TickerId = pos.TickerId,
+                                IsLong = pos.IsLong,
+                                Quantity = filledQty,
+                                EntryPrice = pos.EntryPrice,
+                                ExitPrice = filledPrice,
+                                EntryTime = pos.EntryTime,
+                                ExitTime = order.FilledTime ?? DateTime.UtcNow,
+                                Pnl = pnl,
+                                EntrySource = entrySource,
+                                EntryScore = pos.EntryScore,
+                                ExitReason = pending.ExitReason,
+                            });
+                            await tradeDb.SaveChangesAsync();
+                        }
+                        catch (Exception dbEx)
+                        {
+                            _logger.LogWarning(dbEx, "Failed to persist completed trade to DB (non-fatal)");
+                        }
 
                         // Track live rule performance for auto-disabling losing rules
                         if (!string.IsNullOrEmpty(pos.EntryRuleId) && pos.EntryRuleId != "RECOVERED" && pos.EntryRuleId != "STARTUP")

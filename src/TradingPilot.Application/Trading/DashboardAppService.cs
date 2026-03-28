@@ -15,6 +15,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
     private readonly L2BookCache _l2Cache;
     private readonly StrategyRuleEvaluator _ruleEvaluator;
     private readonly MqttMessageProcessor _mqttProcessor;
+    private readonly PaperTradingExecutor _executor;
     private readonly IBrokerClient _broker;
     private readonly IServiceScopeFactory _scopeFactory;
 
@@ -25,6 +26,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
         L2BookCache l2Cache,
         StrategyRuleEvaluator ruleEvaluator,
         MqttMessageProcessor mqttProcessor,
+        PaperTradingExecutor executor,
         IBrokerClient broker,
         IServiceScopeFactory scopeFactory)
     {
@@ -34,6 +36,7 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
         _l2Cache = l2Cache;
         _ruleEvaluator = ruleEvaluator;
         _mqttProcessor = mqttProcessor;
+        _executor = executor;
         _broker = broker;
         _scopeFactory = scopeFactory;
     }
@@ -131,6 +134,26 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 Status = o.Status,
             };
         }).ToList();
+
+        // Completed round-trip trades from PaperTradingExecutor (has entry source, score, exit reason)
+        dto.CompletedTrades = _executor.GetCompletedTrades()
+            .OrderByDescending(ct => ct.ExitTime)
+            .Take(20)
+            .Select(ct => new CompletedTradeDto
+            {
+                Ticker = ct.Ticker,
+                IsLong = ct.IsLong,
+                Quantity = ct.Quantity,
+                EntryPrice = ct.EntryPrice,
+                ExitPrice = ct.ExitPrice,
+                EntryTime = ct.EntryTime,
+                ExitTime = ct.ExitTime,
+                Pnl = ct.Pnl,
+                EntrySource = ct.EntrySource,
+                EntryScore = ct.EntryScore,
+                ExitReason = ct.ExitReason,
+            })
+            .ToList();
 
         // Recent signals from all tickers (from in-memory store)
         var feedSignals = new List<TradingSignal>();
@@ -282,7 +305,8 @@ public class DashboardAppService : ApplicationService, IDashboardAppService
                 var tradeDto = dto.RecentTrades
                     .FirstOrDefault(t => t.Ticker == order.Symbol && t.Timestamp == order.FilledTime);
                 string source = tradeDto?.Source ?? "";
-                openPositions[order.Symbol] = (order.Action, order.FilledPrice ?? 0, order.Quantity, source);
+                int qty = order.FilledQuantity > 0 ? order.FilledQuantity : order.Quantity;
+                openPositions[order.Symbol] = (order.Action, order.FilledPrice ?? 0, qty, source);
             }
         }
 

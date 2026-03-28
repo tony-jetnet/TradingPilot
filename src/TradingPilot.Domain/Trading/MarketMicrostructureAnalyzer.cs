@@ -340,14 +340,6 @@ public class MarketMicrostructureAnalyzer
             if (state.LastSignalTime != default && (ruleNow - state.LastSignalTime) < MinSignalInterval)
                 return null;
 
-            // Check hourly trading enablement from model config (same as Stage 2)
-            var ruleTickerConfig = _modelConfig?.Tickers.GetValueOrDefault(tickerId);
-            if (ruleTickerConfig != null)
-            {
-                if (ruleTickerConfig.HourlyAdjustments.TryGetValue(etHour, out var ruleHourAdj) && !ruleHourAdj.EnableTrading)
-                    return null;
-            }
-
             // Check live rule performance — disable rules losing money in real-time
             if (_ruleEvaluator.IsRuleDisabledByLivePerformance(rule.Id))
             {
@@ -466,13 +458,6 @@ public class MarketMicrostructureAnalyzer
         // Check if we have learned config for this ticker
         var tickerConfig = _modelConfig?.Tickers.GetValueOrDefault(tickerId);
 
-        // Check hourly trading enablement from model config
-        if (tickerConfig != null)
-        {
-            if (tickerConfig.HourlyAdjustments.TryGetValue(etHour, out var hourAdj) && !hourAdj.EnableTrading)
-                return null; // Skip this hour — historically unprofitable
-        }
-
         decimal compositeScore;
         var barIndicators = _barCache.GetIndicators(tickerId);
 
@@ -535,25 +520,47 @@ public class MarketMicrostructureAnalyzer
 
         if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
         {
-            // Blend: Swin weight = its confidence, indicator weight = remainder
-            // At 0.40 conf: 40% Swin + 60% indicators (indicators dominate)
-            // At 0.70 conf: 70% Swin + 30% indicators (Swin leads, indicators moderate)
-            decimal swinWeight = (decimal)swinPrediction.Confidence;
-            decimal indicatorWeight = 1m - swinWeight;
             decimal swinScore = (decimal)swinPrediction.Score;
 
-            compositeScore = swinScore * swinWeight + weightedScore * indicatorWeight;
-            usedSwin = true;
+            // Direction agreement check: Swin must agree with weighted indicators on direction
+            // AND indicators must have minimum conviction (|weighted| >= 0.05) to confirm.
+            // If indicators are too weak (<0.05), there's no real confirmation — skip Swin.
+            // Prevents Swin from trading on its own when L2 indicators have no opinion.
+            // Threshold 0.05: PLTR weighted=+0.086 passes, SMCI weighted=-0.033 blocked.
+            const decimal minIndicatorConviction = 0.05m;
+            bool directionAgrees = (swinScore > 0 && weightedScore >= minIndicatorConviction)
+                                || (swinScore < 0 && weightedScore <= -minIndicatorConviction);
 
-            // Cache the blended score for ComputeCurrentScore
-            _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
+            if (directionAgrees)
+            {
+                // Blend: Swin weight capped at 50% to prevent 5-min prediction from dominating 20-min holds.
+                // At 0.50 conf: 50% Swin + 50% indicators (balanced)
+                // At 0.85 conf: still 50% Swin + 50% indicators (capped)
+                decimal swinWeight = Math.Min((decimal)swinPrediction.Confidence, 0.50m);
+                decimal indicatorWeight = 1m - swinWeight;
 
-            _logger.LogDebug(
-                "Swin BLEND for {Ticker}: swin={SwinScore:F3}×{SwinW:F2} + weighted={WeightedScore:F3}×{IndW:F2} = {Blend:F3} " +
-                "conf={Conf:F3} P(up)={Up:F3} P(down)={Down:F3}",
-                ticker, swinScore, swinWeight, weightedScore, indicatorWeight, compositeScore,
-                swinPrediction.Confidence, swinPrediction.UpProbability,
-                swinPrediction.DownProbability);
+                compositeScore = swinScore * swinWeight + weightedScore * indicatorWeight;
+                usedSwin = true;
+
+                _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
+
+                _logger.LogDebug(
+                    "Swin BLEND for {Ticker}: swin={SwinScore:F3}×{SwinW:F2} + weighted={WeightedScore:F3}×{IndW:F2} = {Blend:F3} " +
+                    "conf={Conf:F3} P(up)={Up:F3} P(down)={Down:F3}",
+                    ticker, swinScore, swinWeight, weightedScore, indicatorWeight, compositeScore,
+                    swinPrediction.Confidence, swinPrediction.UpProbability,
+                    swinPrediction.DownProbability);
+            }
+            else
+            {
+                // Swin disagrees with indicators — use indicators only.
+                // Swin's 5-min horizon may be correct short-term, but for 20-min holds
+                // we trust the L2/tick indicators over Swin's direction.
+                compositeScore = weightedScore;
+                _logger.LogInformation(
+                    "Swin DISAGREES with indicators for {Ticker}: swin={SwinScore:F3} vs weighted={WeightedScore:F3} — using indicators only",
+                    ticker, swinScore, weightedScore);
+            }
         }
         else
         {
@@ -821,11 +828,18 @@ public class MarketMicrostructureAnalyzer
 
             if (swinPrediction != null && swinPrediction.Confidence >= 0.40f)
             {
-                decimal swinWeight = (decimal)swinPrediction.Confidence;
-                decimal indicatorWeight = 1m - swinWeight;
-                compositeScore = (decimal)swinPrediction.Score * swinWeight + weightedScore * indicatorWeight;
-                _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
-                usedSwin = true;
+                decimal swinScore = (decimal)swinPrediction.Score;
+                const decimal minConviction = 0.05m;
+                bool directionAgrees = (swinScore > 0 && weightedScore >= minConviction)
+                                    || (swinScore < 0 && weightedScore <= -minConviction);
+                if (directionAgrees)
+                {
+                    decimal swinWeight = Math.Min((decimal)swinPrediction.Confidence, 0.50m);
+                    decimal indicatorWeight = 1m - swinWeight;
+                    compositeScore = swinScore * swinWeight + weightedScore * indicatorWeight;
+                    _swinScoreCache[tickerId] = (compositeScore, DateTime.UtcNow);
+                    usedSwin = true;
+                }
             }
         }
 

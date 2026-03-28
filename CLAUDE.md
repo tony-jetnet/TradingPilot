@@ -36,7 +36,7 @@ ABP Framework 10.1 app with DDD layered architecture. .NET 10.0, PostgreSQL, Red
 Real-time L2 order book data flows through a two-stage signal pipeline in `MarketMicrostructureAnalyzer.AnalyzeSnapshot()`:
 
 1. **Stage 1 — AI Rule Evaluation**: `StrategyRuleEvaluator` checks conditional rules from `strategy_rules.json` (generated nightly by Bedrock Sonnet 4.6). If a rule matches, apply contextual filters (trend, VWAP, volume, RSI) to the rule's confidence score. Reject if filtered score drops below 0.20. Also checks hourly enablement from model config and live rule performance tracking.
-2. **Stage 2 — Swin + Weighted Scoring Blend**: If no rule matches, always compute the weighted score from **6 L2/tick indicators** (OBI, WOBI, PressureRoc, Spread, LargeOrder, TickMomentum). If the Swin vision model (ONNX) is confident (≥0.40), **blend** Swin score with weighted score: `composite = swinScore × confidence + weightedScore × (1-confidence)`. If Swin unavailable/low-confidence, use weighted score alone. Then apply contextual filters (trend, VWAP, volume, RSI) as post-scoring multipliers. This prevents Swin from overriding indicator disagreement.
+2. **Stage 2 — Swin + Weighted Scoring Blend**: If no rule matches, always compute the weighted score from **6 L2/tick indicators** (OBI, WOBI, PressureRoc, Spread, LargeOrder, TickMomentum). Swin vision model (ONNX) blends only when ALL three conditions met: (a) confidence ≥ 0.40, (b) agrees with indicators on direction (both positive or both negative), (c) indicators have minimum conviction |weighted| ≥ 0.05. Blend formula: `composite = swinScore × min(confidence, 0.50) + weightedScore × (1-weight)`. If any condition fails, use weighted score only. Then apply contextual filters (trend, VWAP, volume, RSI) as post-scoring multipliers.
 
 **No double penalization**: Trend, VWAP, Volume, and RSI are handled ONLY by contextual filters (weight=0 in the scoring). They are NOT included as weighted indicators in the composite score. This prevents the same signal from being penalized twice.
 
@@ -113,7 +113,8 @@ The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars befo
 - **Multi-horizon outcome**: Training labels use weighted blend: `0.20×PriceAfter5Min + 0.40×PriceAfter15Min + 0.40×PriceAfter30Min` (approximates actual exit time distribution instead of fixed 30-min horizon)
 - **Overfit guard (strengthened)**: Falls back to defaults if: (a) optimized weights lose on validation AND defaults win, OR (b) defaults outperform by 2×+, OR (c) validation P&L < 15% of training P&L (train/val divergence)
 - **Threshold validation**: Optimized thresholds are validated on held-out set; reverts to defaults if they lose on validation
-- **Hour/direction gating**: Uses expected value (EV = avgWin×winRate - avgLoss×lossRate) instead of raw win rate. Minimum 10 samples per hour.
+- **Direction gating**: Uses expected value (EV = avgWin×winRate - avgLoss×lossRate) instead of raw win rate. Minimum 10 samples.
+- **Hourly ScoreMultiplier**: High win rate hours (>60%) get 1.2× boost, low (<50%) get 0.7× dampen. **No disabled hours** — removed 2026-03-26 because hard-blocking entire hours was too aggressive and missed opportunities. The ScoreMultiplier handles bad hours softly instead.
 - **Training data filters**: Only signals with |Score| ≥ 0.20 (tradeable signals). Excludes backfilled bar-derived signals (`Reason NOT LIKE '%BACKFILL%'`). Market hours only (9:30 AM - 4:00 PM ET). Excludes cold-cache signals (OBI=0 AND WOBI=0 AND TickMomentum=0). Requires at least PriceAfter5Min (rows with only 1-min outcome are excluded — they fell into data gaps).
 - **Weights 6-9 (Trend, VWAP, Volume, RSI)**: Fixed at 0 — contextual filters handle these. Optimizer only perturbs weights 0-5.
 - **Hold time optimization (2026-03-25)**: Tests candidates [300, 600, 900, 1200, 1800] seconds per ticker. For each, computes P&L using the closest price outcome columns (PriceAfter5/15/30Min with interpolation). Walk-forward validated: falls back to 1200s default if best candidate loses on validation. Default changed from 3600s to 1200s (20 min) to match the ~19 min weighted training horizon (`0.20×5min + 0.40×15min + 0.40×30min`). The old 3600s default caused all Stage 2 trades to exit via TIME+WEAK because L2 scores naturally decay over 60 min.
@@ -128,6 +129,7 @@ The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars befo
 - Tiered limit orders: strong signals (score ≥ 0.40) use midprice; moderate signals use bid+10% spread offset
 - Entry order timeout: 90 seconds (stale L2 signals expire quickly)
 - Rule entry threshold: 0.35 (same as Stage 2, since raw confidence already passed 0.55 gate in StrategyRuleEvaluator)
+- **Loss cooldown**: 30-minute cooldown per symbol after a losing trade (P&L ≤ 0). Prevents re-entering the same losing setup. Base 300s rate limit still applies for winning trades.
 - **Opposing signal exit**: If we hold a position and get a strong opposing signal (|score| ≥ 0.40), exit immediately. Threshold 0.40 matches "strong signal" throughout the codebase, prevents whipsaw from moderate signals. Event-driven (fires on signal arrival, not 5s poll).
 
 **Exit checks** (evaluated every 5s in priority order):
@@ -170,6 +172,18 @@ The stop loss uses `Max(ruleStop, 2.0×ATR, entrySpread)` which is correct for m
 - `TradingSignalRecord` — Buy/sell signal with indicators, verified with PriceAfter1Min/5Min/15Min/30Min
 - `ModelConfig` / `TickerModelConfig` — Learned weights + thresholds from hill-climbing
 - `StrategyConfig` / `StrategyRule` — AI-discovered conditional rules with per-rule hold time, stop loss
+- `CompletedTrade` — Round-trip trade with entry source, entry score, and exit reason (persisted to DB)
+
+### CompletedTrades Table (DISPLAY ONLY)
+
+**CRITICAL RULE**: The `CompletedTrades` table is used ONLY by the "Today's Trades" dashboard UI. It is NOT used for any trading decisions, P&L calculations, position management, or performance metrics. The **broker API is the sole source of truth** for:
+- P&L (Performance box, daily P&L stops, nightly trainer outcomes)
+- Positions (entry gating, position limits, broker sync)
+- Order status (fill confirmation, exit escalation)
+
+`CompletedTrades` exists because the broker API does not return entry source (RULE/WEIGHTED), entry score, or exit reason (TRAILING STOP, REGIME EXIT, etc.). These are only known at trade time inside `PaperTradingExecutor` and would be lost on app restart without persistence.
+
+If `CompletedTrades` is empty or unavailable, the dashboard simply shows "No trades today" — trading is unaffected.
 
 ## Important Patterns
 
@@ -253,6 +267,9 @@ Background jobs use `[DisableConcurrentExecution(seconds)]` to prevent overlappi
 | Regime exit threshold | **40% of stop distance** | AMD → $1.60. When VWAP/EMA/RSI say "wrong direction" AND trailing not active AND losing 40% of stop → exit early. NOT a hard exit from indicators — requires losing money + indicator confirmation + 40% stop threshold. |
 | Opposing signal threshold | **0.40** (strong signal) | Matches "strong" classification throughout codebase. Only exits on high-conviction reversals, prevents whipsaw from moderate signals. |
 | Score=0 handling | **Unknown, not weak** | ComputeCurrentScore returns exactly 0.000 on data gaps (never natural from 6 blended indicators). Profitable positions survive data gaps. Losing positions with no signal exit as TIME+NOSIGNAL. |
+| Loss cooldown | **1800s (30 min) per symbol** | After a losing trade (P&L ≤ 0) on a symbol, block re-entry on that symbol for 30 minutes. Prevents repeatedly entering the same losing setup (e.g., SMCI shorted 4x into a rally on 2026-03-27). Winning trades have no extended cooldown (base 300s rate limit applies). |
+| Swin direction agreement | **Required before blending, min conviction 0.05** | Swin must agree with weighted indicators on direction AND indicators must have |weighted| ≥ 0.05 conviction. If Swin says SELL but indicators say BUY → blocked. If indicators are near-zero (|weighted| < 0.05) → blocked (no confirmation). Prevents Swin from trading alone when L2 has no opinion. 2026-03-27 SMCI: weighted=-0.033 (noise) let Swin trade → -$271 loss. With 0.05 threshold: blocked. |
+| Swin blend weight cap | **50% max** | Even at 85% confidence, Swin gets at most 50% of the blend. Prevents Swin from dominating the composite score. Previous behavior: 85% confidence → 85% Swin weight → indicators nearly irrelevant. |
 
 ## Swin Vision Model (ml/ directory)
 
@@ -274,6 +291,8 @@ export_data.py --days 20  →  render_heatmap.py  →  train.py  →  export_onn
 - **~28K samples is sufficient**: Fine-tuning (not training from scratch) — pretrained ImageNet features transfer to heatmaps. Only top 2 stages unfrozen (~7-8M params). More data adds stale regime noise.
 - **Memory-mapped Dataset**: `images.npy` loaded via `np.load(mmap_mode='r')`. Dataset stores file path + index array (not the array itself). Each DataLoader worker opens its own mmap handle lazily. This avoids Windows `spawn` pipe size limits that crash at ~2 GB+.
 - **Mixed precision (AMP)**: `torch.amp.autocast` + `GradScaler` for ~2x GPU speedup with negligible accuracy impact.
+- **Multi-horizon labels (2026-03-27)**: Labels use weighted blend `0.20×5min + 0.40×15min + 0.40×30min` matching NightlyLocalTrainer. Previously used pure 5-min horizon which caused Swin to learn short-term mean-reversion patterns that conflicted with 20-min holds. Example: SMCI shorted 4x into a rally because Swin predicted 5-min dips correctly but the 20-min move was UP.
+- **Percentage-normalized price axis attempted and reverted (2026-03-27)**: Tried mapping Y-axis to % deviation from center mid-price to prevent ticker fingerprinting. Failed — pretrained ImageNet features don't transfer to the radically different visual patterns (27% accuracy vs ~55% with absolute). Reverted to absolute price rendering. Fingerprinting to be addressed via data augmentation in a future iteration.
 
 ### Training Config (ml/config.py)
 
@@ -281,6 +300,8 @@ export_data.py --days 20  →  render_heatmap.py  →  train.py  →  export_onn
 |---------|-------|-------|
 | STRIDE_SNAPSHOTS | 100 | ~67% overlap between windows (was 30 = 90% overlap, too correlated) |
 | UP/DOWN_THRESHOLD | ±0.003 (30 bps) | Must exceed spread + slippage to be profitable |
+| HORIZON_SECONDS_LIST | [300, 900, 1800] | Multi-horizon: 5min, 15min, 30min |
+| HORIZON_WEIGHTS | [0.20, 0.40, 0.40] | Same as NightlyLocalTrainer outcome weighting |
 | BATCH_SIZE | 64 | |
 | LEARNING_RATE | 1e-4 | Phase 1 and Phase 2 base LR |
 | EPOCHS_HEAD | 5 | Phase 1: frozen backbone |
@@ -291,9 +312,11 @@ export_data.py --days 20  →  render_heatmap.py  →  train.py  →  export_onn
 ### Data Quality Guards (render_heatmap.py)
 
 - **Market hours filter**: Only snapshots 9:30 AM - 4:00 PM ET used for training. Pre/post-market have different spread/volume characteristics.
-- **Gap detection**: Windows with any consecutive snapshot gap > 5 seconds are skipped. Prevents cross-gap heatmaps that span hours of real time while looking continuous.
-- **Window time span check**: Main window must span 150-600 seconds of real time (expected ~300s for 300 snapshots). Rejects windows with abnormal snapshot frequency.
-- **Future window validation**: Label window must span 50%-150% of HORIZON_SECONDS. Prevents labels that measure wrong time horizons due to gaps.
+- **Gap detection (main window only)**: Windows with any consecutive snapshot gap > 5 seconds are skipped. Prevents cross-gap heatmaps. NOT applied to future window (30 min gap-free is too strict).
+- **Window time span check**: Main window must span 60-600 seconds. Lower bound 60s (not 150s) because snapshot rate varies: NVDA ~2.6/sec (300 snaps = 115s) vs LLY ~1/sec (300 snaps = 300s).
+- **Future window sizing**: Uses `MAX_HORIZON_SECONDS × 3 = 5400` snapshots to guarantee 30 min of coverage even for high-rate tickers (2.6 snaps/sec × 1800s = 4680 snapshots needed).
+- **Cross-day guard**: Future window span must not exceed 2× MAX_HORIZON (3600s). Prevents labels from using next-day prices after market-hours filtering concatenates days.
+- **Per-horizon label quality**: `compute_label()` finds closest snapshot to each 5/15/30 min point. Tolerates ±30% timing deviation per horizon. Requires at least the 5-min horizon. Missing longer horizons are handled by weight normalization.
 - **Skip statistics**: Logged after each symbol showing how many windows were rejected by each filter.
 
 ### Class Imbalance

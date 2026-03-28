@@ -12,6 +12,7 @@ public class DashboardDto
     public List<SymbolLiveDto> Symbols { get; set; } = new();
     public List<PositionDto> OpenPositions { get; set; } = new();
     public List<TradeDto> RecentTrades { get; set; } = new();
+    public List<CompletedTradeDto> CompletedTrades { get; set; } = new();
     public List<SignalDto> RecentSignals { get; set; } = new();
     public PnlSummaryDto PnlSummary { get; set; } = new();
     public StrategyStatusDto StrategyStatus { get; set; } = new();
@@ -73,6 +74,21 @@ public class TradeDto
     public string Reason { get; set; } = "";
     public string Source { get; set; } = ""; // RULE, SWIN, WEIGHTED
     public string? Status { get; set; }
+}
+
+public class CompletedTradeDto
+{
+    public string Ticker { get; set; } = "";
+    public bool IsLong { get; set; }
+    public int Quantity { get; set; }
+    public decimal EntryPrice { get; set; }
+    public decimal ExitPrice { get; set; }
+    public DateTime EntryTime { get; set; }
+    public DateTime ExitTime { get; set; }
+    public decimal Pnl { get; set; }
+    public string EntrySource { get; set; } = "";
+    public decimal EntryScore { get; set; }
+    public string ExitReason { get; set; } = "";
 }
 
 public class SourcePnlDto
