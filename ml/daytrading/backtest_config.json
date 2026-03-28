@@ -1,0 +1,39 @@
+{
+  "initial_capital": 100000,
+  "max_concurrent_positions": 3,
+  "max_position_dollars": 30000,
+  "daily_pnl_stop_loss": -1500,
+  "daily_pnl_stop_profit": 1500,
+  "rate_limit_seconds": 1800,
+  "loss_cooldown_seconds": 3600,
+  "entry_threshold": 0.35,
+  "entry_start_hour": 9,
+  "entry_start_minute": 45,
+  "entry_end_hour": 15,
+  "entry_end_minute": 30,
+  "eod_hard_close_hour": 15,
+  "eod_hard_close_minute": 50,
+  "composite_weights": {
+    "setup": 0.50,
+    "timing": 0.30,
+    "context": 0.20
+  },
+  "exit_params": {
+    "stop_atr_multiplier": 1.5,
+    "trailing_activation_pct": 0.004,
+    "trailing_giveback_base": 0.35,
+    "trailing_giveback_strength_scale": 0.20,
+    "breakeven_activation_multiple": 2.5,
+    "breakeven_buffer_fraction": 0.20,
+    "regime_exit_stop_fraction": 0.35,
+    "profit_target_min_pct": 0.020,
+    "profit_target_min_rr": 2.0,
+    "invalidation_hard_exit_fraction": 0.30,
+    "hold_seconds_default": 3600,
+    "max_hold_seconds": 14400
+  },
+  "slippage": {
+    "entry_atr_fraction": 0.05,
+    "exit_atr_fraction": 0.03
+  }
+}

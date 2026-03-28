@@ -32,5 +32,20 @@ public class PositionState
     /// <summary>Tracks in-flight exit order. Null = no pending exit.</summary>
     public string? PendingExitOrderId { get; set; }
 
+    // ── Day trading setup context (populated from SetupResult at entry) ──
+    /// <summary>Setup type that triggered entry (None for L2-only).</summary>
+    public SetupType EntrySetupType { get; set; }
+    /// <summary>Structural stop price from setup logic. 0 if L2-only (uses ATR fallback).</summary>
+    public decimal SetupStopLevel { get; set; }
+    /// <summary>Projected target price from setup logic. 0 if L2-only.</summary>
+    public decimal SetupTargetLevel { get; set; }
+    /// <summary>Setup quality strength [0, 1] at entry.</summary>
+    public decimal SetupStrength { get; set; }
+    /// <summary>When the setup expires. Null if L2-only or no expiry.</summary>
+    public DateTime? SetupExpiryTime { get; set; }
+    /// <summary>Best price in favorable direction during position lifetime (for analytics).</summary>
+    public decimal MaxFavorableExcursion { get; set; }
+
     public bool IsLong => Shares > 0;
+    public bool HasSetup => EntrySetupType != SetupType.None;
 }

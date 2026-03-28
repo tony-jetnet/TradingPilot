@@ -166,31 +166,7 @@ public class StrategyRuleEvaluator
     }
 }
 
-/// <summary>
-/// Current indicator values at the moment of evaluation.
-/// Populated from TickDataCache, BarIndicatorCache, and L2 features.
-/// </summary>
-public class IndicatorSnapshot
-{
-    // L2-derived features
-    public decimal Obi { get; set; }
-    public decimal BookDepthRatio { get; set; }
-    public decimal BidWallSize { get; set; }
-    public decimal AskWallSize { get; set; }
-    public decimal BidSweepCost { get; set; }
-    public decimal AskSweepCost { get; set; }
-    public decimal ImbalanceVelocity { get; set; }
-    public decimal SpreadPercentile { get; set; }
-
-    // Tick-derived
-    public decimal TickMomentum { get; set; }
-
-    // Bar-derived
-    public int TrendDirection { get; set; }
-    public decimal Rsi14 { get; set; }
-    public decimal VolumeRatio { get; set; }
-    public bool AboveVwap { get; set; }
-}
+// IndicatorSnapshot class moved to IndicatorSnapshot.cs (superset with multi-timeframe + context fields)
 
 /// <summary>
 /// Tracks live trading performance for a specific AI rule within the current trading day.

@@ -27,6 +27,13 @@ public class PendingOrder
     public int HoldSeconds { get; set; }
     public decimal StopLoss { get; set; }
 
+    // Day trading setup context (set at entry, transferred to PositionState on fill)
+    public SetupType EntrySetupType { get; set; }
+    public decimal SetupStopLevel { get; set; }
+    public decimal SetupTargetLevel { get; set; }
+    public decimal SetupStrength { get; set; }
+    public DateTime? SetupExpiryTime { get; set; }
+
     // Exit metadata (set when exit order is placed, read on fill confirmation)
     public string ExitReason { get; set; } = "";
 }

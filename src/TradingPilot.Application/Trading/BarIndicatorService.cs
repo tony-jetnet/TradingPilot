@@ -127,13 +127,25 @@ public class BarIndicatorService
                 LastRefreshTime = DateTime.UtcNow,
             };
 
+            // ── 5-min bar indicators (need EMA50 → 120 bars = 10 hours of 5m data) ──
+            await ComputeHigherTimeframeAsync(scope, asyncExecuter, barRepo, symbolId, tickerId,
+                BarTimeframe.Minute5, 120, indicators, eastern, todayET);
+
+            // ── 15-min bar indicators (need EMA50 → 120 bars = 30 hours of 15m data) ──
+            await ComputeHigherTimeframeAsync(scope, asyncExecuter, barRepo, symbolId, tickerId,
+                BarTimeframe.Minute15, 120, indicators, eastern, todayET);
+
             _cache.Update(tickerId, indicators);
 
             _logger.LogDebug(
                 "Bar indicators updated for tickerId={TickerId}: EMA9={Ema9:F2} EMA20={Ema20:F2} " +
-                "RSI={Rsi:F1} VWAP={Vwap:F2} Trend={Trend} VolRatio={VolRatio:F2}",
+                "RSI={Rsi:F1} VWAP={Vwap:F2} Trend={Trend} VolRatio={VolRatio:F2} " +
+                "EMA20_5m={Ema20_5m:F2} EMA50_5m={Ema50_5m:F2} RSI_5m={Rsi_5m:F1} Trend_5m={Trend_5m} " +
+                "EMA20_15m={Ema20_15m:F2} EMA50_15m={Ema50_15m:F2} Trend_15m={Trend_15m}",
                 tickerId, indicators.Ema9, indicators.Ema20, indicators.Rsi14,
-                indicators.Vwap, indicators.TrendDirection, indicators.VolumeRatio);
+                indicators.Vwap, indicators.TrendDirection, indicators.VolumeRatio,
+                indicators.Ema20_5m, indicators.Ema50_5m, indicators.Rsi14_5m, indicators.TrendDirection_5m,
+                indicators.Ema20_15m, indicators.Ema50_15m, indicators.TrendDirection_15m);
         }
         catch (Exception ex)
         {
@@ -272,5 +284,97 @@ public class BarIndicatorService
         }
 
         return sumV > 0 ? sumPV / sumV : 0;
+    }
+
+    /// <summary>
+    /// Compute EMA20, EMA50, RSI14, ATR14, VolumeRatio, and TrendDirection for a higher timeframe
+    /// (5m or 15m) and populate the corresponding fields on the BarIndicators object.
+    /// </summary>
+    private async Task ComputeHigherTimeframeAsync(
+        IServiceScope scope,
+        IAsyncQueryableExecuter asyncExecuter,
+        IRepository<SymbolBar, Guid> barRepo,
+        string symbolId,
+        long tickerId,
+        BarTimeframe timeframe,
+        int barCount,
+        BarIndicators indicators,
+        TimeZoneInfo eastern,
+        DateTime todayET)
+    {
+        try
+        {
+            var queryable = await barRepo.GetQueryableAsync();
+            var htfBars = await asyncExecuter.ToListAsync(
+                queryable
+                    .Where(b => b.SymbolId == symbolId && b.Timeframe == timeframe)
+                    .OrderByDescending(b => b.Timestamp)
+                    .Take(barCount));
+
+            if (htfBars.Count < 10)
+            {
+                _logger.LogDebug("Not enough {Timeframe} bars ({Count}) for tickerId={TickerId}",
+                    timeframe, htfBars.Count, tickerId);
+                return;
+            }
+
+            // Reverse to chronological order (oldest first)
+            htfBars.Reverse();
+
+            var htfCloses = htfBars.Select(b => b.Close).ToArray();
+            var htfHighs = htfBars.Select(b => b.High).ToArray();
+            var htfLows = htfBars.Select(b => b.Low).ToArray();
+            var htfVolumes = htfBars.Select(b => b.Volume).ToArray();
+
+            decimal ema20 = ComputeEma(htfCloses, 20);
+            decimal ema50 = ComputeEma(htfCloses, 50);
+            decimal rsi14 = ComputeRsi(htfCloses, 14);
+            decimal atr14 = ComputeAtr(htfHighs, htfLows, htfCloses, 14);
+
+            decimal lastClose = htfCloses[^1];
+
+            // Trend: EMA20 vs EMA50 with 0.05% neutral zone
+            int trend = 0;
+            decimal emaDiff = ema20 - ema50;
+            decimal threshold = lastClose * 0.0005m;
+            if (emaDiff > threshold) trend = 1;
+            else if (emaDiff < -threshold) trend = -1;
+
+            // Volume ratio on higher TF
+            decimal avgVol = htfVolumes.Length >= 20
+                ? (decimal)htfVolumes.Take(htfVolumes.Length - 1).TakeLast(20).Average()
+                : (decimal)htfVolumes.Take(htfVolumes.Length - 1).DefaultIfEmpty(1).Average();
+            decimal volRatio = avgVol > 0 ? htfVolumes[^1] / avgVol : 1m;
+
+            // VWAP on higher TF (today's bars only)
+            var todayHtfBars = htfBars.Where(b => TimeZoneInfo.ConvertTimeFromUtc(b.Timestamp, eastern).Date == todayET).ToList();
+            var vwapBarsHtf = todayHtfBars.Count >= 3 ? todayHtfBars : htfBars;
+            var vwapTp = vwapBarsHtf.Select(b => (b.High + b.Low + b.Close) / 3m).ToArray();
+            var vwapVol = vwapBarsHtf.Select(b => b.Volume).ToArray();
+            decimal vwapHtf = ComputeVwap(vwapTp, vwapVol);
+
+            if (timeframe == BarTimeframe.Minute5)
+            {
+                indicators.Ema20_5m = Math.Round(ema20, 4);
+                indicators.Ema50_5m = Math.Round(ema50, 4);
+                indicators.Rsi14_5m = Math.Round(rsi14, 2);
+                indicators.Atr14_5m = Math.Round(atr14, 4);
+                indicators.VolumeRatio_5m = Math.Round(volRatio, 2);
+                indicators.TrendDirection_5m = trend;
+                indicators.AboveVwap_5m = lastClose > vwapHtf;
+            }
+            else if (timeframe == BarTimeframe.Minute15)
+            {
+                indicators.Ema20_15m = Math.Round(ema20, 4);
+                indicators.Ema50_15m = Math.Round(ema50, 4);
+                indicators.Rsi14_15m = Math.Round(rsi14, 2);
+                indicators.TrendDirection_15m = trend;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to compute {Timeframe} indicators for tickerId={TickerId}",
+                timeframe, tickerId);
+        }
     }
 }

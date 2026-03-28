@@ -26,6 +26,8 @@ public class Symbol : BasicAggregateRoot<string>, ICreationAuditedObject
     public bool IsShortable { get; set; } = true;
     public bool IsMarginable { get; set; } = true;
     public bool IsWatched { get; set; }
+    /// <summary>Set daily by PreMarketScannerJob. Top 10 from 50 watched symbols trade that day.</summary>
+    public bool IsActiveForTrading { get; set; }
     public DateTime CreationTime { get; set; }
     public Guid? CreatorId { get; set; }
 }

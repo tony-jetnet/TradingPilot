@@ -1813,9 +1813,27 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                     ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '1800 seconds')))
                     LIMIT 1
                 )),
+                ""PriceAfter1Hr"" = COALESCE(ts.""PriceAfter1Hr"", (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = ts.""SymbolId""
+                      AND sb.""Timeframe"" = 2
+                      AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '3540 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '3660 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '3600 seconds')))
+                    LIMIT 1
+                )),
+                ""PriceAfter2Hr"" = COALESCE(ts.""PriceAfter2Hr"", (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = ts.""SymbolId""
+                      AND sb.""Timeframe"" = 2
+                      AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '7080 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '7320 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '7200 seconds')))
+                    LIMIT 1
+                )),
                 ""VerifiedAt"" = NOW()
             WHERE ts.""VerifiedAt"" IS NULL
-              AND ts.""Timestamp"" < NOW() - INTERVAL '31 minutes'
+              AND ts.""Timestamp"" < NOW() - INTERVAL '121 minutes'
               AND ts.""Timestamp"" > {0}", lookbackCutoff);
 
         if (updated > 0)
@@ -1837,13 +1855,66 @@ IMPORTANT: The example above is just a template showing the schema. Replace ALL 
                     ""WasCorrect30Min"" = CASE
                     WHEN ""PriceAfter30Min"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter30Min"" > ""Price""
                     WHEN ""PriceAfter30Min"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter30Min"" < ""Price""
+                    ELSE NULL END,
+                    ""WasCorrect1Hr"" = CASE
+                    WHEN ""PriceAfter1Hr"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter1Hr"" > ""Price""
+                    WHEN ""PriceAfter1Hr"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter1Hr"" < ""Price""
+                    ELSE NULL END,
+                    ""WasCorrect2Hr"" = CASE
+                    WHEN ""PriceAfter2Hr"" IS NOT NULL AND ""Type"" = 1 THEN ""PriceAfter2Hr"" > ""Price""
+                    WHEN ""PriceAfter2Hr"" IS NOT NULL AND ""Type"" = 2 THEN ""PriceAfter2Hr"" < ""Price""
                     ELSE NULL END
                 WHERE ""VerifiedAt"" IS NOT NULL
                   AND ""WasCorrect1Min"" IS NULL
                   AND ""PriceAfter1Min"" IS NOT NULL");
 
-            _logger.LogWarning("Signal verification: updated {Count} signals with price outcomes", updated);
+            _logger.LogWarning("Signal verification: updated {Count} signals with price outcomes (incl 1hr/2hr)", updated);
         }
+
+        // Also verify BarSetup outcomes
+        int setupsVerified = await dbContext.Database.ExecuteSqlRawAsync(@"
+            UPDATE ""BarSetups"" bs
+            SET
+                ""PriceAfter1Hr"" = COALESCE(bs.""PriceAfter1Hr"", (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = bs.""SymbolId"" AND sb.""Timeframe"" = 2
+                      AND sb.""Timestamp"" BETWEEN bs.""Timestamp"" + INTERVAL '3540 seconds'
+                                                AND bs.""Timestamp"" + INTERVAL '3660 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (bs.""Timestamp"" + INTERVAL '3600 seconds')))
+                    LIMIT 1)),
+                ""PriceAfter2Hr"" = COALESCE(bs.""PriceAfter2Hr"", (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = bs.""SymbolId"" AND sb.""Timeframe"" = 2
+                      AND sb.""Timestamp"" BETWEEN bs.""Timestamp"" + INTERVAL '7080 seconds'
+                                                AND bs.""Timestamp"" + INTERVAL '7320 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (bs.""Timestamp"" + INTERVAL '7200 seconds')))
+                    LIMIT 1)),
+                ""PriceAfter4Hr"" = COALESCE(bs.""PriceAfter4Hr"", (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = bs.""SymbolId"" AND sb.""Timeframe"" = 2
+                      AND sb.""Timestamp"" BETWEEN bs.""Timestamp"" + INTERVAL '14100 seconds'
+                                                AND bs.""Timestamp"" + INTERVAL '14700 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (bs.""Timestamp"" + INTERVAL '14400 seconds')))
+                    LIMIT 1)),
+                ""WasCorrect1Hr"" = CASE
+                    WHEN bs.""PriceAfter1Hr"" IS NOT NULL AND bs.""Direction"" = 1 THEN bs.""PriceAfter1Hr"" > bs.""Price""
+                    WHEN bs.""PriceAfter1Hr"" IS NOT NULL AND bs.""Direction"" = 2 THEN bs.""PriceAfter1Hr"" < bs.""Price""
+                    ELSE NULL END,
+                ""WasCorrect2Hr"" = CASE
+                    WHEN bs.""PriceAfter2Hr"" IS NOT NULL AND bs.""Direction"" = 1 THEN bs.""PriceAfter2Hr"" > bs.""Price""
+                    WHEN bs.""PriceAfter2Hr"" IS NOT NULL AND bs.""Direction"" = 2 THEN bs.""PriceAfter2Hr"" < bs.""Price""
+                    ELSE NULL END,
+                ""WasCorrect4Hr"" = CASE
+                    WHEN bs.""PriceAfter4Hr"" IS NOT NULL AND bs.""Direction"" = 1 THEN bs.""PriceAfter4Hr"" > bs.""Price""
+                    WHEN bs.""PriceAfter4Hr"" IS NOT NULL AND bs.""Direction"" = 2 THEN bs.""PriceAfter4Hr"" < bs.""Price""
+                    ELSE NULL END,
+                ""VerifiedAt"" = NOW()
+            WHERE bs.""VerifiedAt"" IS NULL
+              AND bs.""Timestamp"" < NOW() - INTERVAL '241 minutes'
+              AND bs.""Timestamp"" > {0}", lookbackCutoff);
+
+        if (setupsVerified > 0)
+            _logger.LogWarning("BarSetup verification: updated {Count} setups with outcomes", setupsVerified);
     }
 
     #endregion

@@ -57,6 +57,16 @@ public class TickerModelConfig
 
     // Per time-of-day adjustments (hour 9-16 ET)
     public Dictionary<int, HourlyAdjustment> HourlyAdjustments { get; set; } = new();
+
+    // ── Day trading: composite scoring weights (learned by nightly trainer) ──
+    /// <summary>Weight for bar-based setup strength in composite score. Default 0.50.</summary>
+    public decimal WeightSetup { get; set; }
+    /// <summary>Weight for L2 timing score in composite score. Default 0.30.</summary>
+    public decimal WeightTiming { get; set; }
+    /// <summary>Weight for context (news/fundamentals) in composite score. Default 0.20.</summary>
+    public decimal WeightContext { get; set; }
+    /// <summary>Optimal hold time for day trades. Default 3600s (1 hour).</summary>
+    public int OptimalHoldSecondsDay { get; set; } = DayTradeConfig.DefaultHoldSeconds;
 }
 
 public class HourlyAdjustment

@@ -177,7 +177,25 @@ public class NightlyLocalTrainer
                                                AND ts.""Timestamp"" + INTERVAL '1830 seconds'
                      ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '1800 seconds')))
                      LIMIT 1)
-                ) AS ""PriceAfter30Min""
+                ) AS ""PriceAfter30Min"",
+                COALESCE(ts.""PriceAfter1Hr"", (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = ts.""SymbolId""
+                      AND sb.""Timeframe"" = 2
+                      AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '3540 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '3660 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '3600 seconds')))
+                    LIMIT 1)
+                ) AS ""PriceAfter1Hr"",
+                COALESCE(ts.""PriceAfter2Hr"", (
+                    SELECT sb.""Close"" FROM ""SymbolBars"" sb
+                    WHERE sb.""SymbolId"" = ts.""SymbolId""
+                      AND sb.""Timeframe"" = 2
+                      AND sb.""Timestamp"" BETWEEN ts.""Timestamp"" + INTERVAL '7080 seconds'
+                                                AND ts.""Timestamp"" + INTERVAL '7320 seconds'
+                    ORDER BY ABS(EXTRACT(EPOCH FROM sb.""Timestamp"" - (ts.""Timestamp"" + INTERVAL '7200 seconds')))
+                    LIMIT 1)
+                ) AS ""PriceAfter2Hr""
             FROM ""TradingSignals"" ts
             JOIN ""Symbols"" s ON s.""Id"" = ts.""SymbolId""
             WHERE ts.""Timestamp"" > {{0}}
@@ -247,6 +265,14 @@ public class NightlyLocalTrainer
             var priceAfter30Ord = reader.GetOrdinal("PriceAfter30Min");
             if (!reader.IsDBNull(priceAfter30Ord))
                 row.PriceAfter30Min = reader.GetDecimal(priceAfter30Ord);
+
+            var priceAfter1HrOrd = reader.GetOrdinal("PriceAfter1Hr");
+            if (!reader.IsDBNull(priceAfter1HrOrd))
+                row.PriceAfter1Hr = reader.GetDecimal(priceAfter1HrOrd);
+
+            var priceAfter2HrOrd = reader.GetOrdinal("PriceAfter2Hr");
+            if (!reader.IsDBNull(priceAfter2HrOrd))
+                row.PriceAfter2Hr = reader.GetDecimal(priceAfter2HrOrd);
 
             // Multi-horizon weighted outcome — approximates actual exit time distribution
             decimal? outcomePrice = null;
@@ -422,6 +448,15 @@ public class NightlyLocalTrainer
 
             // Step 8: Optimize hold time from available outcome horizons
             OptimizeHoldTime(ticker, trainRows, valRows, config);
+
+            // Step 9: Set day trading composite weights (default for now — nightly optimization TODO)
+            // These default weights are used by SignalOrchestrator when no optimized values exist.
+            config.WeightSetup = DayTradeConfig.DefaultSetupWeight;
+            config.WeightTiming = DayTradeConfig.DefaultTimingWeight;
+            config.WeightContext = DayTradeConfig.DefaultContextWeight;
+            config.OptimalHoldSecondsDay = config.OptimalHoldSeconds > 0
+                ? Math.Max(config.OptimalHoldSeconds, DayTradeConfig.DefaultHoldSeconds)
+                : DayTradeConfig.DefaultHoldSeconds;
         }
 
         _logger.LogWarning(
@@ -852,9 +887,10 @@ public class NightlyLocalTrainer
     /// </summary>
     private void OptimizeHoldTime(string ticker, List<TrainingRow> trainRows, List<TrainingRow> valRows, TickerModelConfig config)
     {
-        var candidates = new[] { (300, "5min"), (600, "10min"), (900, "15min"), (1200, "20min"), (1800, "30min") };
+        // Day trading hold time candidates: from 30 min to 4 hours
+        var candidates = new[] { (1800, "30min"), (3600, "1hr"), (5400, "90min"), (7200, "2hr"), (10800, "3hr"), (14400, "4hr") };
         decimal bestTrainPnl = decimal.MinValue;
-        int bestHoldSeconds = 1200; // default matches ~19 min weighted training horizon
+        int bestHoldSeconds = DayTradeConfig.DefaultHoldSeconds;
 
         foreach (var (holdSec, label) in candidates)
         {
@@ -867,15 +903,15 @@ public class NightlyLocalTrainer
             }
         }
 
-        // Validate: if best hold time loses money on validation, fall back to 1200s
+        // Validate: if best hold time loses money on validation, fall back to default
         decimal valPnl = ComputeHoldPnl(valRows, bestHoldSeconds);
-        decimal defaultValPnl = ComputeHoldPnl(valRows, 1200);
+        decimal defaultValPnl = ComputeHoldPnl(valRows, DayTradeConfig.DefaultHoldSeconds);
 
         if (valPnl <= 0 && defaultValPnl > valPnl)
         {
             _logger.LogWarning("  {Ticker}: hold time {Best}s overfits (valPnl=${ValPnl:F2} vs default=${DefaultPnl:F2}), using default 1200s",
                 ticker, bestHoldSeconds, valPnl, defaultValPnl);
-            bestHoldSeconds = 1200;
+            bestHoldSeconds = DayTradeConfig.DefaultHoldSeconds;
             valPnl = defaultValPnl;
         }
 
@@ -899,6 +935,8 @@ public class NightlyLocalTrainer
             // Map hold duration to outcome price using closest available columns.
             // 300s → 5min, 600s → blend(5min,15min), 900s → 15min,
             // 1200s → blend(15min,30min), 1800s → 30min.
+            // Map hold duration to outcome price using closest available columns.
+            // Extended for day trading: 1hr and 2hr horizons from SymbolBars.
             decimal? outcomePrice = holdSeconds switch
             {
                 <= 300 => row.PriceAfter5Min,
@@ -909,7 +947,15 @@ public class NightlyLocalTrainer
                 <= 1200 => row.PriceAfter15Min.HasValue && row.PriceAfter30Min.HasValue
                     ? row.PriceAfter15Min.Value * 0.50m + row.PriceAfter30Min.Value * 0.50m
                     : row.PriceAfter15Min ?? row.PriceAfter30Min,
-                _ => row.PriceAfter30Min ?? row.PriceAfter15Min
+                <= 1800 => row.PriceAfter30Min ?? row.PriceAfter15Min,
+                <= 2700 => row.PriceAfter30Min.HasValue && row.PriceAfter1Hr.HasValue
+                    ? row.PriceAfter30Min.Value * 0.50m + row.PriceAfter1Hr.Value * 0.50m
+                    : row.PriceAfter30Min ?? row.PriceAfter1Hr,
+                <= 3600 => row.PriceAfter1Hr ?? row.PriceAfter30Min,
+                <= 5400 => row.PriceAfter1Hr.HasValue && row.PriceAfter2Hr.HasValue
+                    ? row.PriceAfter1Hr.Value * 0.50m + row.PriceAfter2Hr.Value * 0.50m
+                    : row.PriceAfter1Hr ?? row.PriceAfter2Hr,
+                _ => row.PriceAfter2Hr ?? row.PriceAfter1Hr ?? row.PriceAfter30Min,
             };
 
             if (!outcomePrice.HasValue) continue;
@@ -994,6 +1040,8 @@ public class TrainingRow
     public decimal? PriceAfter5Min { get; set; }
     public decimal? PriceAfter15Min { get; set; }
     public decimal? PriceAfter30Min { get; set; }
+    public decimal? PriceAfter1Hr { get; set; }
+    public decimal? PriceAfter2Hr { get; set; }
     public bool IsWin { get; set; }
     public decimal PnlPer100Shares { get; set; }
 }

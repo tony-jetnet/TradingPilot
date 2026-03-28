@@ -1,0 +1,13 @@
+{
+  "total_trades": 21,
+  "total_pnl": -876.62,
+  "win_rate": 0.2857,
+  "avg_win": 76.13,
+  "avg_loss": 88.89,
+  "profit_factor": 0.34,
+  "sharpe": -10.07,
+  "max_drawdown": -808.35,
+  "avg_hold_minutes": -26.9,
+  "max_consecutive_losses": 5,
+  "avg_trades_per_day": 3.0
+}

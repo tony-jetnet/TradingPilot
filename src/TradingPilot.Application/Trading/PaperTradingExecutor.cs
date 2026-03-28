@@ -437,6 +437,12 @@ public class PaperTradingExecutor
                     RuleConfidence = ruleConfidence,
                     HoldSeconds = entryHoldSeconds,
                     StopLoss = entryStopLoss,
+                    // Day trading setup context from enriched signal
+                    EntrySetupType = signal.SignalSetupType,
+                    SetupStopLevel = signal.Setup?.StopLevel ?? 0,
+                    SetupTargetLevel = signal.Setup?.TargetLevel ?? 0,
+                    SetupStrength = signal.SetupStrength,
+                    SetupExpiryTime = signal.Setup?.ExpiresAt,
                 };
 
                 // Atomic add — if another thread already added, skip (prevents duplicate)
@@ -603,6 +609,12 @@ public class PaperTradingExecutor
                         HoldSeconds = pending.HoldSeconds,
                         StopLoss = pending.StopLoss,
                         EntryAtr = entryBar?.Atr14 ?? 0,
+                        // Day trading setup context (from PendingOrder, populated at entry)
+                        EntrySetupType = pending.EntrySetupType,
+                        SetupStopLevel = pending.SetupStopLevel,
+                        SetupTargetLevel = pending.SetupTargetLevel,
+                        SetupStrength = pending.SetupStrength,
+                        SetupExpiryTime = pending.SetupExpiryTime,
                     };
                     _positions[symbol] = pos;
                     _pendingEntries.TryRemove(symbol, out _);
@@ -673,6 +685,14 @@ public class PaperTradingExecutor
                                 EntrySource = entrySource,
                                 EntryScore = pos.EntryScore,
                                 ExitReason = pending.ExitReason,
+                                // Day trading fields
+                                DayTradeSource = pos.HasSetup ? (byte?)SignalSource.Composite : (byte?)SignalSource.L2Micro,
+                                DayTradeSetupType = pos.HasSetup ? (byte?)pos.EntrySetupType : null,
+                                SetupScore = pos.SetupStrength > 0 ? pos.SetupStrength : null,
+                                TimingScore = null, // Not tracked on PositionState (only at signal time)
+                                HoldSeconds = pos.HoldSeconds,
+                                StopDistance = pos.HasSetup ? Math.Abs(pos.EntryPrice - pos.SetupStopLevel) : null,
+                                SetupInvalidated = null, // Set by PositionMonitor if thesis broke
                             });
                             await tradeDb.SaveChangesAsync();
                         }

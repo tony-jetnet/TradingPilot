@@ -23,37 +23,104 @@ cd src/TradingPilot.DbMigrator && dotnet run
 
 # EF Core migration (generate new)
 dotnet ef migrations add <Name> --project src/TradingPilot.EntityFrameworkCore --startup-project src/TradingPilot.Blazor
+
+# Python ML — L2 Swin model (entry timing)
+cd ml/l2 && python retrain.py
+
+# Python ML — Day trading model (setup detection + backtesting)
+cd ml/daytrading && python export_bars.py --days 60
+cd ml/daytrading && python compute_features.py
+cd ml/daytrading && python train.py
+cd ml/daytrading && python backtest.py
+cd ml/daytrading && python evaluate.py
 ```
 
 **Note:** The Blazor process locks DLLs. If build fails with MSB3027 file-lock errors, stop the running app first.
 
-## Architecture
+## Architecture Overview
 
 ABP Framework 10.1 app with DDD layered architecture. .NET 10.0, PostgreSQL, Redis.
 
-### Two-Stage Signal Generation
+**Trading style: Intraday day trading** on US equities. Hold 30 min to 4 hours. Close all positions before EOD. No overnight. The system uses bar-based setups as the primary signal, L2 order book for entry timing, and news/fundamentals for context.
 
-Real-time L2 order book data flows through a two-stage signal pipeline in `MarketMicrostructureAnalyzer.AnalyzeSnapshot()`:
+**Symbol management**: 50 symbols watched permanently (all receive data, all have trained models). Pre-market scanner ranks and selects top 10 for active trading each day.
 
-1. **Stage 1 — AI Rule Evaluation**: `StrategyRuleEvaluator` checks conditional rules from `strategy_rules.json` (generated nightly by Bedrock Sonnet 4.6). If a rule matches, apply contextual filters (trend, VWAP, volume, RSI) to the rule's confidence score. Reject if filtered score drops below 0.20. Also checks hourly enablement from model config and live rule performance tracking.
-2. **Stage 2 — Swin + Weighted Scoring Blend**: If no rule matches, always compute the weighted score from **6 L2/tick indicators** (OBI, WOBI, PressureRoc, Spread, LargeOrder, TickMomentum). Swin vision model (ONNX) blends only when ALL three conditions met: (a) confidence ≥ 0.40, (b) agrees with indicators on direction (both positive or both negative), (c) indicators have minimum conviction |weighted| ≥ 0.05. Blend formula: `composite = swinScore × min(confidence, 0.50) + weightedScore × (1-weight)`. If any condition fails, use weighted score only. Then apply contextual filters (trend, VWAP, volume, RSI) as post-scoring multipliers.
+### Three-Layer Signal Architecture
 
-**No double penalization**: Trend, VWAP, Volume, and RSI are handled ONLY by contextual filters (weight=0 in the scoring). They are NOT included as weighted indicators in the composite score. This prevents the same signal from being penalized twice.
+```
+Layer 1: SETUP DETECTION (bar-based, every 5-min bar close)
+  "Is there a trade worth taking?"
+  → Scans 1m/5m/15m bars for day-trade setups
+  → Produces: SetupResult (type, direction, strength, entry zone, stop, target)
+  → Fully backtest-able on historical SymbolBars data
 
-Both config files live at `D:\Third-Parties\WebullHook\` and are watched via `FileSystemWatcher` + periodic freshness check (1-min polling as failsafe).
+Layer 2: L2 TIMING (real-time, on every L2 update while setup active)
+  "Is now the right moment to enter?"
+  → Existing 6 L2 indicators + Swin vision model
+  → Confirms setup with microstructure pressure
+  → Only works live (no historical L2)
 
-### Contextual Filters (applied to BOTH Stage 1 and Stage 2)
+Layer 3: CONTEXT SCORING (news + fundamentals + capital flow)
+  "Should we take this trade?"
+  → News sentiment and catalyst detection
+  → Capital flow direction (institutional money)
+  → Earnings proximity, short float, time of day
 
-Applied in sequence after the base score is computed:
-1. **Trend filter**: Signal against dominant EMA trend → score × 0.5 (sets `trendFilterApplied = true`)
-2. **VWAP filter**: Signal against VWAP position → score × 0.7
-3. **Volume boost**: High volume AND trend not against signal → score × 1.3 (directional — only boosts when `!trendFilterApplied`)
-4. **RSI filter**: Graduated — RSI 75-80 → ×0.70, RSI 80-85 → ×0.50, RSI 85+ → ×0.30 (symmetric for oversold)
-5. **Floor protection**: No single filter chain can reduce score below **30%** of pre-filter value (**applies to BOTH stages** — Stage 1 rules now have floor protection too)
-6. **Hourly multiplier**: Per-hour learned multiplier from model config
-7. **Staleness guards**: Skip signal if L2 data >30s old or bar indicators >2min old
+Composite = SetupScore × 0.50 + TimingScore × 0.30 + ContextScore × 0.20
+Then contextual filters (trend, VWAP, volume, RSI) applied as multipliers
+Floor protection: 30% (no filter chain can reduce score below 30% of pre-filter value)
+```
 
-### Weighted Scoring Indicators (6 indicators, sum to 1.0)
+### Setup Types (SetupDetector)
+
+| Setup | Entry Condition | Stop Level | Target | Invalidation |
+|-------|----------------|------------|--------|--------------|
+| **TREND_FOLLOW** | EMA9 > EMA20 > EMA50 on 5m, all rising, price pulls back to EMA20 zone (within 0.3×ATR) | Below EMA50 or recent swing low | 2-3× ATR above entry | EMA20 crosses below EMA50 on 5m |
+| **VWAP_BOUNCE** | Price touches VWAP from above, bounces with VolumeRatio > 1.5, RSI 40-60 | Below VWAP by 0.3% | Prior high or VWAP + 2× pullback distance | Price closes below VWAP on 5m bar |
+| **BREAKOUT** | Price breaks above 15m consolidation range (>30 min range) with volume > 2× avg | Mid-point of consolidation range | Range height projected above breakout | Price closes back inside range |
+| **REVERSAL** | RSI divergence (price new low, RSI higher low) + volume + key support level | Below the swing low that formed divergence | EMA20 on 15m (first target), prior swing high | Price makes new low below divergence low |
+
+Each setup has: direction (BUY/SELL), strength [0-1], entry zone (price range), stop level, target level, invalidation condition, expiry (30-60 min shelf life).
+
+### News Integration (Three Roles)
+
+**Role 1 — Catalyst Detection** (pre-market + first 30 min):
+- Scan news from last 12 hours for each symbol
+- Catalyst types: EARNINGS, ANALYST, REGULATORY, SECTOR, CORPORATE
+- Catalyst stocks get +0.15 strength boost on BREAKOUT setups, +0.10 on TREND_FOLLOW
+- No catalyst + low volume → reduce setup strength by 0.10
+
+**Role 2 — Sentiment Scoring** (continuous):
+- Method A (live, free): keyword matching on titles — "upgrade"/"beat" = positive, "downgrade"/"miss" = negative
+- Method B (nightly, higher quality): Bedrock batch scoring, stored as `SentimentScore` on SymbolNews
+- Feeds into ContextScorer as NewsSentiment [-1, +1]
+
+**Role 3 — Risk Filter** (entry gate):
+- Earnings within 1 day → skip entry OR reduce position to 50%
+- High news velocity (>5 articles in 2 hours) → reduce size to 50%
+- Conflicting news sentiment vs setup direction → reduce setup strength by 0.20
+
+### Context Scorer Formula
+
+```
+contextScore = (capitalFlowScore × 0.25 + newsSentiment × 0.30 + shortFloatPressure × 0.15)
+               × timeOfDayFactor
+               + catalystBoost
+               - earningsProximity
+
+capitalFlowScore:    net institutional flow last 3 days, normalized [-1, +1]
+newsSentiment:       avg sentiment of recent articles [-1, +1]
+shortFloatPressure:  high short + buy setup = squeeze potential [0, +0.3]
+catalystBoost:       has catalyst today [0, +0.5]
+earningsProximity:   < 3 days to earnings [0, +0.5] penalty
+timeOfDayFactor:     avoid first 15 min (0.5), normal hours (1.0), careful last 30 min (0.7)
+
+Clamped to [-1, +1]
+```
+
+### L2 Timing Layer (existing, used for entry timing)
+
+When a setup is active, L2 data provides timing confirmation. Same 6 indicators as before:
 
 | Indicator | Default Weight | Range | Source |
 |-----------|---------------|-------|--------|
@@ -64,136 +131,531 @@ Applied in sequence after the base score is computed:
 | LargeOrderSignal | 0.10 | [-1, +1] | Size spikes > 3x average |
 | TickMomentum | 0.15 | [-1, +1] | Uptick/downtick ratio from TickDataCache |
 
-### VWAP Score Formula
+Swin vision model blends when: confidence ≥ 0.40, direction agrees with indicators, indicators have |weighted| ≥ 0.05. Blend cap: 50% max. L2 timing gate: |timingScore| ≥ 0.20 AND direction matches setup.
 
-`deviation = (currentPrice - VWAP) / VWAP`, then `Clamp(deviation × 10, -1, 1)`. A 0.1% deviation → 0.10 score, 0.5% → 0.50, 1.0% → saturates at ±1.0. Divides by VWAP (not price) for symmetry.
+### Contextual Filters (applied after composite scoring)
 
-### Live Rule Performance Tracking
+Applied in sequence:
+1. **Trend filter**: Signal against 15m EMA trend → score × 0.5
+2. **VWAP filter**: Signal against VWAP → score × 0.7
+3. **Volume boost**: High volume + aligned → score × 1.3
+4. **RSI filter**: Graduated — RSI 75-80 → ×0.70, RSI 80-85 → ×0.50, RSI 85+ → ×0.30 (symmetric for oversold)
+5. **Floor protection**: 30% — no filter chain can reduce score below 30% of pre-filter value
+6. **Hourly multiplier**: Per-hour learned multiplier from model config
 
-`StrategyRuleEvaluator` tracks per-rule win/loss/P&L from closed trades in real-time. Rules with negative total P&L after ≥3 trades are auto-disabled for the rest of the trading day. Performance resets when new `strategy_rules.json` is loaded (nightly).
+### Pre-Market Symbol Scanner
+
+**50 symbols watched permanently** — all receive MQTT data, all have trained models, all have warm caches.
+
+**PreMarketScannerJob** runs at 9:00 AM ET. Ranks all 50, selects top 10 as `IsActiveForTrading` for the day:
+
+| Factor | Weight | Source |
+|--------|--------|--------|
+| Overnight gap | 0.25 | Pre-market price vs prev close (>2% = high interest) |
+| Pre-market volume | 0.20 | Relative to 20-day avg pre-market volume |
+| News catalyst | 0.20 | Any catalyst article in last 12 hours |
+| Capital flow trend | 0.15 | 3-day net institutional flow direction |
+| Technical setup quality | 0.15 | SetupDetector run on yesterday's final bars |
+| ATR/Volatility | 0.05 | Minimum ATR% > 0.8% needed for day trading |
+
+Only the active 10 generate trade signals. The other 40 still collect data and train models.
 
 ### Real-Time Data Flow
 
 ```
-Webull MQTT (via injected hook DLL)
-  -> MqttMessageProcessor (decodes protobuf/JSON)
-     -> L2 depth: SymbolBookSnapshots DB + L2BookCache + TickDataCache.UpdateL2Features()
-                  -> MarketMicrostructureAnalyzer -> TradingSignals DB
-                     -> PaperTradingExecutor -> PaperTrades DB + Webull paper API
-     -> Quotes: TickDataCache + BarIndicatorService refresh (30s) + TickSnapshots DB (10s)
-     -> Ticks: TickDataCache (uptick/downtick counts, momentum)
+Webull MQTT (via injected hook DLL, all 50 symbols subscribed)
+  → MqttMessageProcessor (decodes protobuf/JSON)
+     → L2 depth: SymbolBookSnapshots DB + L2BookCache + TickDataCache.UpdateL2Features()
+     → Quotes: TickDataCache + BarIndicatorService refresh (30s) + TickSnapshots DB (10s)
+     → Ticks: TickDataCache (uptick/downtick counts, momentum)
+
+Every 5-min bar close (active 10 only):
+  → BarIndicatorService computes 1m/5m/15m indicators → BarIndicatorCache
+  → SetupDetector.Scan() → BarSetups DB
+  → If setup active + L2 timing confirms:
+     → SignalOrchestrator → CompositeScorer → TradingSignals DB
+     → PaperTradingExecutor.OnSignalAsync() → PaperTrades DB + Webull paper API
+  → PositionMonitor (every 15s) → exit checks → ExitPositionAsync()
 ```
 
-### Nightly Job Sequence (after market close, weekdays)
+## Entry Strategy (PaperTradingExecutor)
+
+### Entry Gating (in order)
+
+1. **Auth**: Broker must be authenticated
+2. **Opposing setup exit**: If holding position and strong opposing setup fires (strength ≥ 0.50 + L2 confirms) → exit current first
+3. **Position limit**: max 3 concurrent positions (including pending entries)
+4. **Daily P&L stops**: stop if day P&L ≤ -$1500 or ≥ +$1500
+5. **Rate limit**: 1800s (30 min) between trades per symbol
+6. **Loss cooldown**: 3600s (60 min) after losing trade on same symbol
+7. **Spread regime filter**: reject if spread ≥ 90th percentile
+8. **Momentum confirmation**: 5-min price delta alignment ≥ 0.05% of mid price
+9. **Min composite score**: ≥ 0.35
+10. **Direction enablement**: model_config EnableBuy/EnableSell per ticker
+11. **Market hours gate**: no entries before 9:45 AM or after 3:30 PM ET
+12. **News risk filter**: earnings within 1 day → skip or half size; high news velocity → half size
+
+### Position Sizing (ATR-based)
 
 ```
-9:00 PM ET  NightlyStrategyOptimizer.OptimizeAsync    — verify signal outcomes + backfill gaps + Bedrock AI rules
-9:30 PM ET  NightlyLocalTrainer.TrainAsync            — hill-climbing weight optimization (needs verified outcomes from above)
-10:00 PM ET NightlyStrategyOptimizer.CleanupOldDataAsync — retention: L2 snapshots 20d, ticks 30d
+maxDollars = $30,000 (base)
+atrScaleFactor = 0.0015 / atr14Pct, clamped [0.25, 2.0]
+strengthFactor = Clamp(|compositeScore| / 0.40, 0.50, 1.0)
+newsReduction = 0.50 if (earningsWithin1Day OR highNewsVelocity), else 1.0
+finalMaxDollars = maxDollars × atrScaleFactor × strengthFactor × newsReduction
+quantity = (int)(finalMaxDollars / entryPrice)
 ```
 
-**Order matters**: Optimizer runs first because `VerifySignalOutcomesAsync()` fills PriceAfter5Min/15Min/30Min columns that the trainer needs.
+### Limit Order Placement
 
-The optimizer backfills TickSnapshots and TradingSignals from 1-minute bars before running AI analysis. **Backfilled signals are excluded from both trainer and Bedrock CSV** (different score distribution from live L2 signals).
+- Price within setup's EntryZone
+- Strong signals (|score| ≥ 0.40): cross 50% of spread
+- Moderate signals: cross 10% of spread
+- Entry order timeout: 300 seconds (5 min)
 
-### Bedrock AI Rule Generation (NightlyStrategyOptimizer)
+## Exit Strategy (PositionMonitor)
 
-- **Rule preservation**: Before calling Bedrock, `EvaluateExistingRulesAsync()` evaluates current rules against last 5 days of live signal data. Rules with ≥5 matches AND positive P&L (using PriceAfter5Min, spread-adjusted) survive. Surviving rules are kept as-is; Bedrock only fills vacated slots (max 5 rules/symbol total). Surviving rules are passed to Bedrock as context so it generates complementary rules, not duplicates.
-- **HoldSeconds**: Prompt instructs 60-600s (1-10 min, matching L2 signal decay). Validator enforces same range.
-- **MaxDailyTrades**: Capped at 5 per symbol in rule output.
-- **Local backtesting**: After Bedrock generates rules, each rule is backtested on the newest 25% of data. Only rules with ≥5 matches AND positive P&L survive.
-- **Backfilled signals excluded** from the CSV sent to Bedrock.
-- **Data quality filters**: Market hours only (9:30 AM - 4:00 PM ET). Cold-cache signals excluded (OBI=WOBI=TickMomentum=0).
-- **Skip guard**: 2-hour cooldown (prevents double-runs on manual trigger), not daily skip.
+Exit checks evaluated every **15 seconds** in priority order. Day trading exits are **thesis-aware** — they know the setup type and exit when the thesis dies.
 
-### Nightly Trainer Details (NightlyLocalTrainer)
+### Exit Thresholds (day trading parameters)
 
-- **Walk-forward**: 75% train (oldest) / 25% validation (newest), time-ordered
-- **Multi-start hill-climbing**: 3 restarts × 300 iterations each (900 total), timestamp-based random seeds (different each night). Perturbs one of the **6 L2/tick weights** (indices 0-5) by ±0.05, keeps if P&L improves. Best result across all restarts is kept.
-- **Multi-horizon outcome**: Training labels use weighted blend: `0.20×PriceAfter5Min + 0.40×PriceAfter15Min + 0.40×PriceAfter30Min` (approximates actual exit time distribution instead of fixed 30-min horizon)
-- **Overfit guard (strengthened)**: Falls back to defaults if: (a) optimized weights lose on validation AND defaults win, OR (b) defaults outperform by 2×+, OR (c) validation P&L < 15% of training P&L (train/val divergence)
-- **Threshold validation**: Optimized thresholds are validated on held-out set; reverts to defaults if they lose on validation
-- **Direction gating**: Uses expected value (EV = avgWin×winRate - avgLoss×lossRate) instead of raw win rate. Minimum 10 samples.
-- **Hourly ScoreMultiplier**: High win rate hours (>60%) get 1.2× boost, low (<50%) get 0.7× dampen. **No disabled hours** — removed 2026-03-26 because hard-blocking entire hours was too aggressive and missed opportunities. The ScoreMultiplier handles bad hours softly instead.
-- **Training data filters**: Only signals with |Score| ≥ 0.20 (tradeable signals). Excludes backfilled bar-derived signals (`Reason NOT LIKE '%BACKFILL%'`). Market hours only (9:30 AM - 4:00 PM ET). Excludes cold-cache signals (OBI=0 AND WOBI=0 AND TickMomentum=0). Requires at least PriceAfter5Min (rows with only 1-min outcome are excluded — they fell into data gaps).
-- **Weights 6-9 (Trend, VWAP, Volume, RSI)**: Fixed at 0 — contextual filters handle these. Optimizer only perturbs weights 0-5.
-- **Hold time optimization (2026-03-25)**: Tests candidates [300, 600, 900, 1200, 1800] seconds per ticker. For each, computes P&L using the closest price outcome columns (PriceAfter5/15/30Min with interpolation). Walk-forward validated: falls back to 1200s default if best candidate loses on validation. Default changed from 3600s to 1200s (20 min) to match the ~19 min weighted training horizon (`0.20×5min + 0.40×15min + 0.40×30min`). The old 3600s default caused all Stage 2 trades to exit via TIME+WEAK because L2 scores naturally decay over 60 min.
+| Threshold | Formula | AMD $218 (ATR $2) |
+|-----------|---------|-------------------|
+| Stop loss | `Max(setup.StopLevel distance, 1.5×ATR, entrySpread)` | $3.00 |
+| Trailing activation | `Max(entryPrice × 0.004, entrySpread × 2)` | $0.87 (0.40%) |
+| Breakeven activation | `trailingActivation × 2.5` | $2.18 |
+| Profit target | `Max(setup.TargetLevel distance, entryPrice × 2.0%, effectiveStop × 2.0)` | $6.00 |
+| Regime exit threshold | `effectiveStop × 0.35` | $1.05 |
 
-### Position Management (PositionMonitor)
+### Exit Priority Chain
 
-**Entry gating** (PaperTradingExecutor.OnSignalAsync):
-- Auth, position limit, daily P&L hard stops (stop if day P&L ≤ -$500 or ≥ +$500), rate limit (5min/300s cooldown)
-- Spread regime filter: reject if spread ≥ 90th percentile
-- Momentum check: find L2 snapshot closest to 30s ago (15-60s window), require price-relative momentum alignment ≥ 0.05% of mid price
-- ATR-based position sizing: $25K base scaled by ATR (high vol → smaller position), further scaled by signal strength (|score|/0.40, clamped 0.50-1.0)
-- Tiered limit orders: strong signals (score ≥ 0.40) use midprice; moderate signals use bid+10% spread offset
-- Entry order timeout: 90 seconds (stale L2 signals expire quickly)
-- Rule entry threshold: 0.35 (same as Stage 2, since raw confidence already passed 0.55 gate in StrategyRuleEvaluator)
-- **Loss cooldown**: 30-minute cooldown per symbol after a losing trade (P&L ≤ 0). Prevents re-entering the same losing setup. Base 300s rate limit still applies for winning trades.
-- **Opposing signal exit**: If we hold a position and get a strong opposing signal (|score| ≥ 0.40), exit immediately. Threshold 0.40 matches "strong signal" throughout the codebase, prevents whipsaw from moderate signals. Event-driven (fires on signal arrival, not 5s poll).
+**EXIT 0: EOD Mandatory Close** — Day trading = no overnight. Non-negotiable.
+- 3:30 PM ET: tighten trailing to 20% giveback
+- 3:45 PM ET: exit at market if profitable, limit if losing
+- 3:50 PM ET: hard close via market order
 
-**Exit checks** (evaluated every 5s in priority order):
+**EXIT 1: Stop Loss** — Structural stop based on setup's logical level, floored at 1.5×ATR.
+- TREND_FOLLOW: below EMA50 or swing low
+- VWAP_BOUNCE: below VWAP by 0.3%
+- BREAKOUT: mid-point of consolidation range
+- REVERSAL: below divergence swing low
+- `effectiveStop = Max(setup stop distance, 1.5×ATR, entrySpread)`
 
-**Key principle — profit-side thresholds are decoupled from stop distance (2026-03-25 fix)**:
-The stop loss uses `Max(ruleStop, 2.0×ATR, entrySpread)` which is correct for max acceptable loss. But profit-protection exits (trailing, breakeven, profit target) use **price-percentage-based thresholds** instead of multiples of stop distance. This is because 2×ATR can be 1-2% of price — unreachable for typical day trades that move 0.1-0.5% in 5-60 minutes.
+**EXIT 2: Profit Target** — `Max(setup.TargetLevel distance, entryPrice × 2.0%, effectiveStop × 2.0)`. Minimum 2:1 risk/reward.
 
-| Threshold | Formula | AMD $218 (ATR $2) | RIVN $15.66 |
-|-----------|---------|-------------------|-------------|
-| Trailing activation | `Max(entryPrice × 0.0015, entrySpread × 2)` | $0.33 (0.15%) | ~$0.05 (spread floor) |
-| Breakeven activation | `trailingActivation × 2.0` | $0.66 | ~$0.10 |
-| Profit target | `Max(entryPrice × 0.010, effectiveStopLoss × 1.5)` | $6.00 | $2.25 |
-| Regime exit threshold | `effectiveStopLoss × 0.40` | $1.60 | $0.60 |
+**EXIT 3: Setup Invalidation** — Thesis-specific condition that kills the trade idea.
+- Grace period: holdTime × 0.25 (give initial room)
+- If trailing active → tighten to 25% giveback
+- If trailing NOT active AND losing > 30% of stop → hard exit
+- Per setup type:
+  - TREND_FOLLOW: EMA20 crosses below EMA50 on 5m
+  - VWAP_BOUNCE: price closes below VWAP on 5m bar
+  - BREAKOUT: price closes back inside consolidation range
+  - REVERSAL: price makes new low below divergence low
 
-0. **Profit Target**: Exit when profit ≥ `Max(entryPrice × 1.0%, effectiveStopLoss × 1.5)`. AMD: $6.00. The 1.5× stop floor ensures minimum 1.5:1 risk/reward. Previously was 3.0× stop ($12 for AMD — unreachable intraday).
-1. **VWAP Cross** (grace: holdTime×0.50, max 15min): **tightens trailing stop to 30% giveback** (NOT a hard exit)
-2. **EMA Trend Reversal** (grace: holdTime×0.33, max 10min): **tightens trailing stop to 30% giveback** (NOT a hard exit)
-3. **RSI Extreme** (grace: holdTime×0.17, max 5min): **graduated tightening** — RSI 75-80→40%, RSI 80+→25% (NOT a hard exit)
-3.5. **Regime Exit** (NEW): When VWAP/EMA/RSI tighteners fire AND trailing is NOT active (profit below activation) AND loss exceeds 40% of stop distance → exit. This makes VWAP/EMA/RSI indicators effective even without the trailing stop. AMD: exits at $1.60 loss vs $4.00 full stop. NOT a hard exit from VWAP/EMA/RSI directly — requires: indicator adverse + trailing not active + losing 40% of stop.
-4. **Stop Loss**: Max(rule stop, **2.0×ATR**, entry spread) — volatility-adaptive, unchanged
-5. **Breakeven Stop**: Once peak profit > `trailingActivation × 2.0` (AMD: $0.66), exit if position falls below **-0.25× stop** (buffer prevents single-tick exits). Previously required 2.0× stop distance ($8.00 for AMD — unreachable).
-6. **Trailing Stop**: Activates when peak profit > `Max(entryPrice × 0.15%, entrySpread × 2)`. AMD: $0.33. Anti-wick filtered (10s persistence). **Inverted** confidence-scaled giveback: `0.35 + confidence×0.25` (higher confidence → MORE room, 0.85 conf → 56%). Stage 2: 50% giveback. VWAP/EMA/RSI tightening overrides applied here. Previously required peakProfit > effectiveStopLoss ($4 for AMD — unreachable).
-7. **Time Gate**: Adaptive — past hold time check score strength; hard cap at 2× hold time. **Score=0 handling**: ComputeCurrentScore returns 0 on data gaps (cold cache, no snapshots). Score of exactly 0.000 is never natural (6 blended indicators). If score=0 AND profitable → hold (don't exit on stale data). If score=0 AND losing → exit as TIME+NOSIGNAL.
-8. **Exit order escalation**: If exit order unfilled after 30s, cancel and resubmit with aggressive price (cross spread by 0.05%)
+**EXIT 4: Trailing Stop** (phased) — Activates when peak profit > entryPrice × 0.40%.
+- Anti-wick filter: 15 seconds persistence required
+- Base giveback: `0.35 + setupStrength × 0.20` (higher strength → more room)
+  - Strength 0.80 → 51% giveback (let winners run)
+  - Strength 0.40 → 43% giveback (tighter)
+- Tightening overrides from indicators:
+  - VWAP cross against position → tighten to 30% (grace: holdTime × 0.40, max 30 min)
+  - EMA trend reversal (5m) → tighten to 30% (grace: holdTime × 0.25, max 20 min)
+  - RSI extreme (>80 or <20) → tighten to 25% (grace: holdTime × 0.15, max 10 min)
+  - RSI moderate extreme (75-80) → tighten to 40%
+  - Setup invalidation → tighten to 25% (grace: holdTime × 0.25)
+  - EOD (3:30 PM) → tighten to 20%
 
-### Singleton Caches (in-memory, registered in BlazorModule)
+**EXIT 5: Regime Exit** — When tighteners fire AND trailing NOT active AND losing > 35% of stop → exit. Catches "thesis wrong, exit before full stop" scenarios.
 
-| Cache | Purpose |
-|-------|---------|
-| `L2BookCache` | Rolling 720 L2 snapshots per ticker |
-| `TickDataCache` | Real-time tick/quote data + L2-derived features (7 fields) |
-| `BarIndicatorCache` | EMA9/20, RSI14, VWAP, VolumeRatio (refreshed every 30s) |
-| `StrategyRuleEvaluator` | AI-generated conditional rules (loaded from file) |
-| `SignalStore` | Recent signals for display |
+**EXIT 6: Breakeven Stop** — Once peak profit > trailingActivation × 2.5, protect at breakeven minus 0.20× stop buffer. Wider activation than scalping (2.5× vs 2.0×) to give day trades room.
 
-### Key Domain Types
+**EXIT 7: Opposing Setup** — If SetupDetector fires opposing setup with strength ≥ 0.50 AND L2 timing confirms (|timing| ≥ 0.20) → exit. Requires full setup, not just L2 blip.
 
-- `SymbolBookSnapshot` — L2 order book (bid/ask arrays as JSONB, spread, midprice, imbalance)
-- `TickSnapshot` — 10-second snapshot with 17 indicators + 7 L2-derived features
-- `TradingSignalRecord` — Buy/sell signal with indicators, verified with PriceAfter1Min/5Min/15Min/30Min
-- `ModelConfig` / `TickerModelConfig` — Learned weights + thresholds from hill-climbing
-- `StrategyConfig` / `StrategyRule` — AI-discovered conditional rules with per-rule hold time, stop loss
-- `CompletedTrade` — Round-trip trade with entry source, entry score, and exit reason (persisted to DB)
+**EXIT 8: Adaptive Time Gate**
+- Default holdTime: 3600s (1 hour). Trained nightly per ticker from [1800, 3600, 5400, 7200, 10800, 14400].
+- Past holdTime: check setup health + score strength
+  - Setup still valid + profitable → hold (up to 2× holdTime)
+  - Setup still valid + losing → tighten trailing to 30%
+  - Setup invalidated → exit
+- Past 2× holdTime: hard cap exit (max 14400s = 4 hours)
+- Score=0 handling: data gap, not weakness. Profitable → hold. Losing → exit as TIME+NOSIGNAL.
 
-### CompletedTrades Table (DISPLAY ONLY)
+**EXIT 9: Exit Order Escalation** — If exit order unfilled after 30s, cancel and resubmit crossing spread by 0.05%.
 
-**CRITICAL RULE**: The `CompletedTrades` table is used ONLY by the "Today's Trades" dashboard UI. It is NOT used for any trading decisions, P&L calculations, position management, or performance metrics. The **broker API is the sole source of truth** for:
-- P&L (Performance box, daily P&L stops, nightly trainer outcomes)
-- Positions (entry gating, position limits, broker sync)
-- Order status (fill confirmation, exit escalation)
+## Daily Schedule
 
-`CompletedTrades` exists because the broker API does not return entry source (RULE/WEIGHTED), entry score, or exit reason (TRAILING STOP, REGIME EXIT, etc.). These are only known at trade time inside `PaperTradingExecutor` and would be lost on app restart without persistence.
+```
+9:00 AM ET   PreMarketScannerJob
+             → Rank all 50 watched symbols
+             → Set top 10 IsActiveForTrading = true
+             → Save to DailyWatchlists table
 
-If `CompletedTrades` is empty or unavailable, the dashboard simply shows "No trades today" — trading is unaffected.
+9:30 AM      Market opens. All 50 symbols receiving MQTT data.
+             Caches warm for all 50. Active 10 generate signals.
+
+9:45 AM      Entry gate opens (first 15 min avoided)
+
+3:30 PM      EOD tightening begins (trailing → 20% giveback)
+
+3:45 PM      EOD exits start (profitable → market, losing → limit)
+
+3:50 PM      Hard close all remaining positions
+
+4:00 PM      Market close. Clear IsActiveForTrading for all.
+
+9:00 PM ET   NightlyStrategyOptimizer.OptimizeAsync
+             → Verify signal outcomes (1hr/2hr/4hr) + backfill gaps
+             → Verify BarSetup outcomes (1hr/2hr/4hr, MaxFavorable, MaxAdverse)
+             → Score news sentiment via Bedrock (batch)
+             → Bedrock AI rule generation (bar + L2 conditions)
+
+9:30 PM ET   NightlyLocalTrainer.TrainAsync
+             → Optimize setup weights (EMA, RSI, volume, VWAP, capital flow)
+             → Optimize L2 timing weights (existing 6 indicators)
+             → Optimize composite blend (setup vs timing vs context ratios)
+             → Optimize hold times from [1800, 3600, 5400, 7200, 10800, 14400]
+             → Optimize exit thresholds
+
+10:00 PM ET  NightlyStrategyOptimizer.CleanupOldDataAsync
+             → L2 snapshots: 3-day retention
+             → TickSnapshots: 30-day retention
+
+After close  ml/l2/retrain.py (Swin model for L2 timing, all 50 symbols)
+             ml/daytrading/ pipeline (setup model + backtest, as needed)
+```
+
+## Nightly Training Details
+
+### NightlyLocalTrainer (C#, hill-climbing)
+
+**What it optimizes** (expanded for day trading):
+- **Setup weights**: Feature importances for SetupDetector (EMA alignment, RSI zone, volume, VWAP, capital flow, news). Indices 0-N of the setup weight vector.
+- **L2 timing weights**: Same 6 indicators (OBI, WOBI, PressureRoc, Spread, LargeOrder, TickMomentum). Perturbs ±0.05.
+- **Composite blend**: Ratio of setup vs timing vs context (sum to 1.0).
+- **Score thresholds**: MinScoreToBuy/Sell from candidates [0.25, 0.30, 0.35, 0.40, 0.45, 0.50].
+- **Hold time**: From [1800, 3600, 5400, 7200, 10800, 14400] per ticker.
+- **Hourly multipliers**: Win rate by ET hour → ScoreMultiplier (>60% → 1.2×, <50% → 0.7×).
+
+**Training data**:
+- Multi-horizon outcome: `0.10×PriceAfter1Hr + 0.35×PriceAfter2Hr + 0.35×PriceAfter4Hr + 0.20×MaxFavorable4Hr`
+- Walk-forward: 75% train (oldest) / 25% validation (newest), time-ordered by day
+- 3 restarts × 300 iterations each (900 total)
+- Overfit guard: falls back to defaults if validation P&L < 15% of training P&L
+
+**Training data filters**:
+- Only signals with |Score| ≥ 0.20
+- Market hours only (9:45 AM - 3:30 PM ET — narrower than collection hours)
+- Excludes backfilled signals
+- Excludes cold-cache signals (OBI=0 AND WOBI=0 AND TickMomentum=0)
+- Requires at least PriceAfter1Hr
+
+### NightlyStrategyOptimizer (C# + Bedrock)
+
+**Rule generation** (expanded for day trading):
+- Rules now include bar-level conditions (EMA crossover, RSI zones, VWAP position, volume surge) in addition to L2 conditions
+- HoldSeconds: 600-7200s (10 min to 2 hours)
+- MaxDailyTrades: 3 per symbol
+- Rule preservation: existing rules with ≥5 matches AND positive P&L survive
+- Bedrock receives: bar indicators, L2 features, news summaries, capital flow, fundamentals
+- Post-generation backtesting on newest 25% of data
+
+**Outcome verification** (expanded):
+- Verifies PriceAfter1Hr, PriceAfter2Hr, PriceAfter4Hr on TradingSignalRecord
+- Verifies PriceAfter1Hr/2Hr/4Hr, MaxFavorable, MaxAdverse on BarSetups
+- News sentiment batch scoring via Bedrock
+
+### Day Trading ML Pipeline (Python, `ml/daytrading/`)
+
+**`export_bars.py`** — Pull from DB: SymbolBars (1m, 5m), SymbolNews, SymbolCapitalFlows, SymbolFinancialSnapshots, BarSetups, TradingSignalRecord. Configurable date range and symbols.
+
+**`compute_features.py`** — Feature engineering per symbol per 5-min bar:
+- Technical: EMA9/20/50 (1m), EMA20/50 (5m), RSI14 (1m, 5m), ATR14 (5m), VWAP, VWAP deviation
+- Trend: trend_1m, trend_5m, trend_alignment, EMA slope
+- Pattern: dist_to_ema20/vwap (ATR-normalized), range_width, range_breakout, RSI divergence
+- News: sentiment (12hr avg), news_count_2hr, has_catalyst, catalyst_type
+- Fundamental: capital_flow_net, capital_flow_3d, short_float, days_to_earnings
+- Volume: volume_ratio, relative_volume (vs 20-day time-of-day avg)
+- Labels: weighted return from 1hr/2hr/4hr + max favorable; UP/FLAT/DOWN at ±0.5% (50 bps)
+
+**`train.py`** — LightGBM gradient-boosted trees (tabular features, not images):
+- Model A: Setup Quality Classifier → P(UP), P(FLAT), P(DOWN)
+- Model B: Setup Type Classifier → best setup type for the conditions
+- Walk-forward split by days: 60% train, 20% validation, 20% test
+- Threshold optimization on validation set for Sharpe ratio
+- Overfit guard: test Sharpe must be >50% of validation Sharpe
+- Output: `day_trade_model.json` (thresholds, feature importances, per-symbol params)
+
+**`backtest.py`** — Full pipeline simulation on historical data:
+- Replays day by day: setup detection → scoring → entry gating → position management → exits
+- Entry price: open of next 1-min bar + slippage (ATR × 0.05 adverse)
+- Exit simulation: all 9 exit types on 1-min bar OHLC
+- Stop loss: triggered if bar.Low ≤ stop → exit at stop level
+- Trailing: update peak from bar.High, check pullback on bar.Close
+- L2 timing approximated from volume_spike × trend_alignment × spread_proxy
+- Config-driven: `backtest_config.json` for all tweakable parameters
+- Output: `trade_log.csv`, `equity_curve.csv`, `metrics.json`
+
+**`evaluate.py`** — Analyze backtest results:
+- Overall: Sharpe, max drawdown, win rate, profit factor, avg hold time
+- By setup type: which setups profitable?
+- By symbol: which symbols work?
+- By hour: when to trade?
+- By exit reason: are exits working or killing winners?
+- By news/catalyst: how much does news matter?
+- Threshold sensitivity: entry threshold vs (win_rate, pnl, trade_count)
+
+**`evaluate_scanner.py`** — Evaluate pre-market scanner accuracy:
+- Did top 10 picks outperform bottom 40?
+- Scanner hit rate (% of picks with >0.5% tradeable move)
+- Ranking weight optimization
+
+**Iteration loop**: train → backtest → evaluate → tweak config → re-backtest → retrain if needed → walk-forward validate → deploy.
+
+### Swin Vision Model (Python, `ml/l2/` — entry timing only)
+
+Swin-Tiny (28M params) fine-tuned on L2 order book heatmaps (224×224 RGB). 300 consecutive L2 snapshots encoded as: R=ask sizes, B=bid sizes, G=midprice+spread. Classifies UP/FLAT/DOWN.
+
+**Role in day trading**: Entry timing confirmation only. Does NOT generate trade ideas. Confirms that L2 pressure aligns with the bar-level setup.
+
+**Training**: 20-day window from DB L2 snapshots. Multi-horizon labels: `0.20×5min + 0.40×15min + 0.40×30min`. Pipeline: `export_data.py → render_heatmap.py → train.py → export_onnx.py`.
+
+**Key config** (`ml/l2/config.py`): STRIDE=100, UP/DOWN_THRESHOLD=±30bps, BATCH_SIZE=64, LR=1e-4, EPOCHS_HEAD=5, EPOCHS_FINETUNE=25, PATIENCE=10, SEED=42.
+
+**Data quality**: Market hours only, gap detection (>5s), window span 60-600s, cross-day guard, per-horizon timing tolerance ±30%.
+
+## Project Structure
+
+```
+src/
+  TradingPilot.Domain.Shared/
+    Symbols/
+      BarTimeframe.cs                    ── Daily, Hour1, Minute30, Minute15, Minute5, Minute1
+      SecurityType.cs                    ── Stock, Etf, Adr, Reit, Spac
+      SymbolStatus.cs                    ── Active, Halted, Delisted, Inactive
+    Trading/
+      SignalSource.cs                    ── L2Micro, BarSetup, AiRule, Composite
+      SetupType.cs                       ── TrendFollow, VwapBounce, Breakout, Reversal
+
+  TradingPilot.Domain/
+    Symbols/
+      Symbol.cs                          ── IsWatched (permanent 50), IsActiveForTrading (daily top 10)
+      SymbolBar.cs
+      SymbolBookSnapshot.cs
+      SymbolCapitalFlow.cs
+      SymbolFinancialSnapshot.cs
+      SymbolNews.cs                      ── + SentimentScore, CatalystType
+    Trading/
+      Caches/
+        TickDataCache.cs
+        BarIndicatorCache.cs             ── 1m + 5m + 15m indicators
+        SignalStore.cs
+      Signals/
+        TradingSignal.cs                 ── runtime DTO
+        TradingSignalRecord.cs           ── DB entity with all indicator columns
+        IndicatorSnapshot.cs             ── all indicators at a point in time
+      Microstructure/
+        MarketMicrostructureAnalyzer.cs  ── L2 timing scorer (ComputeTimingScore)
+        SwinPredictor.cs                 ── ONNX inference
+        L2BookCache.cs                   ── rolling 720 snapshots per ticker
+      Setups/
+        SetupDetector.cs                 ── scans bars for 4 setup types
+        SetupResult.cs                   ── setup DTO (type, direction, levels, strength, expiry)
+        BarSetup.cs                      ── DB entity (AppBarSetups table)
+      Scoring/
+        CompositeScorer.cs               ── setup × 0.50 + timing × 0.30 + context × 0.20
+        ContextScorer.cs                 ── news, capital flow, earnings, short float
+        ScoringWeights.cs                ── weight config structure
+      Rules/
+        StrategyConfig.cs                ── bar + L2 conditions
+        StrategyRuleEvaluator.cs         ── rule matching + live performance tracking
+      Positions/
+        PositionState.cs                 ── + SetupType, StopLevel, TargetLevel, InvalidationCheck
+        CompletedTrade.cs                ── + Source, SetupType, scores
+        PendingOrder.cs
+      Config/
+        ModelConfig.cs                   ── setup weights, timing weights, composite blend
+        DayTradeConfig.cs                ── all day trading constants
+      Scanner/
+        PreMarketScanner.cs              ── ranking logic (50 → top 10)
+        DailyWatchlist.cs                ── DB entity (AppDailyWatchlists table)
+
+  TradingPilot.Application/
+    Trading/
+      Execution/
+        PaperTradingExecutor.cs          ── entry gating for day trading
+        PositionMonitor.cs               ── thesis-aware exits, EOD close, setup invalidation
+      Analysis/
+        SignalOrchestrator.cs            ── SetupDetector → L2 timing → Composite → signal
+        BarIndicatorService.cs           ── compute 1m/5m/15m indicators
+      Training/
+        NightlyLocalTrainer.cs           ── hill-climbing: setup + timing + composite weights
+        NightlyStrategyOptimizer.cs      ── verify outcomes, Bedrock rules, news scoring
+      Scanner/
+        PreMarketScannerJob.cs           ── 9:00 AM ET Hangfire job
+      DashboardAppService.cs
+    Webull/
+      WebullApiClient.cs                 ── bars, depth, news, capital flow, fundamentals, search
+      WebullBrokerClient.cs
+      WebullPaperTradingClient.cs
+      WebullGrpcClient.cs
+      WebullProtobufDecoder.cs
+      MqttMessageProcessor.cs
+      LoadHistoricalBarsJob.cs
+      RefreshFundamentalsJob.cs
+      RefreshNewsJob.cs
+      StartupRecoveryJob.cs
+      WebullHookAppService.cs
+
+  TradingPilot.Blazor/
+    WebullHookHostedService.cs           ── auto-inject, auto-subscribe all 50 symbols
+
+  TradingPilot.EntityFrameworkCore/
+    TradingPilotDbContext.cs
+    TradingPilotDbContextModelCreatingExtensions.cs
+
+ml/
+  l2/                                    ── Swin L2 heatmap pipeline (entry timing)
+    config.py, export_data.py, render_heatmap.py, train.py, export_onnx.py, retrain.py
+
+  daytrading/                            ── Day trading ML + backtesting
+    config.py                            ── horizons, thresholds, feature list
+    export_bars.py                       ── pull bars + news + flows from DB
+    compute_features.py                  ── feature engineering
+    train.py                             ── LightGBM setup quality + type classifiers
+    backtest.py                          ── full pipeline simulation
+    backtest_config.json                 ── tweakable parameters
+    exit_engine.py                       ── all 9 exit types (mirrors C# PositionMonitor)
+    entry_engine.py                      ── entry gating (mirrors C# PaperTradingExecutor)
+    setup_detector.py                    ── setup detection (mirrors C# SetupDetector)
+    context_scorer.py                    ── news + fundamentals scoring
+    evaluate.py                          ── metrics, breakdowns, comparisons
+    evaluate_scanner.py                  ── pre-market scanner accuracy
+    configs/                             ── backtest config variants
+    results/                             ── per-run output directories
+```
+
+## Database Schema
+
+### Existing Tables (unchanged)
+
+**Symbols** — 50 watched symbols. `IsWatched` = permanent watchlist. **ADD**: `IsActiveForTrading` = daily top 10 flag.
+
+**SymbolBars** — OHLCV bars at multiple timeframes (Daily, Hour1, Minute30, Minute15, Minute5, Minute1). Retained forever.
+
+**SymbolBookSnapshots** — L2 order book (bid/ask arrays, spread, midprice, imbalance). 3-day retention. ~110 MB/symbol/day.
+
+**TickSnapshots** — 10-second snapshots with 17 indicators + 7 L2 features. 30-day retention.
+
+**PaperTrades** — Every paper order executed. Retained forever.
+
+**ModelConfigs** — Key-value store for nightly config JSON backup.
+
+### Modified Tables
+
+**SymbolNews** — ADD:
+- `SentimentScore` decimal(6,4) — [-1, +1], null until scored
+- `SentimentMethod` text — 'KEYWORD' or 'BEDROCK'
+- `CatalystType` text — EARNINGS, ANALYST, REGULATORY, SECTOR, CORPORATE, null
+- `ScoredAt` timestamp
+
+**SymbolCapitalFlows** — unchanged (already has super-large/large/medium/small inflow/outflow).
+
+**SymbolFinancialSnapshots** — unchanged (already has PE, EPS, MarketCap, ShortFloat, NextEarningsDate).
+
+**TradingSignalRecord** — ADD:
+- `Source` text — L2_MICRO, BAR_SETUP, AI_RULE, COMPOSITE
+- `SetupType` text — TREND_FOLLOW, VWAP_BOUNCE, BREAKOUT, REVERSAL, null
+- `SetupScore` decimal(8,6) — bar-based setup score
+- `TimingScore` decimal(8,6) — L2 timing score
+- `ContextScore` decimal(8,6) — fundamental/flow/news score
+- `Ema50` decimal(12,4) — 50-period EMA on 5m bars
+- `Ema20_5m` decimal(12,4)
+- `Rsi14_5m` decimal(8,4)
+- `TrendStrength` decimal(8,6) — multi-TF trend alignment [-1, +1]
+- `VwapDeviation` decimal(8,6) — % distance from VWAP
+- `CapitalFlowScore` decimal(8,6) — net institutional flow [-1, +1]
+- `RelativeVolume` decimal(8,4) — volume vs 20-day time-of-day avg
+- `NewsSentiment` decimal(6,4) — news sentiment at signal time
+- `HasCatalyst` bool
+- `CatalystType` text
+- `NewsCount2Hr` int — articles in last 2 hours
+- `PriceAfter1Hr` decimal(12,4)
+- `PriceAfter2Hr` decimal(12,4)
+- `PriceAfter4Hr` decimal(12,4)
+- `WasCorrect1Hr` bool
+- `WasCorrect2Hr` bool
+- `WasCorrect4Hr` bool
+
+**CompletedTrade** — ADD:
+- `Source` text — L2_MICRO, BAR_SETUP, AI_RULE, COMPOSITE
+- `SetupType` text
+- `SetupScore` decimal(8,6)
+- `TimingScore` decimal(8,6)
+- `HoldSeconds` int — planned hold at entry
+- `StopDistance` decimal(12,4) — effective stop at entry
+- `SetupInvalidated` bool — did the thesis break?
+
+### New Tables
+
+**BarSetups** — Detected setups with outcomes. ~20-50 per day per symbol. Retained forever.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| Id | Guid (PK) | |
+| SymbolId | Guid (FK) | |
+| TickerId | long | |
+| Timestamp | DateTime | when setup detected |
+| SetupType | text | TREND_FOLLOW, VWAP_BOUNCE, BREAKOUT, REVERSAL |
+| Direction | text | BUY, SELL |
+| Strength | decimal(8,6) | quality score [0, 1] |
+| EntryZoneLow | decimal(12,4) | ideal entry range low |
+| EntryZoneHigh | decimal(12,4) | ideal entry range high |
+| StopLevel | decimal(12,4) | structural stop price |
+| TargetLevel | decimal(12,4) | projected target price |
+| ExpiresAt | DateTime | setup shelf life |
+| Price | decimal(12,4) | price at detection |
+| Ema9, Ema20, Ema50 | decimal(12,4) | 1m indicators |
+| Ema20_5m, Ema50_5m | decimal(12,4) | 5m indicators |
+| Rsi14, Rsi14_5m | decimal(8,4) | |
+| Vwap | decimal(12,4) | |
+| Atr14 | decimal(10,4) | |
+| VolumeRatio | decimal(8,4) | |
+| TrendDirection | int | |
+| CapitalFlowScore | decimal(8,6) | |
+| NewsSentiment | decimal(6,4) | |
+| HasCatalyst | bool | |
+| CatalystType | text | |
+| NewsCount2Hr | int | |
+| PriceAfter1Hr | decimal(12,4)? | outcome verification |
+| PriceAfter2Hr | decimal(12,4)? | |
+| PriceAfter4Hr | decimal(12,4)? | |
+| MaxFavorable | decimal(12,4)? | best price in direction within 4hr |
+| MaxAdverse | decimal(12,4)? | worst price against within 4hr |
+| WasCorrect1Hr, 2Hr, 4Hr | bool? | |
+| WasTradeable | bool? | did L2 timing confirm during window? |
+| VerifiedAt | DateTime? | |
+
+Indexes: `(SymbolId, Timestamp)`, `(SetupType, Direction)`
+
+**DailyWatchlists** — Scanner picks per day. One row per day. Retained forever.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| Id | Guid (PK) | |
+| Date | DateOnly | trading day |
+| Selections | jsonb | [{symbol, tickerId, rank_score, gap_pct, premarket_vol, catalyst_type, setup_quality, atr_pct}] |
+| CreatedAt | DateTime | |
 
 ## Important Patterns
 
 ### Auth Header Resolution
 
-All Webull API jobs use a `ResolveAuthHeader()` pattern: try in-memory `WebullHookAppService.CapturedAuthHeader` first, fall back to reading `D:\Third-Parties\WebullHook\auth_header.json` from disk. This ensures jobs work even if the MQTT hook hasn't intercepted a request yet.
+All Webull API jobs use a `ResolveAuthHeader()` pattern: try in-memory `WebullHookAppService.CapturedAuthHeader` first, fall back to reading `D:\Third-Parties\WebullHook\auth_header.json` from disk.
 
 ### Database Access in Singletons
 
-Singleton services (MqttMessageProcessor, PaperTradingExecutor) use `IServiceScopeFactory` to create scoped DB access:
+Singleton services use `IServiceScopeFactory` to create scoped DB access:
 ```csharp
 using var scope = _scopeFactory.CreateScope();
 var uowManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
@@ -207,122 +669,130 @@ await uow.CompleteAsync();
 
 All timestamps stored in PostgreSQL as `timestamp without time zone` in **UTC**. When converting to ET in SQL, use the double `AT TIME ZONE` pattern:
 ```sql
--- CORRECT: declare UTC first, then convert to ET
 (ts."Timestamp" AT TIME ZONE 'UTC') AT TIME ZONE 'America/New_York'
-
--- WRONG: PostgreSQL assumes the value IS in ET
-ts."Timestamp" AT TIME ZONE 'America/New_York'
 ```
-
-In C#, use `TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eastern)` (already correct throughout).
+In C#: `TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, eastern)`.
 
 ### Hangfire Job Attributes
 
-Background jobs use `[DisableConcurrentExecution(seconds)]` to prevent overlapping runs and `[AutomaticRetry(Attempts = N)]` for retry policy. Jobs that need auth use `ResolveAuthHeader()` and return early (not throw) if unavailable.
+Background jobs use `[DisableConcurrentExecution(seconds)]` and `[AutomaticRetry(Attempts = N)]`. Jobs needing auth use `ResolveAuthHeader()` and return early if unavailable.
+
+### MQTT Subscription (50 symbols)
+
+`WebullHookHostedService.AutoSubscribeAsync()` subscribes all `IsWatched` symbols to 6 MQTT message types (L2depth=91, quote=92, tick=100, trade=102, order=104, L2depth2=105). Re-subscribes every 2 minutes to keep data flowing. Subscriptions are programmatic via `MqttCommandWriter` named pipe — no manual Webull UI interaction needed.
+
+### Config Files (loaded at runtime)
+
+Both live at `D:\Third-Parties\WebullHook\` and are watched via `FileSystemWatcher` + 1-min polling:
+- `model_config.json` — learned weights, thresholds, hold times per ticker
+- `strategy_rules.json` — AI-generated conditional rules per ticker
+- `day_trade_model.json` — LightGBM feature importances and thresholds
+- `swin_trading.onnx` — Swin model for L2 timing
+
+### CompletedTrades Table (DISPLAY ONLY)
+
+**CRITICAL RULE**: `CompletedTrades` is used ONLY by the dashboard UI. NOT for trading decisions. Broker API is the sole source of truth for P&L, positions, and order status.
 
 ## External Dependencies
 
 - **PostgreSQL** — `localhost:5432/TradingPilot` (connection string in appsettings.json)
 - **Redis** — `localhost` database 10 (Hangfire storage + ABP cache)
-- **AWS Bedrock** — `us-west-2`, model `anthropic.claude-sonnet-4-6-20250514-v1:0` (nightly strategy optimization)
+- **AWS Bedrock** — `us-west-2`, model `anthropic.claude-sonnet-4-6-20250514-v1:0` (nightly rules + news scoring)
 - **Webull Desktop** — MQTT hook DLL injected via `ProcessInjector` for real-time data capture
 
-### Data Quality Guards
+## Locked Parameters (do NOT change without quantitative backtesting evidence)
 
-- **ImbalanceVelocity**: Uses closest-sample interpolation (finds OBI sample nearest to 30s ago, normalizes by actual time delta). Avoids stuck-at-zero from rigid 25-35s window.
-- **SpreadPercentile**: Time-based 5-minute window (not count-based). Queue size 600. Returns 0.50 if <10 samples.
-- **Bar history**: 60 bars loaded (up from 30) for proper EMA20/RSI14 convergence.
-- **VWAP**: Filtered to today's ET trading session only (prevents cross-day contamination).
-- **BarIndicatorCache.LastRefreshTime**: Tracked per ticker. Analyzer skips signal generation if bar indicators are >2 minutes stale.
-
-## Stabilization Plan (2026-03-23, updated 2026-03-25)
-
-**AUTHORITATIVE REFERENCE**: See `docs/final/` for the complete stabilization plan that was implemented. All parameter decisions are final — do NOT re-derive or change without quantitative evidence. Key decisions locked:
+### Day Trading Parameters
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| ATR stop multiplier | 2.0× | 1.5× inside normal candle noise, 2.5× too wide |
-| VWAP/EMA/RSI exits | Trailing tighteners (NOT hard exits) | Hard exits killed winners during oscillation |
-| Floor protection | 30%, both stages | 50% too generous, 0% too brittle |
-| HoldSeconds range (rules) | 60-600 | L2 signals decay in minutes, not hours |
-| Training outcome | Multi-horizon weighted (0.20/0.40/0.40) | Actual exits happen at 5-15 min, not 30 min |
-| Trailing giveback (rules) | 0.35 + conf×0.25 (inverted) | High confidence gets MORE room |
-| Entry timeout | 90 seconds | L2 signal stale after 30s |
-| Rate limit | 300 seconds | Balance between whipsaw prevention and re-entry |
-| Daily P&L stops | -$500 loss / +$500 profit → stop for day | Outcome-based, not count-based |
-| Backfills in training | Excluded | Bar-derived scores corrupt L2 weight optimization |
+| Composite weights | setup 0.50, timing 0.30, context 0.20 | Bar setups primary, L2 for timing, context for filtering |
+| Stop ATR multiplier | 1.5× (floor) | Setup's structural stop is primary; ATR is minimum floor |
+| Trailing activation | 0.40% of entry price | Reachable in 1-4hr holds (0.15% was for scalping) |
+| Breakeven activation | 2.5× trailing | Give day trades room to develop |
+| Profit target min | 2.0% of entry OR 2.0× stop | Minimum 2:1 risk/reward for day trades |
+| Regime exit threshold | 35% of stop | Early exit when thesis weakening |
+| Trailing giveback | 0.35 + strength × 0.20 | Higher quality setups get more room |
+| Default hold time | 3600s (1 hour) | Nightly optimized per ticker from [1800..14400] |
+| Hold time hard cap | 14400s (4 hours) | Must close before EOD |
+| Daily P&L stops | ±$1500 | Wider than scalping ±$500 for bigger swings |
+| Rate limit | 1800s (30 min) | Fewer, higher conviction trades |
+| Loss cooldown | 3600s (60 min) | Prevent repeating losing setups |
+| Entry timeout | 300s (5 min) | Wider fills acceptable for day trades |
+| Floor protection | 30% | Same as scalping — prevents over-filtering |
+| EOD close | 3:50 PM ET hard, 3:30 PM tightening | No overnight positions |
+| Entry hours | 9:45 AM - 3:30 PM ET | Avoid open volatility and close illiquidity |
+| Active symbols | Top 10 from 50 | Daily scanner selection |
+| Swin blend cap | 50% max | Prevents vision model from dominating |
+| Swin min conviction | 0.05 | Require L2 indicator confirmation |
 
-### Exit Strategy Overhaul (2026-03-25)
+### Scanner Parameters
 
-**Problem solved**: 8/10 trades exiting via TIME+WEAK because all profit-side exit thresholds scaled off `effectiveStopLoss` (2×ATR ≈ 1-2% of price) which was unreachable for typical 0.1-0.5% day trade moves. VWAP/EMA/RSI tighteners were dead code (set `trailingOverride` but trailing never activated). Score=0 from data gaps triggered false TIME+WEAK exits. Opposing signals were documented but never implemented.
+| Factor | Weight | Threshold |
+|--------|--------|-----------|
+| Overnight gap | 0.25 | >2% = high interest |
+| Pre-market volume | 0.20 | >2× avg = high interest |
+| News catalyst | 0.20 | Any catalyst = high interest |
+| Capital flow trend | 0.15 | Strong directional 3-day flow |
+| Setup quality | 0.15 | Any setup strength >0.50 from prior close |
+| ATR volatility | 0.05 | ATR% >0.8% minimum for day trading |
 
-**New locked parameters** (do NOT change without quantitative evidence):
+## Data Quality Guards
 
-| Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| OptimalHoldSeconds default | **1200s** (20 min) | Matches weighted training horizon: 0.20×5 + 0.40×15 + 0.40×30 = ~19 min. Old 3600s was 3× longer than what model trained on. Nightly trainer now optimizes per-ticker from [300,600,900,1200,1800]. |
-| Trailing activation | **0.15% of entry price** (floored at 2× entry spread) | AMD $218 → $0.33. Old was effectiveStopLoss ($4 for AMD = 1.8% — unreachable). 0.15% is realistic for 5-60 min day trades. Floor at 2× spread prevents activation from noise inside bid-ask. |
-| Breakeven activation | **2× trailing activation** | AMD → $0.66. Old was 2× stop ($8 — unreachable). Position must reach meaningful profit before protecting at breakeven. |
-| Profit target | **Max(1.0% of entry, 1.5× stop)** | AMD → Max($2.18, $6) = $6. Old was 3× stop ($12 — impossible intraday). 1.5× stop floor guarantees minimum risk/reward ratio. |
-| Regime exit threshold | **40% of stop distance** | AMD → $1.60. When VWAP/EMA/RSI say "wrong direction" AND trailing not active AND losing 40% of stop → exit early. NOT a hard exit from indicators — requires losing money + indicator confirmation + 40% stop threshold. |
-| Opposing signal threshold | **0.40** (strong signal) | Matches "strong" classification throughout codebase. Only exits on high-conviction reversals, prevents whipsaw from moderate signals. |
-| Score=0 handling | **Unknown, not weak** | ComputeCurrentScore returns exactly 0.000 on data gaps (never natural from 6 blended indicators). Profitable positions survive data gaps. Losing positions with no signal exit as TIME+NOSIGNAL. |
-| Loss cooldown | **1800s (30 min) per symbol** | After a losing trade (P&L ≤ 0) on a symbol, block re-entry on that symbol for 30 minutes. Prevents repeatedly entering the same losing setup (e.g., SMCI shorted 4x into a rally on 2026-03-27). Winning trades have no extended cooldown (base 300s rate limit applies). |
-| Swin direction agreement | **Required before blending, min conviction 0.05** | Swin must agree with weighted indicators on direction AND indicators must have |weighted| ≥ 0.05 conviction. If Swin says SELL but indicators say BUY → blocked. If indicators are near-zero (|weighted| < 0.05) → blocked (no confirmation). Prevents Swin from trading alone when L2 has no opinion. 2026-03-27 SMCI: weighted=-0.033 (noise) let Swin trade → -$271 loss. With 0.05 threshold: blocked. |
-| Swin blend weight cap | **50% max** | Even at 85% confidence, Swin gets at most 50% of the blend. Prevents Swin from dominating the composite score. Previous behavior: 85% confidence → 85% Swin weight → indicators nearly irrelevant. |
+- **ImbalanceVelocity**: Closest-sample interpolation (finds OBI sample nearest 30s ago, normalizes by actual time delta)
+- **SpreadPercentile**: Time-based 5-minute window, queue size 600, returns 0.50 if <10 samples
+- **Bar history**: 60 bars loaded for EMA20/RSI14 convergence (1m); 120 bars for EMA50 (5m)
+- **VWAP**: Filtered to today's ET trading session only
+- **BarIndicatorCache.LastRefreshTime**: Per ticker. Analyzer skips if bar indicators >2 minutes stale
+- **Setup expiry**: Setups expire 30-60 minutes after detection (shelf life)
+- **Cache warm-up**: New symbols need ~6 min L2BookCache (720 snapshots), ~1 min BarIndicatorCache after bars loaded
+- **Market hours**: Only signals during 9:45 AM - 3:30 PM ET
 
-## Swin Vision Model (ml/ directory)
+## Backtesting Guide
 
-### Overview
+### Quick Start
 
-Swin-Tiny (28M params) fine-tuned on L2 order book heatmaps (224×224 RGB). Each image encodes ~300 consecutive L2 snapshots: R=ask sizes, B=bid sizes, G=midprice+spread. Classifies as UP/FLAT/DOWN (5-min horizon, ±30 bps threshold). Integrated into Stage 2 scoring via ONNX inference in the Blazor app.
-
-### Pipeline (`retrain.py` — nightly after market close)
-
+```bash
+cd ml/daytrading
+python export_bars.py --days 60           # pull data from DB
+python compute_features.py                 # engineer features
+python train.py                            # train LightGBM models
+python backtest.py                         # simulate trading
+python evaluate.py                         # analyze results
 ```
-export_data.py --days 20  →  render_heatmap.py  →  train.py  →  export_onnx.py
-(L2 from DB)               (numpy heatmaps)      (fine-tune)   (swin_trading.onnx)
+
+### Iteration
+
+```bash
+# Tweak parameters and re-backtest (no retrain needed)
+python backtest.py --config configs/wider_stops.json
+python evaluate.py --compare results/baseline results/wider_stops
+
+# Walk-forward validation
+python backtest.py --walk-forward --train-days 40 --test-days 20 --step 5
+
+# Single symbol deep dive
+python backtest.py --symbol NVDA --verbose
+python evaluate.py --symbol NVDA
+
+# Compare with/without news
+python backtest.py --config configs/no_news.json --output results/no_news
+python evaluate.py --compare results/no_news results/with_news
+
+# Evaluate scanner accuracy
+python evaluate_scanner.py --days 60
 ```
 
-### Key Design Decisions
+### What to Look For in Results
 
-- **20-day training window**: DB retains L2 snapshots for 20 days. This is the optimal window — older data reflects stale market regimes (different volatility, spreads, market makers). No archiving needed; each nightly export pulls fresh 20-day window directly from DB.
-- **No archive/merge**: Previously archived and merged daily exports, causing massive data duplication (each 20-day export overlaps 19 days with the previous). Removed — the 20-day export IS the training set.
-- **~28K samples is sufficient**: Fine-tuning (not training from scratch) — pretrained ImageNet features transfer to heatmaps. Only top 2 stages unfrozen (~7-8M params). More data adds stale regime noise.
-- **Memory-mapped Dataset**: `images.npy` loaded via `np.load(mmap_mode='r')`. Dataset stores file path + index array (not the array itself). Each DataLoader worker opens its own mmap handle lazily. This avoids Windows `spawn` pipe size limits that crash at ~2 GB+.
-- **Mixed precision (AMP)**: `torch.amp.autocast` + `GradScaler` for ~2x GPU speedup with negligible accuracy impact.
-- **Multi-horizon labels (2026-03-27)**: Labels use weighted blend `0.20×5min + 0.40×15min + 0.40×30min` matching NightlyLocalTrainer. Previously used pure 5-min horizon which caused Swin to learn short-term mean-reversion patterns that conflicted with 20-min holds. Example: SMCI shorted 4x into a rally because Swin predicted 5-min dips correctly but the 20-min move was UP.
-- **Percentage-normalized price axis attempted and reverted (2026-03-27)**: Tried mapping Y-axis to % deviation from center mid-price to prevent ticker fingerprinting. Failed — pretrained ImageNet features don't transfer to the radically different visual patterns (27% accuracy vs ~55% with absolute). Reverted to absolute price rendering. Fingerprinting to be addressed via data augmentation in a future iteration.
-
-### Training Config (ml/config.py)
-
-| Setting | Value | Notes |
-|---------|-------|-------|
-| STRIDE_SNAPSHOTS | 100 | ~67% overlap between windows (was 30 = 90% overlap, too correlated) |
-| UP/DOWN_THRESHOLD | ±0.003 (30 bps) | Must exceed spread + slippage to be profitable |
-| HORIZON_SECONDS_LIST | [300, 900, 1800] | Multi-horizon: 5min, 15min, 30min |
-| HORIZON_WEIGHTS | [0.20, 0.40, 0.40] | Same as NightlyLocalTrainer outcome weighting |
-| BATCH_SIZE | 64 | |
-| LEARNING_RATE | 1e-4 | Phase 1 and Phase 2 base LR |
-| EPOCHS_HEAD | 5 | Phase 1: frozen backbone |
-| EPOCHS_FINETUNE | 25 | Phase 2: top 2 stages unfrozen, warmup + cosine decay |
-| EARLY_STOPPING_PATIENCE | 10 | |
-| SEED | 42 | Reproducibility |
-
-### Data Quality Guards (render_heatmap.py)
-
-- **Market hours filter**: Only snapshots 9:30 AM - 4:00 PM ET used for training. Pre/post-market have different spread/volume characteristics.
-- **Gap detection (main window only)**: Windows with any consecutive snapshot gap > 5 seconds are skipped. Prevents cross-gap heatmaps. NOT applied to future window (30 min gap-free is too strict).
-- **Window time span check**: Main window must span 60-600 seconds. Lower bound 60s (not 150s) because snapshot rate varies: NVDA ~2.6/sec (300 snaps = 115s) vs LLY ~1/sec (300 snaps = 300s).
-- **Future window sizing**: Uses `MAX_HORIZON_SECONDS × 3 = 5400` snapshots to guarantee 30 min of coverage even for high-rate tickers (2.6 snaps/sec × 1800s = 4680 snapshots needed).
-- **Cross-day guard**: Future window span must not exceed 2× MAX_HORIZON (3600s). Prevents labels from using next-day prices after market-hours filtering concatenates days.
-- **Per-horizon label quality**: `compute_label()` finds closest snapshot to each 5/15/30 min point. Tolerates ±30% timing deviation per horizon. Requires at least the 5-min horizon. Missing longer horizons are handled by weight normalization.
-- **Skip statistics**: Logged after each symbol showing how many windows were rejected by each filter.
-
-### Class Imbalance
-
-Typical distribution: ~85% FLAT / ~7.5% DOWN / ~7.5% UP. Handled by `WeightedRandomSampler` + `CrossEntropyLoss(weight=class_weights)`. The real bottleneck is minority class count (~2K UP/DOWN), not total samples.
+- **Overall Sharpe < 0**: Model not finding edges. Rethink features or setup conditions.
+- **High STOP LOSS count**: Stops too tight. Widen ATR multiplier or use wider structural stops.
+- **High TIME CAP count**: Hold times too short. Extend hold candidates.
+- **High EOD CLOSE with profit**: Hold time too short — missing moves.
+- **TRAILING STOP with low avg P&L**: Trail too tight. Increase giveback %.
+- **One setup type negative Sharpe**: Disable that setup type.
+- **Scanner hit rate <50%**: Adjust scanner weights. Check which factors predicted movers.
 
 ## Reference
 
-See `SYSTEM_REFERENCE.md` for complete database schema (10 tables), all Hangfire jobs with schedules, data retention policies, and write volumes.
+See `SYSTEM_REFERENCE.md` for complete database schema details, all Hangfire jobs with schedules, data retention policies, and write volumes.

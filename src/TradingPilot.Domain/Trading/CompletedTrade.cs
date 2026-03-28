@@ -24,4 +24,20 @@ public class CompletedTrade : Entity<Guid>
     public string EntrySource { get; set; } = ""; // RULE, SWIN, WEIGHTED
     public decimal EntryScore { get; set; }
     public string ExitReason { get; set; } = ""; // Full reason from PositionMonitor (e.g. "TRAILING STOP peak=0.16...")
+
+    // ── Day trading fields ──
+    /// <summary>Signal source (SignalSource enum as byte).</summary>
+    public byte? DayTradeSource { get; set; }
+    /// <summary>Setup type (SetupType enum as byte).</summary>
+    public byte? DayTradeSetupType { get; set; }
+    /// <summary>Bar-based setup strength at entry [0, 1].</summary>
+    public decimal? SetupScore { get; set; }
+    /// <summary>L2 timing score at entry [-1, +1].</summary>
+    public decimal? TimingScore { get; set; }
+    /// <summary>Planned hold time at entry in seconds.</summary>
+    public int? HoldSeconds { get; set; }
+    /// <summary>Effective stop distance at entry in dollars.</summary>
+    public decimal? StopDistance { get; set; }
+    /// <summary>Did the setup thesis get invalidated before exit?</summary>
+    public bool? SetupInvalidated { get; set; }
 }

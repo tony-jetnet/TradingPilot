@@ -25,6 +25,7 @@ public class MqttMessageProcessor
     private readonly MarketMicrostructureAnalyzer _analyzer;
     private readonly SignalStore _signalStore;
     private readonly PaperTradingExecutor _paperTrader;
+    private readonly SignalOrchestrator _orchestrator;
     private readonly ILogger<MqttMessageProcessor> _logger;
 
     // Track how many raw payloads we've logged per topic to avoid spam
@@ -59,6 +60,7 @@ public class MqttMessageProcessor
         MarketMicrostructureAnalyzer analyzer,
         SignalStore signalStore,
         PaperTradingExecutor paperTrader,
+        SignalOrchestrator orchestrator,
         ILogger<MqttMessageProcessor> logger)
     {
         _scopeFactory = scopeFactory;
@@ -68,6 +70,7 @@ public class MqttMessageProcessor
         _analyzer = analyzer;
         _signalStore = signalStore;
         _paperTrader = paperTrader;
+        _orchestrator = orchestrator;
         _logger = logger;
     }
 
@@ -216,8 +219,23 @@ public class MqttMessageProcessor
         // Compute L2-derived features and store in TickDataCache
         _tickCache.UpdateL2Features(decoded.TickerId, snapshot);
 
-        // Analyze for trading signals
-        var signal = _analyzer.AnalyzeSnapshot(decoded.TickerId, symbol.Id, snapshot);
+        // Analyze for trading signals — two paths:
+        // 1. Active symbols (IsActiveForTrading): use SignalOrchestrator (setup + L2 timing + context)
+        // 2. Non-active symbols: use existing L2-only analyzer (backward compatible)
+        TradingSignal? signal = null;
+
+        if (symbol.IsActiveForTrading)
+        {
+            // Day trading pipeline: setup detection + L2 timing + context scoring
+            signal = await _orchestrator.EvaluateAsync(decoded.TickerId, symbol.Id, symbol.Id, snapshot.MidPrice);
+        }
+
+        // Fallback: L2-only signal for non-active symbols or if orchestrator returned null
+        if (signal == null)
+        {
+            signal = _analyzer.AnalyzeSnapshot(decoded.TickerId, symbol.Id, snapshot);
+        }
+
         if (signal != null && signal.Type != SignalType.Hold)
         {
             _signalStore.AddSignal(signal);
@@ -414,18 +432,29 @@ public class MqttMessageProcessor
         // Compute L2-derived features and store in TickDataCache
         _tickCache.UpdateL2Features(tickerId, snapshot);
 
-        // Analyze for trading signals
-        var signal = _analyzer.AnalyzeSnapshot(tickerId, symbol.Id, snapshot);
-        if (signal != null && signal.Type != SignalType.Hold)
+        // Analyze for trading signals — same two-path logic as protobuf L2
+        TradingSignal? signal2 = null;
+
+        if (symbol.IsActiveForTrading)
         {
-            _signalStore.AddSignal(signal);
-            await PersistSignalAsync(signal, symbol.Id, snapshot);
+            signal2 = await _orchestrator.EvaluateAsync(tickerId, symbol.Id, symbol.Id, snapshot.MidPrice);
+        }
+
+        if (signal2 == null)
+        {
+            signal2 = _analyzer.AnalyzeSnapshot(tickerId, symbol.Id, snapshot);
+        }
+
+        if (signal2 != null && signal2.Type != SignalType.Hold)
+        {
+            _signalStore.AddSignal(signal2);
+            await PersistSignalAsync(signal2, symbol.Id, snapshot);
 
             // Send all signals to executor — it handles entry/exit logic internally
             _ = Task.Run(async () =>
             {
-                try { await _paperTrader.OnSignalAsync(signal); }
-                catch (Exception ex) { _logger.LogError(ex, "Paper trade execution failed for {Ticker}", signal.Ticker); }
+                try { await _paperTrader.OnSignalAsync(signal2); }
+                catch (Exception ex) { _logger.LogError(ex, "Paper trade execution failed for {Ticker}", signal2.Ticker); }
             });
         }
 
@@ -542,6 +571,30 @@ public class MqttMessageProcessor
                 AskSweepCost = tickData?.AskSweepCost ?? 0,
                 ImbalanceVelocity = tickData?.ImbalanceVelocity ?? 0,
                 SpreadPercentile = tickData?.SpreadPercentile ?? 0.5m,
+                // Day trading fields (populated when signal has enrichment from orchestrator)
+                Source = signal.Source != SignalSource.L2Micro ? (byte?)signal.Source : null,
+                SignalSetupType = signal.SignalSetupType != SetupType.None ? (byte?)signal.SignalSetupType : null,
+                SetupScore = signal.SetupStrength != 0 ? signal.SetupStrength : null,
+                TimingScore = signal.TimingScore != 0 ? signal.TimingScore : null,
+                ContextScore = signal.ContextScore != 0 ? signal.ContextScore : null,
+                // Higher-TF indicators from snapshot
+                Ema50 = signal.Snapshot?.Ema50_5m,
+                Ema20_5m = signal.Snapshot?.Ema20_5m,
+                Ema50_5m = signal.Snapshot?.Ema50_5m,
+                Rsi14_5m = signal.Snapshot?.Rsi14_5m != 0 ? signal.Snapshot?.Rsi14_5m : null,
+                TrendDirection_5m = signal.Snapshot?.TrendDirection_5m != 0 ? signal.Snapshot?.TrendDirection_5m : null,
+                Ema20_15m = signal.Snapshot?.Ema20_15m,
+                Ema50_15m = signal.Snapshot?.Ema50_15m,
+                Rsi14_15m = signal.Snapshot?.Rsi14_15m != 0 ? signal.Snapshot?.Rsi14_15m : null,
+                TrendDirection_15m = signal.Snapshot?.TrendDirection_15m != 0 ? signal.Snapshot?.TrendDirection_15m : null,
+                TrendStrength = signal.Snapshot?.TrendAlignment != 0 ? signal.Snapshot?.TrendAlignment : null,
+                VwapDeviation = signal.Snapshot?.VwapDeviation != 0 ? signal.Snapshot?.VwapDeviation : null,
+                CapitalFlowScore = signal.Snapshot?.CapitalFlowScore,
+                RelativeVolume = signal.Snapshot?.RelativeVolume != 0 ? signal.Snapshot?.RelativeVolume : null,
+                NewsSentiment = signal.Snapshot?.NewsSentiment,
+                HasCatalyst = !string.IsNullOrEmpty(signal.Snapshot?.CatalystType) ? true : null,
+                SignalCatalystType = signal.Snapshot?.CatalystType,
+                NewsCount2Hr = signal.Snapshot?.NewsCount2Hr > 0 ? signal.Snapshot?.NewsCount2Hr : null,
             };
 
             using var scope = _scopeFactory.CreateScope();

@@ -57,4 +57,55 @@ public class TradingSignalRecord : Entity<Guid>
     public bool? WasCorrect15Min { get; set; }
     public bool? WasCorrect30Min { get; set; }
     public DateTime? VerifiedAt { get; set; }
+
+    // ── Day trading: signal source and setup context ──
+    /// <summary>What generated this signal (L2Micro, BarSetup, AiRule, Composite).</summary>
+    public byte? Source { get; set; }
+    /// <summary>Setup type if bar-based (TrendFollow, VwapBounce, Breakout, Reversal).</summary>
+    public byte? SignalSetupType { get; set; }
+
+    // ── Day trading: composite score breakdown ──
+    /// <summary>Bar-based setup strength [0, 1].</summary>
+    public decimal? SetupScore { get; set; }
+    /// <summary>L2 timing score [-1, +1].</summary>
+    public decimal? TimingScore { get; set; }
+    /// <summary>News/fundamental context score [-1, +1].</summary>
+    public decimal? ContextScore { get; set; }
+
+    // ── Day trading: higher-timeframe indicators at signal time ──
+    public decimal? Ema50 { get; set; }
+    public decimal? Ema20_5m { get; set; }
+    public decimal? Ema50_5m { get; set; }
+    public decimal? Rsi14_5m { get; set; }
+    public int? TrendDirection_5m { get; set; }
+    public decimal? Ema20_15m { get; set; }
+    public decimal? Ema50_15m { get; set; }
+    public decimal? Rsi14_15m { get; set; }
+    public int? TrendDirection_15m { get; set; }
+    /// <summary>Multi-TF trend alignment [-1, +1].</summary>
+    public decimal? TrendStrength { get; set; }
+    /// <summary>% distance from VWAP, clamped [-1, +1].</summary>
+    public decimal? VwapDeviation { get; set; }
+    /// <summary>Net institutional flow [-1, +1].</summary>
+    public decimal? CapitalFlowScore { get; set; }
+    /// <summary>Volume vs 20-day time-of-day average.</summary>
+    public decimal? RelativeVolume { get; set; }
+
+    // ── Day trading: news context at signal time ──
+    /// <summary>Avg news sentiment at signal time [-1, +1].</summary>
+    public decimal? NewsSentiment { get; set; }
+    /// <summary>Was there a catalyst article today?</summary>
+    public bool? HasCatalyst { get; set; }
+    /// <summary>Catalyst type (EARNINGS, ANALYST, etc.) or null.</summary>
+    public string? SignalCatalystType { get; set; }
+    /// <summary>Number of news articles in last 2 hours.</summary>
+    public int? NewsCount2Hr { get; set; }
+
+    // ── Day trading: longer horizon verification ──
+    public decimal? PriceAfter1Hr { get; set; }
+    public decimal? PriceAfter2Hr { get; set; }
+    public decimal? PriceAfter4Hr { get; set; }
+    public bool? WasCorrect1Hr { get; set; }
+    public bool? WasCorrect2Hr { get; set; }
+    public bool? WasCorrect4Hr { get; set; }
 }

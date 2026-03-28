@@ -125,6 +125,13 @@ public class TradingPilotBlazorModule : AbpModule
         context.Services.AddSingleton<MarketMicrostructureAnalyzer>();
         context.Services.AddSingleton<SignalStore>();
 
+        // Day trading: setup detection, context scoring, composite scoring, orchestration, scanner
+        context.Services.AddSingleton<SetupDetector>();
+        context.Services.AddSingleton<ContextScorer>();
+        context.Services.AddSingleton<CompositeScorer>();
+        context.Services.AddSingleton<SignalOrchestrator>();
+        context.Services.AddSingleton<PreMarketScanner>();
+
         // Paper trading client (typed HttpClient — no base address since we use full URLs)
         context.Services.AddHttpClient<WebullPaperTradingClient>();
 
@@ -217,6 +224,17 @@ public class TradingPilotBlazorModule : AbpModule
 
         // Clean up deprecated jobs from Redis
         recurringJobs.RemoveIfExists("signal-verification");
+
+        // Pre-market scanner: 9 AM ET weekdays (30 min before market open)
+        // Ranks all 50 watched symbols, selects top 10 for active trading
+        recurringJobs.AddOrUpdate<PreMarketScannerJob>(
+            "pre-market-scanner",
+            scanner => scanner.ScanAsync(),
+            "0 9 * * 1-5",
+            new RecurringJobOptions
+            {
+                TimeZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time")
+            });
 
         // Nightly AI strategy optimization: 9 PM ET weekdays (after market close)
         // Backfills gaps + verifies signal outcomes + calls Bedrock Sonnet 4.6 per symbol

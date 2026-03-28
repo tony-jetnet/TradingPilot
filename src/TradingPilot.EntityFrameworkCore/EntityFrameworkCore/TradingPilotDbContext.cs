@@ -18,6 +18,8 @@ public class TradingPilotDbContext : AbpDbContext<TradingPilotDbContext>
     public DbSet<TradingSignalRecord> TradingSignals { get; set; }
     public DbSet<BrokerSymbolMapping> BrokerSymbolMappings { get; set; }
     public DbSet<CompletedTrade> CompletedTrades { get; set; }
+    public DbSet<BarSetup> BarSetups { get; set; }
+    public DbSet<DailyWatchlist> DailyWatchlists { get; set; }
 
     public TradingPilotDbContext(DbContextOptions<TradingPilotDbContext> options)
         : base(options)

@@ -78,6 +78,11 @@ namespace TradingPilot.Migrations
                         .HasMaxLength(100)
                         .HasColumnType("character varying(100)");
 
+                    b.Property<bool>("IsActiveForTrading")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false);
+
                     b.Property<bool>("IsMarginable")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("boolean")
@@ -380,11 +385,26 @@ namespace TradingPilot.Migrations
                     b.Property<Guid>("Id")
                         .HasColumnType("uuid");
 
+                    b.Property<string>("CatalystType")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
                     b.Property<DateTime>("CollectedAt")
                         .HasColumnType("timestamp without time zone");
 
                     b.Property<DateTime>("PublishedAt")
                         .HasColumnType("timestamp without time zone");
+
+                    b.Property<DateTime?>("ScoredAt")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<string>("SentimentMethod")
+                        .HasMaxLength(20)
+                        .HasColumnType("character varying(20)");
+
+                    b.Property<decimal?>("SentimentScore")
+                        .HasPrecision(6, 4)
+                        .HasColumnType("numeric(6,4)");
 
                     b.Property<string>("SourceName")
                         .HasMaxLength(200)
@@ -422,10 +442,189 @@ namespace TradingPilot.Migrations
                     b.ToTable("SymbolNews", (string)null);
                 });
 
+            modelBuilder.Entity("TradingPilot.Trading.BarSetup", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uuid");
+
+                    b.Property<decimal>("Atr14")
+                        .HasPrecision(10, 4)
+                        .HasColumnType("numeric(10,4)");
+
+                    b.Property<decimal>("Atr14_5m")
+                        .HasPrecision(10, 4)
+                        .HasColumnType("numeric(10,4)");
+
+                    b.Property<decimal?>("CapitalFlowScore")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<string>("CatalystType")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<byte>("Direction")
+                        .HasColumnType("smallint");
+
+                    b.Property<decimal>("Ema20")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Ema20_15m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Ema20_5m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Ema50_15m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Ema50_5m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Ema9")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("EntryZoneHigh")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("EntryZoneLow")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<DateTime>("ExpiresAt")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<bool>("HasCatalyst")
+                        .HasColumnType("boolean");
+
+                    b.Property<decimal?>("MaxAdverse")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("MaxFavorable")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<int>("NewsCount2Hr")
+                        .HasColumnType("integer");
+
+                    b.Property<decimal?>("NewsSentiment")
+                        .HasPrecision(6, 4)
+                        .HasColumnType("numeric(6,4)");
+
+                    b.Property<decimal>("Price")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("PriceAfter1Hr")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("PriceAfter2Hr")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("PriceAfter4Hr")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Rsi14")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
+                    b.Property<decimal>("Rsi14_15m")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
+                    b.Property<decimal>("Rsi14_5m")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
+                    b.Property<byte>("SetupType")
+                        .HasColumnType("smallint");
+
+                    b.Property<decimal>("StopLevel")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal>("Strength")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<string>("SymbolId")
+                        .IsRequired()
+                        .HasColumnType("character varying(10)");
+
+                    b.Property<decimal>("TargetLevel")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<long>("TickerId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTime>("Timestamp")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<int>("TrendDirection")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("TrendDirection_15m")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("TrendDirection_5m")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime?>("VerifiedAt")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<decimal>("VolumeRatio")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
+                    b.Property<decimal>("Vwap")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<bool?>("WasCorrect1Hr")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool?>("WasCorrect2Hr")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool?>("WasCorrect4Hr")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool?>("WasTradeable")
+                        .HasColumnType("boolean");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SetupType", "Direction")
+                        .HasDatabaseName("IX_BarSetups_SetupType_Direction");
+
+                    b.HasIndex("SymbolId", "Timestamp")
+                        .HasDatabaseName("IX_BarSetups_SymbolId_Timestamp");
+
+                    b.ToTable("BarSetups", (string)null);
+                });
+
             modelBuilder.Entity("TradingPilot.Trading.CompletedTrade", b =>
                 {
                     b.Property<Guid>("Id")
                         .HasColumnType("uuid");
+
+                    b.Property<byte?>("DayTradeSetupType")
+                        .HasColumnType("smallint");
+
+                    b.Property<byte?>("DayTradeSource")
+                        .HasColumnType("smallint");
 
                     b.Property<decimal>("EntryPrice")
                         .HasPrecision(12, 4)
@@ -455,6 +654,9 @@ namespace TradingPilot.Migrations
                     b.Property<DateTime>("ExitTime")
                         .HasColumnType("timestamp without time zone");
 
+                    b.Property<int?>("HoldSeconds")
+                        .HasColumnType("integer");
+
                     b.Property<bool>("IsLong")
                         .HasColumnType("boolean");
 
@@ -465,6 +667,17 @@ namespace TradingPilot.Migrations
                     b.Property<int>("Quantity")
                         .HasColumnType("integer");
 
+                    b.Property<bool?>("SetupInvalidated")
+                        .HasColumnType("boolean");
+
+                    b.Property<decimal?>("SetupScore")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<decimal?>("StopDistance")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
                     b.Property<string>("Ticker")
                         .IsRequired()
                         .HasMaxLength(20)
@@ -472,6 +685,10 @@ namespace TradingPilot.Migrations
 
                     b.Property<long>("TickerId")
                         .HasColumnType("bigint");
+
+                    b.Property<decimal?>("TimingScore")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
 
                     b.HasKey("Id");
 
@@ -482,6 +699,30 @@ namespace TradingPilot.Migrations
                         .HasDatabaseName("IX_CompletedTrades_Ticker_ExitTime");
 
                     b.ToTable("CompletedTrades", (string)null);
+                });
+
+            modelBuilder.Entity("TradingPilot.Trading.DailyWatchlist", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<DateOnly>("Date")
+                        .HasColumnType("date");
+
+                    b.Property<string>("Selections")
+                        .IsRequired()
+                        .HasColumnType("jsonb");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Date")
+                        .IsUnique()
+                        .HasDatabaseName("IX_DailyWatchlists_Date");
+
+                    b.ToTable("DailyWatchlists", (string)null);
                 });
 
             modelBuilder.Entity("TradingPilot.Trading.TradingSignalRecord", b =>
@@ -510,11 +751,42 @@ namespace TradingPilot.Migrations
                     b.Property<decimal>("BookDepthRatio")
                         .HasColumnType("numeric");
 
+                    b.Property<decimal?>("CapitalFlowScore")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<decimal?>("ContextScore")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
                     b.Property<decimal>("Ema20")
                         .HasColumnType("numeric");
 
+                    b.Property<decimal?>("Ema20_15m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("Ema20_5m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("Ema50")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("Ema50_15m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("Ema50_5m")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
                     b.Property<decimal>("Ema9")
                         .HasColumnType("numeric");
+
+                    b.Property<bool?>("HasCatalyst")
+                        .HasColumnType("boolean");
 
                     b.Property<decimal>("Imbalance")
                         .HasPrecision(8, 6)
@@ -526,6 +798,13 @@ namespace TradingPilot.Migrations
                     b.Property<decimal>("LargeOrderSignal")
                         .HasPrecision(8, 6)
                         .HasColumnType("numeric(8,6)");
+
+                    b.Property<int?>("NewsCount2Hr")
+                        .HasColumnType("integer");
+
+                    b.Property<decimal?>("NewsSentiment")
+                        .HasPrecision(6, 4)
+                        .HasColumnType("numeric(6,4)");
 
                     b.Property<decimal>("ObiSmoothed")
                         .HasPrecision(8, 6)
@@ -543,11 +822,23 @@ namespace TradingPilot.Migrations
                         .HasPrecision(12, 4)
                         .HasColumnType("numeric(12,4)");
 
+                    b.Property<decimal?>("PriceAfter1Hr")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
                     b.Property<decimal?>("PriceAfter1Min")
                         .HasPrecision(12, 4)
                         .HasColumnType("numeric(12,4)");
 
+                    b.Property<decimal?>("PriceAfter2Hr")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
                     b.Property<decimal?>("PriceAfter30Min")
+                        .HasPrecision(12, 4)
+                        .HasColumnType("numeric(12,4)");
+
+                    b.Property<decimal?>("PriceAfter4Hr")
                         .HasPrecision(12, 4)
                         .HasColumnType("numeric(12,4)");
 
@@ -560,12 +851,38 @@ namespace TradingPilot.Migrations
                         .HasMaxLength(500)
                         .HasColumnType("character varying(500)");
 
+                    b.Property<decimal?>("RelativeVolume")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
                     b.Property<decimal>("Rsi14")
                         .HasColumnType("numeric");
+
+                    b.Property<decimal?>("Rsi14_15m")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
+
+                    b.Property<decimal?>("Rsi14_5m")
+                        .HasPrecision(8, 4)
+                        .HasColumnType("numeric(8,4)");
 
                     b.Property<decimal>("Score")
                         .HasPrecision(8, 6)
                         .HasColumnType("numeric(8,6)");
+
+                    b.Property<decimal?>("SetupScore")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<string>("SignalCatalystType")
+                        .HasMaxLength(50)
+                        .HasColumnType("character varying(50)");
+
+                    b.Property<byte?>("SignalSetupType")
+                        .HasColumnType("smallint");
+
+                    b.Property<byte?>("Source")
+                        .HasColumnType("smallint");
 
                     b.Property<decimal>("Spread")
                         .HasPrecision(10, 4)
@@ -594,6 +911,20 @@ namespace TradingPilot.Migrations
                     b.Property<DateTime>("Timestamp")
                         .HasColumnType("timestamp without time zone");
 
+                    b.Property<decimal?>("TimingScore")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
+                    b.Property<int?>("TrendDirection_15m")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("TrendDirection_5m")
+                        .HasColumnType("integer");
+
+                    b.Property<decimal?>("TrendStrength")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
                     b.Property<byte>("Type")
                         .HasColumnType("smallint");
 
@@ -606,13 +937,26 @@ namespace TradingPilot.Migrations
                     b.Property<decimal>("Vwap")
                         .HasColumnType("numeric");
 
+                    b.Property<decimal?>("VwapDeviation")
+                        .HasPrecision(8, 6)
+                        .HasColumnType("numeric(8,6)");
+
                     b.Property<bool?>("WasCorrect15Min")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool?>("WasCorrect1Hr")
                         .HasColumnType("boolean");
 
                     b.Property<bool?>("WasCorrect1Min")
                         .HasColumnType("boolean");
 
+                    b.Property<bool?>("WasCorrect2Hr")
+                        .HasColumnType("boolean");
+
                     b.Property<bool?>("WasCorrect30Min")
+                        .HasColumnType("boolean");
+
+                    b.Property<bool?>("WasCorrect4Hr")
                         .HasColumnType("boolean");
 
                     b.Property<bool?>("WasCorrect5Min")
@@ -685,6 +1029,15 @@ namespace TradingPilot.Migrations
                 });
 
             modelBuilder.Entity("TradingPilot.Symbols.SymbolNews", b =>
+                {
+                    b.HasOne("TradingPilot.Symbols.Symbol", null)
+                        .WithMany()
+                        .HasForeignKey("SymbolId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("TradingPilot.Trading.BarSetup", b =>
                 {
                     b.HasOne("TradingPilot.Symbols.Symbol", null)
                         .WithMany()

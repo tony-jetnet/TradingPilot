@@ -64,4 +64,30 @@ public class BarIndicators
     /// Used by MarketMicrostructureAnalyzer to detect stale bar data and skip signal generation.
     /// </summary>
     public DateTime LastRefreshTime { get; set; }
+
+    // ── 5-min bar indicators (populated by BarIndicatorService Phase 3) ──
+    /// <summary>20-period EMA on 5-min bars.</summary>
+    public decimal Ema20_5m { get; set; }
+    /// <summary>50-period EMA on 5-min bars.</summary>
+    public decimal Ema50_5m { get; set; }
+    /// <summary>14-period RSI on 5-min bars.</summary>
+    public decimal Rsi14_5m { get; set; }
+    /// <summary>14-period ATR on 5-min bars.</summary>
+    public decimal Atr14_5m { get; set; }
+    /// <summary>Volume ratio on 5-min bars (current / 20-bar avg).</summary>
+    public decimal VolumeRatio_5m { get; set; }
+    /// <summary>+1 if EMA20_5m > EMA50_5m, -1 if below, 0 if equal.</summary>
+    public int TrendDirection_5m { get; set; }
+    /// <summary>True if last close is above VWAP on 5-min timeframe.</summary>
+    public bool AboveVwap_5m { get; set; }
+
+    // ── 15-min bar indicators (populated by BarIndicatorService Phase 3) ──
+    /// <summary>20-period EMA on 15-min bars.</summary>
+    public decimal Ema20_15m { get; set; }
+    /// <summary>50-period EMA on 15-min bars.</summary>
+    public decimal Ema50_15m { get; set; }
+    /// <summary>14-period RSI on 15-min bars.</summary>
+    public decimal Rsi14_15m { get; set; }
+    /// <summary>+1 if EMA20_15m > EMA50_15m, -1 if below, 0 if equal.</summary>
+    public int TrendDirection_15m { get; set; }
 }
